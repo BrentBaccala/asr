@@ -1,4 +1,4 @@
-#!/home/claude/asr/asr-env-canary/bin/python
+#!/home/claude/venv-3.12-torch/bin/python
 """
 Streaming Canary ASR/AST transcription from stdin PCM audio.
 

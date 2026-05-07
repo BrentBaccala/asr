@@ -43,15 +43,20 @@ is the active audio session on pony for everything else).
 
 | Venv | Python | Purpose |
 |---|---|---|
-| `asr-env/` | 3.14.4 (system) | faster-whisper stack: ctranslate2, silero-vad, onnxruntime |
-| `asr-env-canary/` | 3.12.13 (uv-installed) | NeMo stack: torch 2.9.1+cu128, nemo_toolkit[asr], silero-vad, onnxruntime, torchaudio |
+| `~/asr/asr-env/` | 3.14.4 (system) | faster-whisper stack: ctranslate2, silero-vad, onnxruntime |
+| `~/venv-3.12-torch/` | 3.12.13 (uv-installed) | torch stack: torch 2.9.1+cu128, nemo_toolkit[asr], silero-vad, onnxruntime, torchaudio |
 
 Pony runs Ubuntu 26.04 (Resolute Raccoon) which ships only
 Python 3.14. NeMo's released wheels target 3.10–3.12; on 3.14
 several of NeMo's deps fail to resolve. Workaround: `uv python
 install 3.12` pulls a standalone CPython 3.12 build (lives at
 `~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/`) and
-the canary/parakeet venv points at it.
+`~/venv-3.12-torch/` points at it.
+
+The torch venv lives at `~/venv-3.12-torch/`, not under
+`~/asr/`, because torch-based tooling extends beyond ASR
+(e.g. music stem-splitting via demucs). Hoisted out so other
+projects can share it without polluting the ~/asr tree.
 
 faster-whisper installs cleanly on 3.14 — no need to consolidate.
 The two venvs total ~7 GB on disk and don't conflict.

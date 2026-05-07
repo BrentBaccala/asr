@@ -14,9 +14,9 @@ three transcribe English well enough to be useful.
 
 | Script | Model | Engine | Languages | When to pick |
 |---|---|---|---|---|
-| `asr-stream-whisper.py` | `Systran/faster-whisper-large-v3` | CTranslate2 | 99 (auto-detect) | Best multilingual coverage; lightest runtime |
-| `asr-stream-parakeet.py` | `nvidia/parakeet-tdt-0.6b-v3` | NeMo (PyTorch) | 25 (auto-detect, en/es/fr/de/+) | Fastest inference (~1 s on 6 s audio); current best multilingual NeMo |
-| `asr-stream-canary.py` | `nvidia/canary-1b-flash` | NeMo (PyTorch) | en/es/fr/de | Single-pass ASR + translation in one model (`--task ast --source-lang es --target-lang en`) |
+| `stream-whisper.py` | `Systran/faster-whisper-large-v3` | CTranslate2 | 99 (auto-detect) | Best multilingual coverage; lightest runtime |
+| `stream-parakeet.py` | `nvidia/parakeet-tdt-0.6b-v3` | NeMo (PyTorch) | 25 (auto-detect, en/es/fr/de/+) | Fastest inference (~1 s on 6 s audio); current best multilingual NeMo |
+| `stream-canary.py` | `nvidia/canary-1b-flash` | NeMo (PyTorch) | en/es/fr/de | Single-pass ASR + translation in one model (`--task ast --source-lang es --target-lang en`) |
 
 Common shape: read raw 16-bit-LE mono PCM from stdin at 16 kHz,
 chunk on Silero VAD utterance boundaries (500 ms silence
@@ -27,7 +27,7 @@ per utterance with timing tags. ^C to stop.
 
 ```bash
 ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
-  | ~/asr/asr-stream-parakeet.py'
+  | ~/asr/stream-parakeet.py'
 ```
 
 Substitute any of the three scripts. Each script's shebang
@@ -89,7 +89,7 @@ All model weights live in the shared HuggingFace cache at
 
 Both venvs see the same cache (HF default location).
 
-## TODO — `asr-stream-multitalker.py`
+## TODO — `stream-multitalker.py`
 
 The multitalker streaming model is downloaded but no script yet
 because the integration is significantly heavier than a drop-in
@@ -122,7 +122,7 @@ sub-second latency:
 
 - Smoke-tested all three scripts post-move (`script < /dev/null`):
   models load, silero-vad initializes, ready-to-listen banner prints.
-- Live mic input has been confirmed working on `asr-stream-whisper.py`
+- Live mic input has been confirmed working on `stream-whisper.py`
   earlier in development (pre-rename / pre-move). The other two
   haven't been tested with real speech yet.
 - `/tmp/out.wav` (a 5.8-second 8 kHz BBB IVR clip) transcribes

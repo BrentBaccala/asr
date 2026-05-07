@@ -3,7 +3,7 @@
 Streaming faster-whisper transcription from stdin PCM audio.
 
 Pipe arecord into this:
-  arecord -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 | asr-stream-whisper.py
+  arecord -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 | stream-whisper.py
 
 Reads 16-bit signed little-endian mono PCM at 16 kHz.
 Uses Silero VAD to chunk speech utterances; each utterance is sent to

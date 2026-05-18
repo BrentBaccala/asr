@@ -8,21 +8,25 @@ Pipe raw PCM in:
 
 Reads 16-bit signed little-endian mono PCM at 16 kHz.
 
-Unlike the sliding-window parakeet/whisper scripts, Vosk is a genuinely
-streaming online recognizer: it emits a growing partial hypothesis as
-audio arrives (no recompute, no confirmation window), so latency is the
-model's intrinsic decoding lag (~0.1-0.3 s). Accuracy is below
-parakeet-tdt/whisper, especially on telephone-band audio, but it
-outputs Spanish words directly and is the lowest-latency local option.
+Vosk is a genuinely streaming online recognizer: it emits a growing
+partial hypothesis as audio arrives (no recompute, no confirmation
+window). Output is delta-printed -- only newly appended text is
+written, and a finalized segment ends the line with a newline. This is
+terminal-wrap safe (no carriage-return overwrite, which breaks once a
+line wraps) and matches the cache-aware English script's UX. On the
+rare non-prefix tail revision the line is reprinted fresh.
 
-Emits, on every partial change, a line tagged with the audio start time
-of the first not-yet-final word (so latency tooling can compare wall vs
-audio time, same format as stream-parakeet-live.py). Final segments are
-newline-committed.
+Accuracy is below parakeet-tdt/whisper on telephone-band audio but on
+clean speech is close to whisper-large-v3; outputs Spanish words
+directly and is the lowest-latency *stable* local option (CPU-only;
+Vosk has no GPU path).
 
 Options:
-  --model PATH    vosk model dir (default ~/asr/models/vosk-model-es-0.42)
+  --model PATH    vosk model dir (default ~/asr/models/vosk-model-es-0.42;
+                  pass ~/asr/models/vosk-model-small-es-0.42 for lower
+                  latency at some accuracy cost)
   --read-ms MS    stdin read granularity (default 120)
+  --timestamps    append [start-end s] to each finalized line
 """
 import sys
 import os
@@ -38,6 +42,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--model",
                 default=os.path.expanduser("~/asr/models/vosk-model-es-0.42"))
 ap.add_argument("--read-ms", type=int, default=120)
+ap.add_argument("--timestamps", action="store_true",
+                help="append [start-end s] to each finalized line")
 args = ap.parse_args()
 
 print(f"loading {args.model}...", file=sys.stderr, flush=True)
@@ -48,23 +54,39 @@ rec.SetPartialWords(True)
 print("ready, listening...", file=sys.stderr, flush=True)
 
 read_bytes = int(SAMPLE_RATE * args.read_ms / 1000) * 2
-shown = ""
+shown = ""  # text already written on the current (unterminated) line
 
 
-def show(ts, text):
+def stream(text):
+    """Print `text` as the current line incrementally: just the new
+    suffix when it extends what's shown, else a newline + full reprint.
+    Never uses carriage return, so terminal line-wrap is harmless."""
     global shown
-    if text and text != shown:
-        line = f"[{ts:6.1f}s] {text}"
-        sys.stdout.write("\r" + line + " " * max(0, len(shown) - len(line)))
-        sys.stdout.flush()
-        shown = line
+    if text == shown:
+        return
+    if text.startswith(shown):
+        sys.stdout.write(text[len(shown):])
+    else:
+        sys.stdout.write("\n" + text)
+    sys.stdout.flush()
+    shown = text
 
 
-def commit(ts, text):
+def endline(text, span):
+    """Finalize the current segment: flush any remaining suffix, then a
+    newline (optionally a timestamp), and reset the line."""
     global shown
-    if text:
-        sys.stdout.write("\r" + f"[{ts:6.1f}s] {text}" + "\n")
-        sys.stdout.flush()
+    if not text:
+        return
+    if text != shown:
+        if text.startswith(shown):
+            sys.stdout.write(text[len(shown):])
+        else:
+            sys.stdout.write(("\n" if shown else "") + text)
+    if args.timestamps and span is not None:
+        sys.stdout.write(f"   [{span[0]:.1f}-{span[1]:.1f}s]")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
     shown = ""
 
 
@@ -74,19 +96,16 @@ while True:
         break
     if rec.AcceptWaveform(bytes(data)):
         r = json.loads(rec.Result())
-        words = r.get("result", [])
+        w = r.get("result", [])
         if r.get("text"):
-            ts = words[-1]["end"] if words else 0.0
-            commit(ts, r["text"])
+            endline(r["text"], (w[0]["start"], w[-1]["end"]) if w else None)
     else:
         pr = json.loads(rec.PartialResult())
-        pw = pr.get("partial_result", [])
         if pr.get("partial"):
-            ts = pw[-1]["end"] if pw else 0.0
-            show(ts, pr["partial"])
+            stream(pr["partial"])
 
 fr = json.loads(rec.FinalResult())
 fw = fr.get("result", [])
 if fr.get("text"):
-    commit(fw[0]["start"] if fw else 0.0, fr["text"])
+    endline(fr["text"], (fw[0]["start"], fw[-1]["end"]) if fw else None)
 print("[stream-vosk] bye.", file=sys.stderr)

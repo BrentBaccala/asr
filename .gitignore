@@ -1,1 +1,4 @@
 asr-env/
+*-env/
+models/
+vosk-env/

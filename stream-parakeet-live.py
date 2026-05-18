@@ -152,7 +152,7 @@ while not eof:
         break
 
     if final_txt:
-        flush_line(("[%6.1fs] " % (final[0][1])) + final_txt)
+        flush_line(("[%6.1fs] " % (final[-1][2])) + final_txt)
         # Trim the buffer up to the last finalized word.
         cut = final[-1][2]
         drop = int((cut - buf_start_t) * SAMPLE_RATE)
@@ -164,7 +164,7 @@ while not eof:
         audio_buf = audio_buf[d:]
         buf_start_t += d / SAMPLE_RATE
     if tail_txt:
-        show(("[%6.1fs] " % (tail[0][1])) + tail_txt)
+        show(("[%6.1fs] " % (tail[-1][2])) + tail_txt)
 
 if shown:
     sys.stdout.write("\n")

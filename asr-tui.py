@@ -676,10 +676,17 @@ def render():
                     en_pref   = "EN▸   "
                 live_l = (wrap_pref(ces_live, live_pref) if ces_live
                           else [live_pref.rstrip()])
-                es_l   = (wrap_pref(ces_trans, es_pref) if ces_trans
-                          else [es_pref + "(translating…)"])
-                en_l   = (wrap_pref(cen_trans, en_pref) if cen_trans
-                          else [en_pref + "(translating…)"])
+                # "(translating…)" only when there's raw text awaiting a
+                # translation — not when the channel is idle (cur_live
+                # empty), where all three lines should sit empty.
+                if not ces_live:
+                    es_l = [es_pref.rstrip()]
+                    en_l = [en_pref.rstrip()]
+                else:
+                    es_l = (wrap_pref(ces_trans, es_pref) if ces_trans
+                            else [es_pref + "(translating…)"])
+                    en_l = (wrap_pref(cen_trans, en_pref) if cen_trans
+                            else [en_pref + "(translating…)"])
                 for ln in live_l:
                     live.append((ln, "1m"))           # raw: bold
                 for ln in es_l:

@@ -5,13 +5,27 @@ translation, in a terminal UI.
 
   ssh cosine@pony
   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+
+  # single-stream (stdin pipe — unchanged behaviour):
   pw-record --target rtp_call_remote_source --format=s16 --rate=16000 \
             --channels=1 - | ~/asr/asr-tui.py          # the TUI
   ... | ~/asr/asr-tui.py --plain                        # headless log
 
-Pipeline (unchanged from the headless scripts): audio on stdin ->
-Voxtral-Mini-4B-Realtime via the local vLLM /v1/realtime WS (Spanish);
-NLLB-200-distilled-600M int8 (CTranslate2, CPU) for English.
+  # dual-stream (script owns both taps — [Remote]/[Me] labelled):
+  ~/asr/asr-tui.py --dual                                # the TUI
+  ~/asr/asr-tui.py --dual --plain                        # headless log
+
+Pipeline (unchanged from the headless scripts): audio -> Voxtral-Mini-
+4B-Realtime via the local vLLM /v1/realtime WS (Spanish); NLLB-200-
+distilled-600M int8 (CTranslate2, CPU) for English.
+
+In --dual mode the script spawns two pw-record subprocesses on the two
+canonical PipeWire source names (rtp_call_remote_source = Remote,
+rtp_call_me_source = Me, as in asr-call-transcribe) and runs two
+independent Voxtral /v1/realtime WS sessions concurrently. Each stream
+keeps its own in-progress ES/EN; finalized pairs interleave in one
+speaker-tagged scrolling history. The live region shows only the
+*active* speaker (whichever got the most recent delta).
 
 What's new vs stream-voxtral-translate.py: the English for the
 *in-progress* sentence is re-translated continuously from the full
@@ -20,8 +34,9 @@ last few words masked (the unstable tail). It refines in place in a
 fixed pane instead of scrolling, so low-latency EN is possible without
 churn. On sentence end the pair freezes into scrolling history.
 
-Audio is on stdin, so the TUI renders via ANSI to the terminal (stdout)
-and never reads stdin for keys; quit with Ctrl-C (terminal is restored).
+Audio is on stdin (single-stream) or owned subprocesses (dual), so the
+TUI renders via ANSI to the terminal (stdout) and never reads stdin for
+keys; quit with Ctrl-C (terminal is restored).
 """
 import argparse
 import asyncio
@@ -32,6 +47,7 @@ import queue
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -49,9 +65,25 @@ CHUNK = 2048 * 2
 SENT_RE = re.compile(r'(.+?[.!?…]+["»”\'\)\]]*)(?:\s+|$)', re.S)
 MASK_K = 4              # words of the live EN tail to hide (unstable)
 FROZEN_CAP = 300
+SAMPLE_RATE = 16000
+
+# Dual-stream sources: (PipeWire node name, label, label ANSI accent).
+# Matches asr-call-transcribe (Remote cyan / Me green).
+DUAL_SOURCES = [
+    ("rtp_call_remote_source", "Remote", "1;36"),  # cyan
+    ("rtp_call_me_source",     "Me",     "1;32"),  # green
+]
+# Single-stream sentinel label (stdin path).
+SOLO = "(solo)"
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--beam", type=int, default=1)
+ap.add_argument("--dual", action="store_true",
+                help="dual-stream: the script owns both taps "
+                     "(rtp_call_remote_source=Remote, "
+                     "rtp_call_me_source=Me) via two pw-record "
+                     "subprocesses + two Voxtral WS sessions. Without "
+                     "this, audio is read from stdin (single stream).")
 ap.add_argument("--mask", type=int, default=MASK_K,
                 help="words of the in-progress EN tail to hide (default 4)")
 ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
@@ -71,27 +103,43 @@ ap.add_argument("--plain", action="store_true",
 args = ap.parse_args()
 CLAUSE_DELIM = re.compile(r'[,;:]')
 
+# Active stream labels (order = render/iteration order).
+STREAMS = ([lbl for _, lbl, _ in DUAL_SOURCES] if args.dual else [SOLO])
+# label -> ANSI accent for the [label] tag in history (solo: plain).
+ACCENT = ({lbl: c for _, lbl, c in DUAL_SOURCES} if args.dual
+          else {SOLO: "0"})
+
 # ---------------- shared state ----------------
 _lock = threading.Lock()
 # Set by the signal handler ONLY. Never acquire _lock in the handler:
 # the handler runs in the main thread and would deadlock if interrupted
 # while the main thread already holds _lock (this hung a run for 15 min).
 _STOP = threading.Event()
+
+
+def _new_stream_state():
+    return {
+        "cur_es": "",      # in-progress Spanish (no sentence end yet)
+        "cur_en": "",      # masked live English of cur_es
+        "delta_t": 0.0,    # wall time of last transcription delta (speech)
+    }
+
+
 _state = {
-    "frozen": [],          # list[(es, en)]
-    "cur_es": "",          # in-progress Spanish (no sentence end yet)
-    "cur_en": "",          # masked live English of cur_es
+    "frozen": [],          # list[(speaker, es, en)] — interleaved history
+    "streams": {lbl: _new_stream_state() for lbl in STREAMS},
+    "active": STREAMS[0],  # label of the last stream to get a delta
     "status": "starting",
-    "audio_t": 0.0,        # wall time of last audio chunk (activity)
-    "delta_t": 0.0,        # wall time of last transcription delta (speech)
+    "audio_t": 0.0,        # wall time of last audio chunk, any stream
     "cols": 100,           # live-line width budget, kept current by render
-    "stop": False,
 }
 
 
 def st_get():
     with _lock:
-        return (list(_state["frozen"]), _state["cur_es"], _state["cur_en"],
+        act = _state["active"]
+        s = _state["streams"][act]
+        return (list(_state["frozen"]), act, s["cur_es"], s["cur_en"],
                 _state["status"], _state["audio_t"])
 
 
@@ -120,20 +168,22 @@ def mask_tail(en: str, k: int) -> str:
     return " ".join(w[:-k])
 
 
-# finalize jobs (sentence text) get priority over live re-translation
-_final_q: "queue.Queue[str]" = queue.Queue()
+# finalize jobs ((speaker, sentence)) get priority over live re-translation
+_final_q: "queue.Queue[tuple]" = queue.Queue()
 
 
 def mt_worker():
-    last_src = None
+    # per-stream last-source so a quiet stream's stale cur_es isn't
+    # re-translated, and one stream's text never seeds another's.
+    last_src = {lbl: None for lbl in STREAMS}
     while True:
         if _STOP.is_set():
             return
-        # 1. priority: finalize completed sentences
+        # 1. priority: finalize completed sentences (speaker-tagged)
         try:
-            s = _final_q.get_nowait()
+            spk, s = _final_q.get_nowait()
         except queue.Empty:
-            s = None
+            spk, s = None, None
         if s is not None:
             s = s.strip()
             if s:
@@ -142,24 +192,32 @@ def mt_worker():
                 except Exception as e:
                     en = f"[mt error: {e}]"
                 with _lock:
-                    _state["frozen"].append((s, en))
+                    _state["frozen"].append((spk, s, en))
                     _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
                 if args.plain:
-                    sys.stdout.write(f"ES  {s}\nEN  {en}\n\n")
+                    tag = "" if spk == SOLO else f"[{spk}] "
+                    sys.stdout.write(f"{tag}ES  {s}\n{tag}EN  {en}\n\n")
                     sys.stdout.flush()
             continue
-        # 2. else: re-translate the current in-progress sentence
-        with _lock:
-            cur = _state["cur_es"].strip()
-        if cur and cur != last_src:
-            last_src = cur
-            try:
-                en = translate(cur)
-            except Exception as e:
-                en = f"[mt error: {e}]"
+        # 2. else: re-translate every stream's in-progress sentence
+        did = False
+        for lbl in STREAMS:
             with _lock:
-                _state["cur_en"] = mask_tail(en, args.mask)
-        else:
+                cur = _state["streams"][lbl]["cur_es"].strip()
+            if cur and cur != last_src[lbl]:
+                last_src[lbl] = cur
+                try:
+                    en = translate(cur)
+                except Exception as e:
+                    en = f"[mt error: {e}]"
+                with _lock:
+                    # only write back if still the current text (the
+                    # stream may have flushed while we translated)
+                    if _state["streams"][lbl]["cur_es"].strip() == cur:
+                        _state["streams"][lbl]["cur_en"] = \
+                            mask_tail(en, args.mask)
+                did = True
+        if not did:
             time.sleep(0.05)
 
 
@@ -173,34 +231,58 @@ def stdin_reader(q, loop):
         loop.call_soon_threadsafe(q.put_nowait, b)
 
 
-def take_sentences():
-    """Move any completed sentences out of cur_es into _final_q."""
+def pw_reader(source_name, q, loop):
+    """Dual-stream feed: one pw-record subprocess -> queue (asr-call-
+    transcribe's capture shape, but raw byte chunks for the WS)."""
+    cmd = ["pw-record", "--target", source_name,
+           "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    try:
+        while not _STOP.is_set():
+            b = proc.stdout.read(CHUNK)
+            if not b:
+                break
+            loop.call_soon_threadsafe(q.put_nowait, b)
+    finally:
+        loop.call_soon_threadsafe(q.put_nowait, None)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def take_sentences(spk):
+    """Move any completed sentences out of this stream's cur_es into
+    _final_q (speaker-tagged)."""
     with _lock:
-        buf = _state["cur_es"]
+        s = _state["streams"][spk]
+        buf = s["cur_es"]
         out, pos = [], 0
         for m in SENT_RE.finditer(buf):
             out.append(m.group(1).strip())
             pos = m.end()
         if out:
-            _state["cur_es"] = buf[pos:]
-            _state["cur_en"] = ""        # reset live EN for the new sentence
-    for s in out:
-        _final_q.put(s)
+            s["cur_es"] = buf[pos:]
+            s["cur_en"] = ""             # reset live EN for the new sentence
+    for sent in out:
+        _final_q.put((spk, sent))
 
 
-def clause_flush():
-    """Pressure-based: only when the in-progress Spanish would exceed one
-    live line, commit a leading clause at the *rightmost* comma that still
-    fits the line (so the flushed clause is near-full -> good context,
-    short tail restarts). No comma within a line and badly overflowing ->
-    hard word-cut so it can't run forever; mildly over with no comma ->
-    leave it (let it wrap until a comma/sentence end arrives). Each
-    flushed clause goes to history like a sentence."""
+def clause_flush(spk):
+    """Pressure-based: only when this stream's in-progress Spanish would
+    exceed one live line, commit a leading clause at the *rightmost*
+    comma that still fits the line (so the flushed clause is near-full ->
+    good context, short tail restarts). No comma within a line and badly
+    overflowing -> hard word-cut so it can't run forever; mildly over
+    with no comma -> leave it. Each flushed clause goes to history like a
+    sentence."""
     if not args.line_flush:
         return
     with _lock:
+        s = _state["streams"][spk]
         budget = max(40, _state["cols"] - 4)     # one ES▸ line of chars
-        buf = _state["cur_es"]
+        buf = s["cur_es"]
         minc = max(15, args.min_clause)
         flushed, changed = [], False
         while len(buf) > budget:
@@ -211,55 +293,55 @@ def clause_flush():
             if cut == -1:
                 # No comma within the line: word-cut at the last space
                 # that fits, so the live region ALWAYS stays ~1 line and
-                # the chunk promotes into history. (The old "let it wrap
-                # until a comma" grace left long comma-poor sentences
-                # stuck, wrapped, never promoting — the reported bug.)
+                # the chunk promotes into history.
                 sp = buf.rfind(" ", minc, budget)
                 cut = sp if sp > minc else budget
             flushed.append(buf[:cut].strip())
             buf = buf[cut:].lstrip()
             changed = True
         if changed:
-            _state["cur_es"] = buf
-            _state["cur_en"] = ""
-    for s in flushed:
-        if s:
-            _final_q.put(s)
+            s["cur_es"] = buf
+            s["cur_en"] = ""
+    for sent in flushed:
+        if sent:
+            _final_q.put((spk, sent))
 
 
 def pause_watcher():
-    """Fourth flush trigger: a speech pause. take_sentences() ends a line
-    on punctuation, clause_flush() on width pressure; this ends it when the
-    speaker just trails off (no end punctuation, line not wide enough to
-    pressure-flush) -> no new transcription delta for --pause-ms. Pauses
-    are gaps in DELTAS, not audio: pw-record streams silence frames, so
-    audio_t is always fresh -> delta_t is the right clock. Same
-    substantive-tail guard as the EOF block (a 1-3 char scrap just makes
-    NLLB hallucinate boilerplate). After a flush cur_es is empty, so the
-    guard stops it re-firing while silence continues; the next delta
-    starts a fresh line."""
+    """Fourth flush trigger: a speech pause, evaluated PER STREAM.
+    take_sentences() ends a line on punctuation, clause_flush() on width
+    pressure; this ends it when the speaker just trails off -> no new
+    transcription delta for --pause-ms on that stream. Pauses are gaps in
+    DELTAS, not audio: pw-record streams silence frames, so each stream
+    has its own delta_t. delta_t == 0.0 until the first delta on that
+    stream ever arrives: don't flush during a silent direction's startup
+    (a silent direction must not flush a phantom line)."""
     if args.pause_ms <= 0:
         return
     gap_s = args.pause_ms / 1000.0
     while not _STOP.is_set():
         time.sleep(0.1)
+        pending = []
         with _lock:
-            # delta_t == 0.0 until the first delta ever arrives: don't
-            # flush during startup silence (now - 0.0 is huge).
-            seen = _state["delta_t"] > 0.0
-            gap = time.time() - _state["delta_t"]
-            rem = _state["cur_es"].strip()
-            if (seen and gap >= gap_s
-                    and len(rem) >= max(12, args.min_clause // 2)):
-                _state["cur_es"] = ""
-                _state["cur_en"] = ""
-            else:
-                rem = ""
-        if rem:
-            _final_q.put(rem)
+            now = time.time()
+            for lbl in STREAMS:
+                s = _state["streams"][lbl]
+                seen = s["delta_t"] > 0.0
+                gap = now - s["delta_t"]
+                rem = s["cur_es"].strip()
+                if (seen and gap >= gap_s
+                        and len(rem) >= max(12, args.min_clause // 2)):
+                    s["cur_es"] = ""
+                    s["cur_en"] = ""
+                    pending.append((lbl, rem))
+        for lbl, rem in pending:
+            _final_q.put((lbl, rem))
 
 
-async def net_main():
+async def net_main(source_name, label, q, loop):
+    """One Voxtral /v1/realtime WS session + one audio feed for `label`.
+    source_name is the pw-record target in --dual, or None for the
+    stdin (single-stream) path. `q` is this session's audio queue."""
     uri = f"ws://{HOST}:{PORT}/v1/realtime"
     try:
         ws = await websockets.connect(uri, max_size=None)
@@ -278,10 +360,13 @@ async def net_main():
         with _lock:
             _state["status"] = "streaming"
 
-        q = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        threading.Thread(target=stdin_reader, args=(q, loop),
-                         daemon=True).start()
+        if source_name is None:
+            threading.Thread(target=stdin_reader, args=(q, loop),
+                             daemon=True).start()
+        else:
+            threading.Thread(target=pw_reader,
+                             args=(source_name, q, loop),
+                             daemon=True).start()
 
         async def receiver():
             while True:
@@ -289,19 +374,22 @@ async def net_main():
                 t = m.get("type")
                 if t == "transcription.delta":
                     with _lock:
-                        _state["cur_es"] += m["delta"]
-                        _state["delta_t"] = time.time()
-                    take_sentences()
-                    clause_flush()
+                        s = _state["streams"][label]
+                        s["cur_es"] += m["delta"]
+                        s["delta_t"] = time.time()
+                        _state["active"] = label
+                    take_sentences(label)
+                    clause_flush(label)
                 elif t == "transcription.done":
-                    take_sentences()
+                    take_sentences(label)
                     with _lock:
-                        rem = _state["cur_es"].strip()
+                        s = _state["streams"][label]
+                        rem = s["cur_es"].strip()
                         if rem:
-                            _state["cur_es"] = ""
-                            _state["cur_en"] = ""
+                            s["cur_es"] = ""
+                            s["cur_en"] = ""
                     if rem:
-                        _final_q.put(rem)
+                        _final_q.put((label, rem))
                 elif t == "error":
                     with _lock:
                         _state["status"] = f"server error: {m}"
@@ -325,27 +413,39 @@ async def net_main():
             await asyncio.wait_for(rx, timeout=10)
         except asyncio.TimeoutError:
             pass
-        # Promote whatever is still in the live buffer (the speaker/audio
-        # ended mid-sentence, so no period and maybe no transcription.done
-        # ever arrives — without this the tail stays stuck, wrapped, in
-        # the live region instead of moving into history).
+        # Promote whatever is still in this stream's live buffer (the
+        # speaker/audio ended mid-sentence, so no period and maybe no
+        # transcription.done ever arrives).
         with _lock:
-            rem = _state["cur_es"].strip()
+            s = _state["streams"][label]
+            rem = s["cur_es"].strip()
             # only promote a substantive tail; a 1-3 char scrap ("se")
             # just makes NLLB hallucinate boilerplate — drop it.
             if rem and len(rem) >= max(12, args.min_clause // 2):
-                _state["cur_es"] = ""
-                _state["cur_en"] = ""
+                s["cur_es"] = ""
+                s["cur_en"] = ""
             else:
                 rem = ""
         if rem:
-            _final_q.put(rem)
+            _final_q.put((label, rem))
             time.sleep(2.0)            # let the MT worker finalize it
 
 
 def net_thread():
+    async def _run():
+        loop = asyncio.get_running_loop()
+        if args.dual:
+            tasks = []
+            for src, lbl, _ in DUAL_SOURCES:
+                q = asyncio.Queue()
+                tasks.append(asyncio.create_task(
+                    net_main(src, lbl, q, loop)))
+            await asyncio.gather(*tasks)
+        else:
+            q = asyncio.Queue()
+            await net_main(None, SOLO, q, loop)
     try:
-        asyncio.run(net_main())
+        asyncio.run(_run())
     except Exception as e:
         with _lock:
             _state["status"] = f"net error: {e}"
@@ -384,25 +484,28 @@ def render():
             cols, rows = shutil.get_terminal_size((100, 30))
             with _lock:
                 _state["cols"] = cols
-            frozen, ces, cen, status, at = st_get()
+            frozen, act, ces, cen, status, at = st_get()
             live = "●" if (time.time() - at) < 1.5 else "○"
-            head = (f" asr-tui  │  {status}  │  audio {live}  │  "
+            spk_tag = "" if act == SOLO else f"  │  speaker {act}"
+            head = (f" asr-tui  │  {status}  │  audio {live}{spk_tag}  │  "
                     f"{len(frozen)} done  │  Ctrl-C quit")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
             # --- live block: full text, multi-line, expands/contracts ---
+            es_pref = "ES▸ " if act == SOLO else f"[{act}] ES▸ "
+            en_pref = "EN▸ " if act == SOLO else f"[{act}] EN▸ "
+
             def wrap_pref(text, prefix):
                 indent = " " * len(prefix)
                 body = wrap(text, max(8, cols - len(prefix)))
                 return [(prefix if i == 0 else indent) + ln
                         for i, ln in enumerate(body)]
 
-            es_lines = wrap_pref(ces, "ES▸ ") if ces else ["ES▸"]
-            en_lines = (wrap_pref(cen, "EN▸ ") if cen
-                        else ["EN▸ (translating…)"])
+            es_lines = (wrap_pref(ces, es_pref) if ces
+                        else [es_pref.rstrip()])
+            en_lines = (wrap_pref(cen, en_pref) if cen
+                        else [en_pref + "(translating…)"])
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): header + separator + live must fit.
-            # If the live block is huge, keep its most recent lines —
-            # the refining EN tail — and prioritise EN over ES.
             live_budget = max(2, rows - 2)
             if len(es_lines) + len(en_lines) > live_budget:
                 en_keep = min(len(en_lines), max(1, live_budget // 2))
@@ -411,13 +514,23 @@ def render():
                 en_lines = en_lines[-en_keep:]
             live_h = 1 + len(es_lines) + len(en_lines)   # +1 separator
             body_h = max(0, rows - 1 - live_h)
-            # history (most recent at the bottom), fills remaining space
+            # history (most recent at the bottom), fills remaining space,
+            # interleaved + speaker-tagged.
             hist = []
-            for es, en in frozen:
+            for spk, es, en in frozen:
+                if spk == SOLO:
+                    es_tag, en_tag = "ES ", "EN "
+                else:
+                    acc = ACCENT.get(spk, "0")
+                    es_tag = (CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
+                              + "ES ")
+                    en_tag = (CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
+                              + "EN ")
                 for i, ln in enumerate(wrap(es, cols - 4)):
-                    hist.append(("  " if i else "ES ") + ln)
+                    hist.append((es_tag if i == 0 else "  ") + ln)
                 for i, ln in enumerate(wrap(en, cols - 4)):
-                    hist.append((CSI + "36m" + ("  " if i else "EN ")
+                    hist.append((CSI + "36m"
+                                 + (en_tag if i == 0 else "  ")
                                  + ln + CSI + "0m"))
                 hist.append("")
             hist = hist[-body_h:] if body_h > 0 else []
@@ -447,9 +560,10 @@ def plain_loop():
     while True:
         if _STOP.is_set():
             return
-        _, _, cen, _, _ = st_get()
+        _, act, _, cen, _, _ = st_get()
         if cen and cen != last:
-            sys.stderr.write(f"\r[live EN] {cen[:120]}\033[K")
+            tag = "" if act == SOLO else f"[{act}] "
+            sys.stderr.write(f"\r[live EN] {tag}{cen[:120]}\033[K")
             sys.stderr.flush()
             last = cen
         time.sleep(0.2)

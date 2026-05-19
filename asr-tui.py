@@ -97,9 +97,16 @@ ap.add_argument("--min-clause", type=int, default=25,
                 help="never line-flush a leading clause shorter than this "
                      "many chars (avoids tiny-fragment mistranslation)")
 ap.add_argument("--pause-ms", type=int, default=800,
-                help="end the working line after this many ms with no new "
-                     "transcription delta (speaker paused). 0 disables. "
-                     "Keep comfortably above transcription_delay_ms (240)")
+                help="short pause: flush the live region as a VISUAL "
+                     "chunk after this many ms with no new delta. The "
+                     "sentence stays open so MT runs on the whole "
+                     "sentence (good context). 0 disables visual flush.")
+ap.add_argument("--sentence-close-ms", type=int, default=3000,
+                help="long pause: CLOSE the sentence after this many ms "
+                     "with no new delta (speaker truly stopped). Marker-"
+                     "MT runs and chunk ES/EN backfill. Must be > "
+                     "--pause-ms; should be long enough to not fire "
+                     "during a natural inter-clause pause.")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
 args = ap.parse_args()
@@ -432,17 +439,28 @@ def clause_flush(spk):
 
 
 def pause_watcher():
-    """Fourth flush trigger: a speech pause, evaluated PER STREAM.
-    take_sentences() ends a line on punctuation, clause_flush() on width
-    pressure; this ends it when the speaker just trails off -> no new
-    transcription delta for --pause-ms on that stream. Pauses are gaps in
-    DELTAS, not audio: pw-record streams silence frames, so each stream
-    has its own delta_t. delta_t == 0.0 until the first delta on that
-    stream ever arrives: don't flush during a silent direction's startup
-    (a silent direction must not flush a phantom line)."""
-    if args.pause_ms <= 0:
+    """Two-tier pause behaviour, evaluated PER STREAM. Pauses are gaps
+    in transcription DELTAS, not audio (pw-record streams silence
+    frames; each stream has its own delta_t, refreshed only by deltas
+    with non-whitespace content).
+
+      • short pause (--pause-ms, default 800ms) -> flush the live
+        region as a VISUAL chunk (is_final=False). The chunk lands in
+        history with ES/EN = "⋯"; sent_raw keeps accumulating with the
+        next [N] marker. Marker-MT does NOT run yet. This gives the
+        comfortable visual flow between clauses without fragmenting MT.
+      • long  pause (--sentence-close-ms, default 3000ms) -> CLOSE the
+        sentence (is_final=True). Marker-MT translates the whole
+        sent_raw and all open chunks get their ES/EN backfilled.
+
+    delta_t == 0.0 until the first delta on a stream ever arrives: a
+    silent direction must not flush a phantom line during startup."""
+    if args.pause_ms <= 0 and args.sentence_close_ms <= 0:
         return
-    gap_s = args.pause_ms / 1000.0
+    visual_s = args.pause_ms / 1000.0 if args.pause_ms > 0 else None
+    close_s = (args.sentence_close_ms / 1000.0
+               if args.sentence_close_ms > 0 else None)
+    min_sub = max(12, args.min_clause // 2)
     while not _STOP.is_set():
         time.sleep(0.1)
         jobs = []
@@ -450,27 +468,28 @@ def pause_watcher():
             now = time.time()
             for lbl in STREAMS:
                 s = _state["streams"][lbl]
-                seen = s["delta_t"] > 0.0
+                if s["delta_t"] <= 0.0:
+                    continue
                 gap = now - s["delta_t"]
                 rem = s["cur_live"].strip()
-                # Trigger when the pause clock has run out AND either
-                # there's something in cur_live OR a sentence-in-progress
-                # has open chunks awaiting an EN backfill (so the
-                # earlier clause_flush'd pieces don't sit as "⋯" forever
-                # just because the trailing tail was tiny / silent).
-                if seen and gap >= gap_s and (rem or s["open_ids"]):
+                # Long pause first (higher threshold) — covers the case
+                # where the speaker truly stopped and the sentence must
+                # close so open chunks' ES/EN can backfill.
+                if (close_s is not None and gap >= close_s
+                        and (rem or s["open_ids"])):
                     s["cur_live"] = ""
                     s["cur_es"] = s["cur_en"] = ""
-                    if rem and len(rem) >= max(12, args.min_clause // 2):
-                        # substantive tail: emit + finalize the sentence
-                        job = _emit_chunk_locked(lbl, rem, is_final=True)
-                    else:
-                        # tail too short to translate alone: discard the
-                        # tail, but if open chunks exist we still need to
-                        # close the sentence so their EN backfills.
-                        job = _emit_chunk_locked(lbl, "", is_final=True)
+                    tail = rem if (rem and len(rem) >= min_sub) else ""
+                    job = _emit_chunk_locked(lbl, tail, is_final=True)
                     if job is not None:
                         jobs.append(job)
+                # Short pause: flush a visual chunk, keep the sentence
+                # open so MT still translates the whole utterance.
+                elif (visual_s is not None and gap >= visual_s
+                      and rem and len(rem) >= min_sub):
+                    s["cur_live"] = ""
+                    s["cur_es"] = s["cur_en"] = ""
+                    _emit_chunk_locked(lbl, rem, is_final=False)
         for job in jobs:
             _final_q.put(job)
 

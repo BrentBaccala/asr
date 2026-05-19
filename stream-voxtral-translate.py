@@ -1,27 +1,28 @@
 #!/home/cosine/asr/mt-env/bin/python
 """
-Live Spanish transcription (Voxtral realtime, vLLM) + running English
-translation (NLLB-200-distilled-600M int8, CTranslate2, CPU).
+Live Spanish transcription (Voxtral realtime, vLLM) with an English
+translation injected inline whenever it is ready.
 
-Pipe the samsung->pony RTP tap in, exactly like stream-voxtral.py:
+Pipe the samsung->pony RTP tap in, like stream-voxtral.py:
 
   ssh cosine@pony
   export XDG_RUNTIME_DIR=/run/user/$(id -u)
   pw-record --target rtp_call_remote_source --format=s16 --rate=16000 \
             --channels=1 - | ~/asr/stream-voxtral-translate.py
 
-Design (the research report's v1 = COMMIT-ONLY translation, zero churn):
-Voxtral streams committed Spanish; we accumulate it into sentences and,
-on each sentence-final boundary (.?! / utterance end), print a paired
-block:
+UX: the Spanish flows in near-real-time as Voxtral emits it. Each
+completed sentence is translated off-thread on the CPU (NLLB-200
+distilled-600M int8, CTranslate2); when a translation is ready it is
+printed on its own marked line, then the live Spanish continues. The
+EN line therefore appears *interleaved* with the ongoing Spanish (one
+sentence behind, wherever the ~0.3-0.8 s MT finished) — that lag is
+inherent to keeping the Spanish real-time and is the explicit design.
 
-  ES  <spanish sentence>
-  EN  <english translation>
-
-No live re-translating partial sentences (no flicker). MT runs on the
-CPU in a worker thread (NLLB int8, ~0.3-0.8 s/sentence) so it never
-blocks the audio WebSocket. The Spanish side and the GPU vLLM server
-are untouched.
+All stdout goes through ONE writer thread fed by a single queue, so
+the live ES deltas and the async EN blocks never race; their order is
+exactly the order things became ready. Append-only (no carriage
+return), so terminal line-wrap is harmless. Voxtral and the GPU vLLM
+server are untouched; MT is CPU-only (zero GPU contention).
 
 Prereqs: vLLM Voxtral server on 127.0.0.1:8000; NLLB CT2 model at
 ~/asr/models/nllb-600m-ct2.
@@ -47,6 +48,8 @@ NLLB_DIR = os.path.expanduser("~/asr/models/nllb-600m-ct2")
 CHUNK = 2048 * 2                       # 128 ms s16le @ 16 kHz
 SENT_RE = re.compile(r'(.+?[.!?…]+["»”\'\)\]]*)(?:\s+|$)', re.S)
 SOFT_CAP = 240                         # flush a run-on as a clause past this
+EN_PREFIX = "\n      \033[36m[EN]\033[0m "   # cyan tag, own line
+EN_SUFFIX = "\n"
 
 print("[stream-voxtral-translate] loading NLLB...", file=sys.stderr,
       flush=True)
@@ -66,13 +69,41 @@ def translate(es: str) -> str:
     return _tok.decode(_tok.convert_tokens_to_ids(h)).strip()
 
 
-# MT worker: completed Spanish sentences in -> paired ES/EN block out.
-_sent_q: "queue.Queue[str|None]" = queue.Queue()
+# ---- single stdout owner: drains out_q, renders ES inline + EN blocks ----
+# items: ("es", text)  live Spanish delta
+#        ("en", text)  finished translation, inject on its own line
+out_q: "queue.Queue[tuple[str,str]|None]" = queue.Queue()
+
+
+def writer():
+    at_bol = True                      # at beginning of an output line?
+    while True:
+        item = out_q.get()
+        if item is None:
+            if not at_bol:
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+            return
+        kind, text = item
+        if kind == "es":
+            sys.stdout.write(text)
+            if text:
+                at_bol = text.endswith("\n")
+        else:  # "en" — break the Spanish line, print marked, resume after
+            if not at_bol:
+                sys.stdout.write("\n")
+            sys.stdout.write(EN_PREFIX + text + EN_SUFFIX)
+            at_bol = True
+        sys.stdout.flush()
+
+
+# ---- MT worker: completed Spanish sentences -> ("en", translation) ----
+sent_q: "queue.Queue[str|None]" = queue.Queue()
 
 
 def mt_worker():
     while True:
-        es = _sent_q.get()
+        es = sent_q.get()
         if es is None:
             return
         es = es.strip()
@@ -80,10 +111,9 @@ def mt_worker():
             continue
         try:
             en = translate(es)
-        except Exception as e:                       # never kill the stream
+        except Exception as e:
             en = f"[translate error: {e}]"
-        sys.stdout.write(f"ES  {es}\nEN  {en}\n\n")
-        sys.stdout.flush()
+        out_q.put(("en", en))
 
 
 def stdin_reader(q, loop):
@@ -96,13 +126,11 @@ def stdin_reader(q, loop):
 
 
 def split_sentences(buf: str):
-    """Return (complete_sentences, remaining_tail) from buf."""
     out, pos = [], 0
     for m in SENT_RE.finditer(buf):
         out.append(m.group(1).strip())
         pos = m.end()
     tail = buf[pos:]
-    # Run-on with no terminal punctuation: flush at last space as a clause.
     if len(tail) > SOFT_CAP:
         cut = tail.rfind(" ", 0, SOFT_CAP)
         if cut > 0:
@@ -127,9 +155,10 @@ async def main():
             return
         await ws.send(json.dumps({"type": "session.update", "model": MODEL}))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        print("[stream-voxtral-translate] connected, streaming "
-              "(ES + running EN)...", file=sys.stderr, flush=True)
+        print("[stream-voxtral-translate] connected — live ES, inline EN...",
+              file=sys.stderr, flush=True)
 
+        threading.Thread(target=writer, daemon=True).start()
         threading.Thread(target=mt_worker, daemon=True).start()
         q = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -143,14 +172,17 @@ async def main():
                 m = json.loads(await ws.recv())
                 t = m.get("type")
                 if t == "transcription.delta":
-                    buf[0] += m["delta"]
+                    d = m["delta"]
+                    out_q.put(("es", d))            # live Spanish, now
+                    buf[0] += d
                     sents, buf[0] = split_sentences(buf[0])
                     for s in sents:
-                        _sent_q.put(s)
+                        sent_q.put(s)               # translate off-thread
                 elif t == "transcription.done":
                     if buf[0].strip():
-                        _sent_q.put(buf[0].strip())
+                        sent_q.put(buf[0].strip())
                         buf[0] = ""
+                    out_q.put(("es", "\n"))          # break at utterance end
                 elif t == "error":
                     print(f"\n[stream-voxtral-translate] server error: {m}",
                           file=sys.stderr)
@@ -171,8 +203,9 @@ async def main():
         except asyncio.TimeoutError:
             pass
         if buf[0].strip():
-            _sent_q.put(buf[0].strip())
-    _sent_q.put(None)
+            sent_q.put(buf[0].strip())
+    sent_q.put(None)
+    out_q.put(None)
     print("[stream-voxtral-translate] bye.", file=sys.stderr)
 
 

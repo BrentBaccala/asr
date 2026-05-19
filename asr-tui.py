@@ -272,20 +272,25 @@ def take_sentences(spk):
 
 
 def clause_flush(spk):
-    """Pressure-based: only when this stream's in-progress Spanish would
-    exceed one live line, commit a leading clause at the *rightmost*
-    comma that still fits the line (so the flushed clause is near-full ->
-    good context, short tail restarts). No comma within a line and badly
-    overflowing -> hard word-cut so it can't run forever; mildly over
-    with no comma -> leave it. Each flushed clause goes to history like a
-    sentence."""
+    """Last-resort guard against unbounded growth — NOT a per-line
+    chopper. Normal sentences end via punctuation (take_sentences) or a
+    speech pause (pause_watcher), which keep whole clauses together so
+    NLLB has context. Only a genuine run-on with no punctuation for many
+    lines is force-broken here, at the rightmost comma that leaves a
+    substantial chunk (>= minc). Breaking mid-sentence into short
+    fragments was translating them out of context (e.g. a lone
+    'elocuencia' -> garbage); hence the generous multi-line budget and
+    large minimum."""
     if not args.line_flush:
         return
     with _lock:
         s = _state["streams"][spk]
-        budget = max(40, _state["cols"] - 4)     # one ES▸ line of chars
+        line = max(40, _state["cols"] - 4)       # one ES▸ row of chars
+        # allow several wrapped rows before any forced break, so
+        # ordinary sentences finalize whole via punctuation/pause
+        budget = line * 6
         buf = s["cur_es"]
-        minc = max(15, args.min_clause)
+        minc = max(80, args.min_clause)          # never flush a short bit
         flushed, changed = [], False
         while len(buf) > budget:
             cut = -1
@@ -331,11 +336,16 @@ def pause_watcher():
                 seen = s["delta_t"] > 0.0
                 gap = now - s["delta_t"]
                 rem = s["cur_es"].strip()
-                if (seen and gap >= gap_s
-                        and len(rem) >= max(12, args.min_clause // 2)):
+                if seen and gap >= gap_s and rem:
+                    # Pause reached: ALWAYS clear the live line so a
+                    # short tail can't stay stuck (the "Por eso," that
+                    # never promoted nor cleared). Promote to history
+                    # only if substantive; a tiny scrap would just make
+                    # NLLB hallucinate, so drop it rather than freeze it.
                     s["cur_es"] = ""
                     s["cur_en"] = ""
-                    pending.append((lbl, rem))
+                    if len(rem) >= max(12, args.min_clause // 2):
+                        pending.append((lbl, rem))
         for lbl, rem in pending:
             _final_q.put((lbl, rem))
 
@@ -567,10 +577,14 @@ def render():
             lines.append(CSI + "2m" + ("─" * cols) + CSI + "0m")
             for ln, ansi in live:
                 lines.append(CSI + ansi + ln + CSI + "0m")
-            frame = CSI + "H"
-            for ln in lines[:rows]:
-                frame += ln + CSI + "K\r\n"
-            frame += CSI + "J"
+            # Newlines BETWEEN lines only — never after the last shown
+            # line. A trailing \r\n on the rows-th line drops the cursor
+            # one row past the bottom, scrolling the alt-screen up by one
+            # every frame, which scrolled the header off the top ~10x/s
+            # (the "flickering top line").
+            shown = lines[:rows]
+            frame = (CSI + "H" + (CSI + "K\r\n").join(shown)
+                     + CSI + "K" + CSI + "J")
             w(frame)
             sys.stdout.flush()
             time.sleep(0.1)

@@ -42,17 +42,21 @@ keys; quit with Ctrl-C (terminal is restored).
 """
 import argparse
 import asyncio
+import atexit
 import base64
 import json
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
@@ -160,6 +164,13 @@ _state = {
     "audio_t": 0.0,        # wall time of last audio chunk, any stream
     "cols": 100,           # live-line width budget, kept current by render
     "next_chunk_id": 1,    # monotonic; survives FROZEN_CAP truncation
+    # Scrollback: how many rendered rows the history region is scrolled
+    # back from the bottom (0 = follow live). Live region keeps updating
+    # regardless. Input thread (input_reader) bumps this on wheel/keys;
+    # render() consumes + clamps + reads back the clamped value.
+    "scroll_offset": 0,
+    "last_body_h": 1,      # body height of the last render (PgUp/PgDn unit)
+    "last_hist_total": 0,  # total rendered hist lines last frame (clamp)
 }
 
 
@@ -628,6 +639,11 @@ def net_thread():
 CSI = "\033["
 ALT_ON, ALT_OFF = CSI + "?1049h", CSI + "?1049l"
 CUR_HIDE, CUR_SHOW = CSI + "?25l", CSI + "?25h"
+# Mouse tracking on the alt-screen: basic button events (?1000) + SGR
+# extended encoding (?1006). The terminal then sends wheel-up/down as
+# CSI < 64;col;row M / CSI < 65;col;row M on /dev/tty.
+MOUSE_ON  = CSI + "?1000h" + CSI + "?1006h"
+MOUSE_OFF = CSI + "?1006l" + CSI + "?1000l"
 
 
 def wrap(s, w):
@@ -646,9 +662,139 @@ def wrap(s, w):
     return out or [""]
 
 
+# ---------------- scrollback input ----------------
+# Wheel/keys arrive on /dev/tty (NOT stdin — stdin is the audio pipe in
+# single-stream mode). We open /dev/tty separately, put it in cbreak so
+# we get bytes per keystroke without echo, parse CSI sequences, and
+# update _state["scroll_offset"]. ISIG stays on so Ctrl-C still
+# delivers SIGINT to the main thread.
+
+_tty_fd = None
+_tty_old_attrs = None
+_WHEEL_LINES = 3            # rows per wheel click
+
+
+def _tty_setup():
+    """Open /dev/tty in cbreak mode and remember its prior attrs.
+    Returns the fd on success, None if /dev/tty isn't available (no
+    controlling terminal — scrollback then silently disabled)."""
+    global _tty_fd, _tty_old_attrs
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        _tty_old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except (termios.error, OSError):
+        os.close(fd)
+        return None
+    _tty_fd = fd
+    atexit.register(_tty_restore)
+    return fd
+
+
+def _tty_restore():
+    """Restore /dev/tty to its prior attrs. Idempotent + crash-safe
+    (atexit-registered too) so a hard exit can't leave the user's
+    shell in cbreak."""
+    global _tty_fd, _tty_old_attrs
+    if _tty_fd is not None and _tty_old_attrs is not None:
+        try:
+            termios.tcsetattr(_tty_fd, termios.TCSANOW, _tty_old_attrs)
+        except Exception:
+            pass
+        try:
+            os.close(_tty_fd)
+        except Exception:
+            pass
+    _tty_fd, _tty_old_attrs = None, None
+
+
+def _scroll(delta):
+    """Adjust scroll_offset by delta (positive = back/up, negative =
+    down/toward live). Clamping happens in render() — it knows the
+    true upper bound (total hist lines - body_h)."""
+    with _lock:
+        _state["scroll_offset"] = max(0, _state["scroll_offset"] + delta)
+
+
+# SGR mouse event:  CSI <  B ; X ; Y  M/m   (M=press, m=release)
+_MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+def input_reader(fd):
+    """Daemon: read /dev/tty, parse wheel + arrow/PgUp/PgDn/Home/End/q,
+    drive scroll_offset and the quit signal."""
+    buf = b""
+    while not _STOP.is_set():
+        try:
+            r, _, _ = select.select([fd], [], [], 0.1)
+        except (OSError, ValueError):
+            return
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 256)
+        except (BlockingIOError, OSError):
+            continue
+        if not chunk:
+            continue
+        buf += chunk
+        # Try to consume one event at a time from the front of buf.
+        while buf:
+            # SGR mouse first (longest specific match)
+            m = _MOUSE_RE.match(buf)
+            if m:
+                btn, _x, _y, _kind = m.groups()
+                btn = int(btn)
+                if btn == 64:                    # wheel up
+                    _scroll(+_WHEEL_LINES)
+                elif btn == 65:                  # wheel down
+                    _scroll(-_WHEEL_LINES)
+                buf = buf[m.end():]
+                continue
+            b0 = buf[:1]
+            if b0 in (b"q", b"Q"):
+                _STOP.set()
+                buf = buf[1:]
+                continue
+            if b0 != b"\x1b":
+                # ignore stray printable chars
+                buf = buf[1:]
+                continue
+            # ESC-prefixed sequences
+            if buf.startswith(b"\x1b[A"):    _scroll(+1);              buf = buf[3:]; continue
+            if buf.startswith(b"\x1b[B"):    _scroll(-1);              buf = buf[3:]; continue
+            if buf.startswith(b"\x1b[5~"):   _scroll(+_state["last_body_h"]); buf = buf[4:]; continue
+            if buf.startswith(b"\x1b[6~"):   _scroll(-_state["last_body_h"]); buf = buf[4:]; continue
+            if buf.startswith(b"\x1b[H") or buf.startswith(b"\x1b[1~"):
+                with _lock:
+                    _state["scroll_offset"] = 10**9   # clamped down to max in render
+                buf = buf[3 if buf[2:3] == b"H" else 4:]; continue
+            if buf.startswith(b"\x1b[F") or buf.startswith(b"\x1b[4~"):
+                with _lock:
+                    _state["scroll_offset"] = 0
+                buf = buf[3 if buf[2:3] == b"F" else 4:]; continue
+            # Unknown ESC sequence: try to skip past terminator, else
+            # break to wait for more bytes.
+            if len(buf) < 2:
+                break
+            if buf[1:2] not in (b"[", b"O"):
+                buf = buf[1:]
+                continue
+            term = -1
+            for i in range(2, len(buf)):
+                if 0x40 <= buf[i] <= 0x7e:
+                    term = i; break
+            if term == -1:
+                break       # incomplete; wait
+            buf = buf[term + 1:]
+
+
 def render():
     w = sys.stdout.write
-    w(ALT_ON + CUR_HIDE)
+    w(ALT_ON + CUR_HIDE + MOUSE_ON)
     sys.stdout.flush()
     try:
         while True:
@@ -668,8 +814,12 @@ def render():
             live_mark = "●" if (time.time() - at) < 1.5 else "○"
             dual = STREAMS != [SOLO]
             spk_tag = "  │  Remote+Me" if dual else ""
-            head = (f" asr-tui  │  {status}  │  audio {live_mark}{spk_tag}"
-                    f"  │  {len(frozen)} done  │  Ctrl-C quit")
+            with _lock:
+                so = _state["scroll_offset"]
+            scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
+            head = (f" asr-tui  │  {status}  │  audio {live_mark}"
+                    f"{spk_tag}{scroll_tag}  │  {len(frozen)} done  "
+                    f"│  Ctrl-C quit")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 
             def wrap_pref(text, prefix):
@@ -759,7 +909,23 @@ def render():
                     else:
                         hist.append(out)
                 hist.append("")
-            hist = hist[-body_h:] if body_h > 0 else []
+            # Apply scrollback: scroll_offset is rows back from the
+            # bottom (the live-following position). Clamp it to a sane
+            # range and write the clamped value back so the indicator
+            # never advertises a position you can't reach.
+            total = len(hist)
+            max_off = max(0, total - body_h)
+            so = min(max(0, so), max_off)
+            with _lock:
+                _state["scroll_offset"] = so
+                _state["last_body_h"] = max(1, body_h)
+                _state["last_hist_total"] = total
+            if body_h > 0:
+                end = total - so
+                start = max(0, end - body_h)
+                hist = hist[start:end]
+            else:
+                hist = []
             while len(hist) < body_h:
                 hist.insert(0, "")
             lines += hist
@@ -783,7 +949,7 @@ def render():
             sys.stdout.flush()
             time.sleep(0.1)
     finally:
-        w(CUR_SHOW + ALT_OFF)
+        w(MOUSE_OFF + CUR_SHOW + ALT_OFF)
         sys.stdout.flush()
 
 
@@ -813,7 +979,18 @@ def main():
     if args.plain:
         plain_loop()
     else:
-        render()
+        # Open /dev/tty for keyboard/mouse input (scrollback). Mouse
+        # tracking is enabled inside render() (MOUSE_ON in the alt-
+        # screen setup) so terminal mode is restored even if render
+        # crashes. tty restoration is also atexit-registered.
+        fd = _tty_setup()
+        try:
+            if fd is not None:
+                threading.Thread(target=input_reader, args=(fd,),
+                                 daemon=True).start()
+            render()
+        finally:
+            _tty_restore()
     print("[asr-tui] bye.", file=sys.stderr)
 
 

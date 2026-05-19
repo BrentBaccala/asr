@@ -691,14 +691,19 @@ def render():
             lines.append(CSI + "2m" + ("─" * cols) + CSI + "0m")
             for ln, ansi in live:
                 lines.append(CSI + ansi + ln + CSI + "0m")
-            # Newlines BETWEEN lines only — never after the last shown
-            # line. A trailing \r\n on the rows-th line drops the cursor
-            # one row past the bottom, scrolling the alt-screen up by one
-            # every frame, which scrolled the header off the top ~10x/s
-            # (the "flickering top line").
+            # Position each row ABSOLUTELY with CSI <r>;1H rather than
+            # advancing with \r\n. The header is exactly `cols` chars
+            # wide; on eager-wrap terminals the cols-th char auto-wraps
+            # the cursor, so a between-lines \r\n then over-advances by
+            # one row, line N lands at row 2N-1, and the late rows
+            # scroll the header off. Absolute positioning avoids any
+            # dependence on auto-wrap or newline-induced scroll.
             shown = lines[:rows]
-            frame = (CSI + "H" + (CSI + "K\r\n").join(shown)
-                     + CSI + "K" + CSI + "J")
+            parts = [f"{CSI}{i+1};1H{CSI}K{ln}"
+                     for i, ln in enumerate(shown)]
+            if len(shown) < rows:
+                parts.append(f"{CSI}{len(shown)+1};1H{CSI}J")
+            frame = "".join(parts)
             w(frame)
             sys.stdout.flush()
             time.sleep(0.1)

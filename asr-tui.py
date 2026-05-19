@@ -375,11 +375,21 @@ async def net_main(source_name, label, q, loop):
                 m = json.loads(await ws.recv())
                 t = m.get("type")
                 if t == "transcription.delta":
+                    d = m["delta"]
                     with _lock:
                         s = _state["streams"][label]
-                        s["cur_es"] += m["delta"]
-                        s["delta_t"] = time.time()
-                        _state["active"] = label
+                        s["cur_es"] += d          # keep text fidelity
+                        # Only a delta with non-whitespace content counts
+                        # as speech activity. An always-on channel keeps
+                        # streaming silence; Voxtral answers with empty/
+                        # whitespace deltas, which must NOT refresh the
+                        # pause clock (else pause_watcher never fires and
+                        # a trailed-off line stays stuck — observed when
+                        # the source audio is stopped but RTP keeps
+                        # sending zeros).
+                        if d.strip():
+                            s["delta_t"] = time.time()
+                            _state["active"] = label
                     take_sentences(label)
                     clause_flush(label)
                 elif t == "transcription.done":

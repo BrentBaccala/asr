@@ -62,6 +62,10 @@ ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
 ap.add_argument("--min-clause", type=int, default=25,
                 help="never line-flush a leading clause shorter than this "
                      "many chars (avoids tiny-fragment mistranslation)")
+ap.add_argument("--pause-ms", type=int, default=800,
+                help="end the working line after this many ms with no new "
+                     "transcription delta (speaker paused). 0 disables. "
+                     "Keep comfortably above transcription_delay_ms (240)")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
 args = ap.parse_args()
@@ -79,6 +83,7 @@ _state = {
     "cur_en": "",          # masked live English of cur_es
     "status": "starting",
     "audio_t": 0.0,        # wall time of last audio chunk (activity)
+    "delta_t": 0.0,        # wall time of last transcription delta (speech)
     "cols": 100,           # live-line width budget, kept current by render
     "stop": False,
 }
@@ -222,6 +227,38 @@ def clause_flush():
             _final_q.put(s)
 
 
+def pause_watcher():
+    """Fourth flush trigger: a speech pause. take_sentences() ends a line
+    on punctuation, clause_flush() on width pressure; this ends it when the
+    speaker just trails off (no end punctuation, line not wide enough to
+    pressure-flush) -> no new transcription delta for --pause-ms. Pauses
+    are gaps in DELTAS, not audio: pw-record streams silence frames, so
+    audio_t is always fresh -> delta_t is the right clock. Same
+    substantive-tail guard as the EOF block (a 1-3 char scrap just makes
+    NLLB hallucinate boilerplate). After a flush cur_es is empty, so the
+    guard stops it re-firing while silence continues; the next delta
+    starts a fresh line."""
+    if args.pause_ms <= 0:
+        return
+    gap_s = args.pause_ms / 1000.0
+    while not _STOP.is_set():
+        time.sleep(0.1)
+        with _lock:
+            # delta_t == 0.0 until the first delta ever arrives: don't
+            # flush during startup silence (now - 0.0 is huge).
+            seen = _state["delta_t"] > 0.0
+            gap = time.time() - _state["delta_t"]
+            rem = _state["cur_es"].strip()
+            if (seen and gap >= gap_s
+                    and len(rem) >= max(12, args.min_clause // 2)):
+                _state["cur_es"] = ""
+                _state["cur_en"] = ""
+            else:
+                rem = ""
+        if rem:
+            _final_q.put(rem)
+
+
 async def net_main():
     uri = f"ws://{HOST}:{PORT}/v1/realtime"
     try:
@@ -253,6 +290,7 @@ async def net_main():
                 if t == "transcription.delta":
                     with _lock:
                         _state["cur_es"] += m["delta"]
+                        _state["delta_t"] = time.time()
                     take_sentences()
                     clause_flush()
                 elif t == "transcription.done":
@@ -424,6 +462,7 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     threading.Thread(target=mt_worker, daemon=True).start()
     threading.Thread(target=net_thread, daemon=True).start()
+    threading.Thread(target=pause_watcher, daemon=True).start()
     if args.plain:
         plain_loop()
     else:

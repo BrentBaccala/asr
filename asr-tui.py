@@ -121,24 +121,32 @@ _STOP = threading.Event()
 
 def _new_stream_state():
     return {
-        "cur_es": "",      # in-progress Spanish since last visual chunk
-        "cur_en": "",      # masked live English of cur_es (preview only)
-        "delta_t": 0.0,    # wall time of last transcription delta (speech)
+        # Three live "views" per stream: cur_live is the raw Voxtral
+        # transcription (possibly code-switched); cur_es and cur_en are
+        # NLLB translations of cur_live into Spanish and English
+        # respectively. All three render in the live block as Live▸ /
+        # ES▸ / EN▸; on sentence finalize the chunk's es/en fields in
+        # `frozen` are filled with the marker-aligned segments.
+        "cur_live": "",      # raw Voxtral text since last visual chunk
+        "cur_es": "",        # masked live Spanish translation of cur_live
+        "cur_en": "",        # masked live English translation of cur_live
+        "delta_t": 0.0,      # wall time of last transcription delta (speech)
         # Visual chunking (clause_flush / take_sentences) decouples from
-        # MT: each chunk lands in `frozen` immediately with en=None
-        # (live ES flow), but its EN is filled in once the WHOLE sentence
-        # is translated. We build `sent_es` by joining emitted chunks with
+        # MT: each chunk lands in `frozen` immediately with es=None and
+        # en=None (live raw flow), and its translations are filled in
+        # once the WHOLE sentence is translated TWICE (target=spa_Latn,
+        # target=eng_Latn). `sent_raw` joins emitted raw chunks with
         # [N] markers (which NLLB passes through cleanly — empirically
-        # verified across 7 sentences, 0 marker drops, perfect order);
-        # at sentence end we translate sent_es, split EN on the markers,
-        # and backfill each open chunk's EN by its chunk_id.
-        "sent_es": "",       # marker-laden Spanish for the in-progress sent.
-        "open_ids": [],      # chunk_ids whose en is still None pending backfill
+        # verified, 0 marker drops across 7 sentences, perfect order);
+        # at sentence end each translation is split on the markers and
+        # each open chunk's es/en is backfilled by its chunk_id.
+        "sent_raw": "",      # marker-laden raw text for the in-progress sentence
+        "open_ids": [],      # chunk_ids whose es/en are pending backfill
     }
 
 
 _state = {
-    "frozen": [],          # list[(speaker, es, en_or_None, chunk_id)]
+    "frozen": [],          # list[(speaker, raw, es_or_None, en_or_None, chunk_id)]
     "streams": {lbl: _new_stream_state() for lbl in STREAMS},
     "active": STREAMS[0],  # label of the last stream to get a delta
     "status": "starting",
@@ -152,7 +160,7 @@ def st_get():
     with _lock:
         act = _state["active"]
         s = _state["streams"][act]
-        return (list(_state["frozen"]), act, s["cur_es"], s["cur_en"],
+        return (list(_state["frozen"]), act, s["cur_live"], s["cur_en"],
                 _state["status"], _state["audio_t"])
 
 
@@ -164,12 +172,15 @@ _tr = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
                              inter_threads=1, intra_threads=8)
 
 
-def translate(es: str) -> str:
-    src = _tok.convert_ids_to_tokens(_tok.encode(es))
-    r = _tr.translate_batch([src], target_prefix=[["eng_Latn"]],
+def translate(text: str, tgt: str = "eng_Latn") -> str:
+    """Translate `text` into target language `tgt` (a FLORES-200 code,
+    e.g. 'eng_Latn' or 'spa_Latn'). Source language is the tokenizer's
+    src_lang set at load time."""
+    src = _tok.convert_ids_to_tokens(_tok.encode(text))
+    r = _tr.translate_batch([src], target_prefix=[[tgt]],
                             beam_size=args.beam, max_decoding_length=512)
     h = r[0].hypotheses[0]
-    if h and h[0] == "eng_Latn":
+    if h and h[0] == tgt:
         h = h[1:]
     return _tok.decode(_tok.convert_tokens_to_ids(h)).strip()
 
@@ -182,7 +193,7 @@ def mask_tail(en: str, k: int) -> str:
 
 
 # Marker pattern for whole-sentence MT with chunk-aligned EN backfill.
-# Inserted as " [N] " between visual chunks in sent_es; NLLB passes
+# Inserted as " [N] " between visual chunks in sent_raw; NLLB passes
 # them through at semantically aligned English positions.
 MARKER_RE = re.compile(r"\s*\[\d+\]\s*")
 
@@ -202,15 +213,15 @@ def _split_on_markers(en: str, expected_n: int) -> list:
     return parts[:expected_n - 1] + [" ".join(parts[expected_n - 1:])]
 
 
-# Sentence-complete jobs: (speaker, sent_es_with_markers, list_of_chunk_ids).
+# Sentence-complete jobs: (speaker, sent_raw_with_markers, list_of_chunk_ids).
 # One job per sentence (not per chunk).
 _final_q: "queue.Queue[tuple]" = queue.Queue()
 
 
 def _emit_chunk_locked(spk, es_text, is_final):
     """Caller holds _lock. Appends a visual chunk to `frozen` with
-    en=None (live ES flow); marker-joins it into the stream's sent_es.
-    Returns a (spk, sent_es, open_ids) sentence-finalize job iff
+    en=None (live ES flow); marker-joins it into the stream's sent_raw.
+    Returns a (spk, sent_raw, open_ids) sentence-finalize job iff
     is_final and there's a sentence to translate, else None — caller
     queues the job after releasing the lock."""
     es_text = es_text.strip()
@@ -218,90 +229,106 @@ def _emit_chunk_locked(spk, es_text, is_final):
     if es_text:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1
-        _state["frozen"].append((spk, es_text, None, cid))
+        # 5-tuple: (spk, raw, es_translation, en_translation, chunk_id);
+        # both translations start as None pending sentence-level MT.
+        _state["frozen"].append((spk, es_text, None, None, cid))
         _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
         # Marker BEFORE this chunk if it isn't the first of the sentence.
         # Number the markers 1, 2, ... per the probe (which used [1][2][3]).
         if s["open_ids"]:
-            s["sent_es"] += f" [{len(s['open_ids'])}] " + es_text
+            s["sent_raw"] += f" [{len(s['open_ids'])}] " + es_text
         else:
-            s["sent_es"] = es_text
+            s["sent_raw"] = es_text
         s["open_ids"].append(cid)
-    if is_final and s["sent_es"]:
-        job = (spk, s["sent_es"], list(s["open_ids"]))
-        s["sent_es"] = ""
+    if is_final and s["sent_raw"]:
+        job = (spk, s["sent_raw"], list(s["open_ids"]))
+        s["sent_raw"] = ""
         s["open_ids"] = []
         return job
     return None
 
 
-def _backfill_chunk_en_locked(chunk_id: int, en: str) -> None:
+def _backfill_chunk_translations_locked(chunk_id: int,
+                                        es: str, en: str) -> None:
     """Caller holds _lock. Find the frozen row with this chunk_id and
-    set its en field. Silent no-op if the row was truncated by
-    FROZEN_CAP (very-long-call edge case)."""
+    set BOTH its es and en fields. Silent no-op if the row was
+    truncated by FROZEN_CAP (very-long-call edge case)."""
     fr = _state["frozen"]
     for i in range(len(fr) - 1, -1, -1):    # search from the back (recent)
-        if fr[i][3] == chunk_id:
-            spk, es, _old, cid = fr[i]
-            fr[i] = (spk, es, en, cid)
+        if fr[i][4] == chunk_id:            # chunk_id is now at index 4
+            spk, raw, _old_es, _old_en, cid = fr[i]
+            fr[i] = (spk, raw, es, en, cid)
             return
 
 
 def mt_worker():
-    # per-stream last-source so a quiet stream's stale cur_es isn't
+    # per-stream last-source so a quiet stream's stale cur_live isn't
     # re-translated, and one stream's text never seeds another's.
     last_src = {lbl: None for lbl in STREAMS}
     while True:
         if _STOP.is_set():
             return
         # 1. priority: a sentence has completed — translate marker-laden
-        # sent_es, split EN on markers, backfill the open chunks' EN.
+        # sent_raw, split EN on markers, backfill the open chunks' EN.
         try:
             job = _final_q.get_nowait()
         except queue.Empty:
             job = None
         if job is not None:
-            spk, sent_es, open_ids = job
+            spk, sent_raw, open_ids = job
             try:
-                full_en = translate(sent_es)
+                full_es = translate(sent_raw, tgt="spa_Latn")
+            except Exception as e:
+                full_es = f"[mt error: {e}]"
+            try:
+                full_en = translate(sent_raw, tgt="eng_Latn")
             except Exception as e:
                 full_en = f"[mt error: {e}]"
-            segments = _split_on_markers(full_en, len(open_ids))
+            es_segs = _split_on_markers(full_es, len(open_ids))
+            en_segs = _split_on_markers(full_en, len(open_ids))
             with _lock:
-                for cid, seg in zip(open_ids, segments):
-                    _backfill_chunk_en_locked(cid, seg)
+                for cid, es, en in zip(open_ids, es_segs, en_segs):
+                    _backfill_chunk_translations_locked(cid, es, en)
             if args.plain:
                 tag = "" if spk == SOLO else f"[{spk}] "
-                # Print per chunk so --plain mirrors what's in frozen
-                # (one ES/EN pair per visual chunk).
+                # Per-chunk Live/ES/EN so --plain mirrors `frozen`.
                 with _lock:
-                    fr = {row[3]: row for row in _state["frozen"]}
-                for cid, seg in zip(open_ids, segments):
+                    fr = {row[4]: row for row in _state["frozen"]}
+                for cid, es, en in zip(open_ids, es_segs, en_segs):
                     row = fr.get(cid)
                     if row is None:
                         continue
-                    sys.stdout.write(f"{tag}ES  {row[1]}\n"
-                                     f"{tag}EN  {seg}\n")
+                    sys.stdout.write(f"{tag}Live  {row[1]}\n"
+                                     f"{tag}ES    {es}\n"
+                                     f"{tag}EN    {en}\n")
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             continue
-        # 2. else: re-translate every stream's in-progress tail for the
-        # live EN preview (cur_es is the tail since the last chunk emit;
-        # no markers — preview only, not used for history).
+        # 2. else: re-translate every stream's in-progress raw tail for
+        # the live ES + EN previews (cur_live is the tail since the last
+        # chunk emit; no markers — preview only, not used for history).
+        # Two translate calls per stream cycle on a CPU translator —
+        # acceptable on a phone call (~1-2 sentences/sec mt rate).
         did = False
         for lbl in STREAMS:
             with _lock:
-                cur = _state["streams"][lbl]["cur_es"].strip()
+                cur = _state["streams"][lbl]["cur_live"].strip()
             if cur and cur != last_src[lbl]:
                 last_src[lbl] = cur
                 try:
-                    en = translate(cur)
+                    es = translate(cur, tgt="spa_Latn")
+                except Exception as e:
+                    es = f"[mt error: {e}]"
+                try:
+                    en = translate(cur, tgt="eng_Latn")
                 except Exception as e:
                     en = f"[mt error: {e}]"
                 with _lock:
                     # only write back if still the current text (the
                     # stream may have flushed while we translated)
-                    if _state["streams"][lbl]["cur_es"].strip() == cur:
+                    if _state["streams"][lbl]["cur_live"].strip() == cur:
+                        _state["streams"][lbl]["cur_es"] = \
+                            mask_tail(es, args.mask)
                         _state["streams"][lbl]["cur_en"] = \
                             mask_tail(en, args.mask)
                 did = True
@@ -341,20 +368,20 @@ def pw_reader(source_name, q, loop):
 
 
 def take_sentences(spk):
-    """Move any completed sentences out of this stream's cur_es into
+    """Move any completed sentences out of this stream's cur_live into
     `frozen` as is_final visual chunks (closing each sentence and
     queueing it for whole-sentence MT)."""
     jobs = []
     with _lock:
         s = _state["streams"][spk]
-        buf = s["cur_es"]
+        buf = s["cur_live"]
         out, pos = [], 0
         for m in SENT_RE.finditer(buf):
             out.append(m.group(1).strip())
             pos = m.end()
         if out:
-            s["cur_es"] = buf[pos:]
-            s["cur_en"] = ""             # reset live EN for the new sentence
+            s["cur_live"] = buf[pos:]
+            s["cur_es"] = s["cur_en"] = ""             # reset live EN for the new sentence
         for sent in out:
             job = _emit_chunk_locked(spk, sent, is_final=True)
             if job is not None:
@@ -379,7 +406,7 @@ def clause_flush(spk):
         s = _state["streams"][spk]
         line = max(40, _state["cols"] - 4)       # one ES▸ row of chars
         budget = line * 6                        # allow several rows
-        buf = s["cur_es"]
+        buf = s["cur_live"]
         minc = max(80, args.min_clause)
         flushed, changed = [], False
         while len(buf) > budget:
@@ -394,10 +421,10 @@ def clause_flush(spk):
             buf = buf[cut:].lstrip()
             changed = True
         if changed:
-            s["cur_es"] = buf
-            s["cur_en"] = ""
+            s["cur_live"] = buf
+            s["cur_es"] = s["cur_en"] = ""
         # Visual chunks: NOT is_final. The chunk lands in `frozen` with
-        # en=None and joins this sentence's marker-laden sent_es; the EN
+        # en=None and joins this sentence's marker-laden sent_raw; the EN
         # will backfill when the sentence completes (punctuation/pause).
         for piece in flushed:
             if piece:
@@ -425,15 +452,15 @@ def pause_watcher():
                 s = _state["streams"][lbl]
                 seen = s["delta_t"] > 0.0
                 gap = now - s["delta_t"]
-                rem = s["cur_es"].strip()
+                rem = s["cur_live"].strip()
                 # Trigger when the pause clock has run out AND either
-                # there's something in cur_es OR a sentence-in-progress
+                # there's something in cur_live OR a sentence-in-progress
                 # has open chunks awaiting an EN backfill (so the
                 # earlier clause_flush'd pieces don't sit as "⋯" forever
                 # just because the trailing tail was tiny / silent).
                 if seen and gap >= gap_s and (rem or s["open_ids"]):
-                    s["cur_es"] = ""
-                    s["cur_en"] = ""
+                    s["cur_live"] = ""
+                    s["cur_es"] = s["cur_en"] = ""
                     if rem and len(rem) >= max(12, args.min_clause // 2):
                         # substantive tail: emit + finalize the sentence
                         job = _emit_chunk_locked(lbl, rem, is_final=True)
@@ -486,7 +513,7 @@ async def net_main(source_name, label, q, loop):
                     d = m["delta"]
                     with _lock:
                         s = _state["streams"][label]
-                        s["cur_es"] += d          # keep text fidelity
+                        s["cur_live"] += d          # keep text fidelity
                         # Only a delta with non-whitespace content counts
                         # as speech activity. An always-on channel keeps
                         # streaming silence; Voxtral answers with empty/
@@ -505,10 +532,10 @@ async def net_main(source_name, label, q, loop):
                     job = None
                     with _lock:
                         s = _state["streams"][label]
-                        rem = s["cur_es"].strip()
+                        rem = s["cur_live"].strip()
                         if rem or s["open_ids"]:
-                            s["cur_es"] = ""
-                            s["cur_en"] = ""
+                            s["cur_live"] = ""
+                            s["cur_es"] = s["cur_en"] = ""
                             # Always close the sentence; if rem is empty
                             # we still need to flush any open chunks.
                             job = _emit_chunk_locked(label, rem,
@@ -539,17 +566,17 @@ async def net_main(source_name, label, q, loop):
         except asyncio.TimeoutError:
             pass
         # Close the in-progress sentence: emit any substantive tail as
-        # the final chunk, then translate sent_es so open chunks get
+        # the final chunk, then translate sent_raw so open chunks get
         # backfilled. If only a 1-3 char scrap remains we discard the
         # tail (NLLB hallucinates on scraps) but still close so any
         # earlier-flushed chunks finish.
         job = None
         with _lock:
             s = _state["streams"][label]
-            rem = s["cur_es"].strip()
+            rem = s["cur_live"].strip()
             if rem or s["open_ids"]:
-                s["cur_es"] = ""
-                s["cur_en"] = ""
+                s["cur_live"] = ""
+                s["cur_es"] = s["cur_en"] = ""
                 tail = rem if (rem and len(rem)
                                >= max(12, args.min_clause // 2)) else ""
                 job = _emit_chunk_locked(label, tail, is_final=True)
@@ -615,6 +642,7 @@ def render():
                 status = _state["status"]
                 at = _state["audio_t"]
                 snap = [(lbl,
+                         _state["streams"][lbl]["cur_live"],
                          _state["streams"][lbl]["cur_es"],
                          _state["streams"][lbl]["cur_en"])
                         for lbl in STREAMS]
@@ -631,24 +659,33 @@ def render():
                 return [(prefix if i == 0 else indent) + ln
                         for i, ln in enumerate(body)]
 
-            # --- live block: every stream, always shown, stacked
-            # (Remote then Me). No active-speaker selection, so a
-            # silent channel's sporadic Voxtral deltas can't flip the
-            # panel back and forth (the reported flicker).
+            # --- live block: three lines per stream — Live (raw
+            # Voxtral transcription), ES (NLLB Spanish translation,
+            # masked-tail preview), EN (NLLB English translation,
+            # masked-tail preview). Always shown, both streams
+            # stacked; no active-speaker selection.
             live = []   # list[(text, ansi)]
-            for lbl, ces, cen in snap:
+            for lbl, ces_live, ces_trans, cen_trans in snap:
                 if dual:
-                    es_pref, en_pref = f"[{lbl}] ES▸ ", f"[{lbl}] EN▸ "
+                    live_pref = f"[{lbl}] Live▸ "
+                    es_pref   = f"[{lbl}] ES▸   "
+                    en_pref   = f"[{lbl}] EN▸   "
                 else:
-                    es_pref, en_pref = "ES▸ ", "EN▸ "
-                es_l = (wrap_pref(ces, es_pref) if ces
-                        else [es_pref.rstrip()])
-                en_l = (wrap_pref(cen, en_pref) if cen
-                        else [en_pref + "(translating…)"])
+                    live_pref = "Live▸ "
+                    es_pref   = "ES▸   "
+                    en_pref   = "EN▸   "
+                live_l = (wrap_pref(ces_live, live_pref) if ces_live
+                          else [live_pref.rstrip()])
+                es_l   = (wrap_pref(ces_trans, es_pref) if ces_trans
+                          else [es_pref + "(translating…)"])
+                en_l   = (wrap_pref(cen_trans, en_pref) if cen_trans
+                          else [en_pref + "(translating…)"])
+                for ln in live_l:
+                    live.append((ln, "1m"))           # raw: bold
                 for ln in es_l:
-                    live.append((ln, "1m"))
+                    live.append((ln, "1;33m"))        # ES: bold yellow
                 for ln in en_l:
-                    live.append((ln, "1;36m"))
+                    live.append((ln, "1;36m"))        # EN: bold cyan
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)
@@ -656,33 +693,45 @@ def render():
                 live = live[-live_budget:]
             live_h = 1 + len(live)                       # +1 separator
             body_h = max(0, rows - 1 - live_h)
-            # history (most recent at the bottom), fills remaining space,
-            # interleaved + speaker-tagged. En is None until the whole
-            # sentence finishes translating, "" if the marker-split
-            # placed the EN content on a neighboring chunk.
+            # history (most recent at the bottom). Each chunk renders
+            # three lines — Live (raw transcription), ES (NLLB Spanish
+            # translation), EN (NLLB English translation), plus a
+            # separator blank. es/en are None until the whole sentence
+            # is translated, "" when the marker-split placed that
+            # field's content on a neighboring chunk (rendered "—").
+            def _trans_line(en_tag, value, ansi):
+                if value is None:
+                    return CSI + "2;" + ansi + "m" + en_tag + "⋯" + CSI + "0m"
+                if value == "":
+                    return CSI + "2;" + ansi + "m" + en_tag + "—" + CSI + "0m"
+                wrapped = wrap(value, cols - 4)
+                return [(CSI + ansi + "m"
+                         + (en_tag if i == 0 else "  ")
+                         + ln + CSI + "0m")
+                        for i, ln in enumerate(wrapped)]
             hist = []
-            for spk, es, en, _cid in frozen:
+            for spk, raw, es, en, _cid in frozen:
                 if spk == SOLO:
-                    es_tag, en_tag = "ES ", "EN "
+                    live_tag = "Live "
+                    es_tag = "ES   "
+                    en_tag = "EN   "
                 else:
                     acc = ACCENT.get(spk, "0")
-                    es_tag = (CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
-                              + "ES ")
-                    en_tag = (CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
-                              + "EN ")
-                for i, ln in enumerate(wrap(es, cols - 4)):
-                    hist.append((es_tag if i == 0 else "  ") + ln)
-                if en is None:
-                    # sentence still translating
-                    hist.append(CSI + "2;36m" + en_tag + "⋯" + CSI + "0m")
-                elif en == "":
-                    # this chunk's EN merged into an adjacent chunk
-                    hist.append(CSI + "2;36m" + en_tag + "—" + CSI + "0m")
-                else:
-                    for i, ln in enumerate(wrap(en, cols - 4)):
-                        hist.append((CSI + "36m"
-                                     + (en_tag if i == 0 else "  ")
-                                     + ln + CSI + "0m"))
+                    lead = CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
+                    live_tag = lead + "Live "
+                    es_tag   = lead + "ES   "
+                    en_tag   = lead + "EN   "
+                # Live (raw) — never None/empty: it's what got emitted.
+                for i, ln in enumerate(wrap(raw, cols - 4)):
+                    hist.append((live_tag if i == 0 else "  ") + ln)
+                for fn, tag, ansi in (
+                        (es, es_tag, "33"),   # yellow for ES translation
+                        (en, en_tag, "36")):  # cyan for EN translation
+                    out = _trans_line(tag, fn, ansi)
+                    if isinstance(out, list):
+                        hist.extend(out)
+                    else:
+                        hist.append(out)
                 hist.append("")
             hist = hist[-body_h:] if body_h > 0 else []
             while len(hist) < body_h:

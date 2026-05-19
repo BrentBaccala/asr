@@ -27,6 +27,7 @@ server are untouched; MT is CPU-only (zero GPU contention).
 Prereqs: vLLM Voxtral server on 127.0.0.1:8000; NLLB CT2 model at
 ~/asr/models/nllb-600m-ct2.
 """
+import argparse
 import asyncio
 import base64
 import json
@@ -47,9 +48,23 @@ MODEL = "mistralai/Voxtral-Mini-4B-Realtime-2602"
 NLLB_DIR = os.path.expanduser("~/asr/models/nllb-600m-ct2")
 CHUNK = 2048 * 2                       # 128 ms s16le @ 16 kHz
 SENT_RE = re.compile(r'(.+?[.!?…]+["»”\'\)\]]*)(?:\s+|$)', re.S)
-SOFT_CAP = 240                         # flush a run-on as a clause past this
 EN_PREFIX = "\n      \033[36m[EN]\033[0m "   # cyan tag, own line
 EN_SUFFIX = "\n"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--beam", type=int, default=1,
+                help="MT beam size (1=greedy, fastest; 2=slightly better, ~2x slower)")
+ap.add_argument("--clause", action=argparse.BooleanOptionalAction, default=False,
+                help="also flush at clause boundaries , ; : — measured: "
+                     "negligible latency gain on real prose AND mistranslates "
+                     "context-dependent fragments. Off by default; "
+                     "real low-latency path is masked re-translation in a TUI")
+ap.add_argument("--min-clause", type=int, default=45,
+                help="only clause-flush once the pending clause is >= this many chars")
+ap.add_argument("--soft-cap", type=int, default=140,
+                help="hard flush a run-on (no punctuation) past this many chars")
+args = ap.parse_args()
+CLAUSE_RE = re.compile(r'(.+?[,;:]["»”\'\)\]]*)(?:\s+|$)', re.S)
 
 print("[stream-voxtral-translate] loading NLLB...", file=sys.stderr,
       flush=True)
@@ -62,7 +77,7 @@ _tr = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
 def translate(es: str) -> str:
     src = _tok.convert_ids_to_tokens(_tok.encode(es))
     r = _tr.translate_batch([src], target_prefix=[["eng_Latn"]],
-                            beam_size=2, max_decoding_length=512)
+                            beam_size=args.beam, max_decoding_length=512)
     h = r[0].hypotheses[0]
     if h and h[0] == "eng_Latn":
         h = h[1:]
@@ -126,13 +141,27 @@ def stdin_reader(q, loop):
 
 
 def split_sentences(buf: str):
+    """Pull translatable units off the front of buf.
+
+    Always flush on sentence end (.?!). With --clause, also flush at
+    , ; : once the pending clause is long enough (--min-clause) so EN
+    appears mid-sentence instead of waiting for the period. Run-ons with
+    no punctuation flush at --soft-cap. Returns (units, remaining_tail).
+    """
     out, pos = [], 0
     for m in SENT_RE.finditer(buf):
         out.append(m.group(1).strip())
         pos = m.end()
     tail = buf[pos:]
-    if len(tail) > SOFT_CAP:
-        cut = tail.rfind(" ", 0, SOFT_CAP)
+    if args.clause:
+        cpos = 0
+        for m in CLAUSE_RE.finditer(tail):
+            if m.end() - cpos >= args.min_clause:
+                out.append(m.group(1).strip())
+                cpos = m.end()
+        tail = tail[cpos:]
+    if len(tail) > args.soft_cap:
+        cut = tail.rfind(" ", 0, args.soft_cap)
         if cut > 0:
             out.append(tail[:cut].strip())
             tail = tail[cut + 1:]

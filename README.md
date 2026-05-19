@@ -136,3 +136,21 @@ sub-second latency:
   canary-1b-flash, parakeet-tdt-0.6b-v3, and
   multitalker-parakeet-streaming-0.6b-v1 (via the offline transcribe
   interface, not its streaming API).
+
+---
+
+> **Note:** this README documents only the original whisper/parakeet/
+> canary trio and is **stale** — it predates `asr-tui.py` (the Voxtral
+> dual-stream `[Remote]`/`[Me]` translation TUI), `asr-call-transcribe`,
+> and the cosine phone-call pipeline that are now the primary tools
+> here. See the commit history and the script docstrings for current
+> behavior.
+
+---
+
+*This repository is developed with the assistance of an AI agent
+(Claude, via Claude Code) on behalf of Brent Baccala
+(cosine@freesoft.org). The `asr-tui.py` Voxtral dual-stream pipeline
+and the more recent streaming scripts were AI-authored across
+interactive sessions and task-runner tasks; per-commit authorship and
+co-authorship trailers record the provenance.*

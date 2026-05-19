@@ -733,6 +733,30 @@ def _scroll(delta):
         _state["scroll_offset"] = max(0, _state["scroll_offset"] + delta)
 
 
+def _clear_history():
+    """Ctrl-L: wipe the history pane + the in-flight sentence state.
+    Live region (cur_live/cur_es/cur_en) is left alone — the speaker's
+    current utterance keeps streaming — but each stream's sent_raw and
+    open_ids reset to empty, so post-clear chunks are translated as a
+    fresh sentence rather than trying to backfill into rows that no
+    longer exist. Any pending sentence-complete jobs are drained from
+    _final_q (their chunk_ids reference gone rows — backfill would
+    silently no-op but draining avoids burning MT cycles)."""
+    with _lock:
+        _state["frozen"].clear()
+        _state["scroll_offset"] = 0
+        _state["last_hist_total"] = 0
+        for lbl in STREAMS:
+            s = _state["streams"][lbl]
+            s["sent_raw"] = ""
+            s["open_ids"] = []
+    while True:
+        try:
+            _final_q.get_nowait()
+        except queue.Empty:
+            break
+
+
 # SGR mouse event:  CSI <  B ; X ; Y  M/m   (M=press, m=release)
 _MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
@@ -769,6 +793,10 @@ def input_reader(fd):
                 buf = buf[m.end():]
                 continue
             b0 = buf[:1]
+            if b0 == b"\x0c":             # Ctrl-L: clear history
+                _clear_history()
+                buf = buf[1:]
+                continue
             if b0 in (b"q", b"Q"):
                 _STOP.set()
                 buf = buf[1:]
@@ -833,7 +861,7 @@ def render():
             scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
             head = (f" asr-tui  │  {status}  │  audio {live_mark}"
                     f"{spk_tag}{scroll_tag}  │  {len(frozen)} done  "
-                    f"│  Ctrl-C quit")
+                    f"│  ^C quit  ^L clear")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 
             def wrap_pref(text, prefix):

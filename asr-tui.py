@@ -24,8 +24,10 @@ canonical PipeWire source names (rtp_call_remote_source = Remote,
 rtp_call_me_source = Me, as in asr-call-transcribe) and runs two
 independent Voxtral /v1/realtime WS sessions concurrently. Each stream
 keeps its own in-progress ES/EN; finalized pairs interleave in one
-speaker-tagged scrolling history. The live region shows only the
-*active* speaker (whichever got the most recent delta).
+speaker-tagged scrolling history. The live region shows BOTH streams
+stacked ([Remote] then [Me]), always present and refining
+independently — no active-speaker switching (a silent channel's
+sporadic deltas must not flip the panel).
 
 What's new vs stream-voxtral-translate.py: the English for the
 *in-progress* sentence is re-translated continuously from the full
@@ -484,15 +486,19 @@ def render():
             cols, rows = shutil.get_terminal_size((100, 30))
             with _lock:
                 _state["cols"] = cols
-            frozen, act, ces, cen, status, at = st_get()
-            live = "●" if (time.time() - at) < 1.5 else "○"
-            spk_tag = "" if act == SOLO else f"  │  speaker {act}"
-            head = (f" asr-tui  │  {status}  │  audio {live}{spk_tag}  │  "
-                    f"{len(frozen)} done  │  Ctrl-C quit")
+                frozen = list(_state["frozen"])
+                status = _state["status"]
+                at = _state["audio_t"]
+                snap = [(lbl,
+                         _state["streams"][lbl]["cur_es"],
+                         _state["streams"][lbl]["cur_en"])
+                        for lbl in STREAMS]
+            live_mark = "●" if (time.time() - at) < 1.5 else "○"
+            dual = STREAMS != [SOLO]
+            spk_tag = "  │  Remote+Me" if dual else ""
+            head = (f" asr-tui  │  {status}  │  audio {live_mark}{spk_tag}"
+                    f"  │  {len(frozen)} done  │  Ctrl-C quit")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
-            # --- live block: full text, multi-line, expands/contracts ---
-            es_pref = "ES▸ " if act == SOLO else f"[{act}] ES▸ "
-            en_pref = "EN▸ " if act == SOLO else f"[{act}] EN▸ "
 
             def wrap_pref(text, prefix):
                 indent = " " * len(prefix)
@@ -500,19 +506,30 @@ def render():
                 return [(prefix if i == 0 else indent) + ln
                         for i, ln in enumerate(body)]
 
-            es_lines = (wrap_pref(ces, es_pref) if ces
+            # --- live block: every stream, always shown, stacked
+            # (Remote then Me). No active-speaker selection, so a
+            # silent channel's sporadic Voxtral deltas can't flip the
+            # panel back and forth (the reported flicker).
+            live = []   # list[(text, ansi)]
+            for lbl, ces, cen in snap:
+                if dual:
+                    es_pref, en_pref = f"[{lbl}] ES▸ ", f"[{lbl}] EN▸ "
+                else:
+                    es_pref, en_pref = "ES▸ ", "EN▸ "
+                es_l = (wrap_pref(ces, es_pref) if ces
                         else [es_pref.rstrip()])
-            en_lines = (wrap_pref(cen, en_pref) if cen
+                en_l = (wrap_pref(cen, en_pref) if cen
                         else [en_pref + "(translating…)"])
+                for ln in es_l:
+                    live.append((ln, "1m"))
+                for ln in en_l:
+                    live.append((ln, "1;36m"))
             # never overflow the screen (that would scroll the terminal
-            # and corrupt the layout): header + separator + live must fit.
+            # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)
-            if len(es_lines) + len(en_lines) > live_budget:
-                en_keep = min(len(en_lines), max(1, live_budget // 2))
-                es_keep = max(1, live_budget - en_keep)
-                es_lines = es_lines[-es_keep:]
-                en_lines = en_lines[-en_keep:]
-            live_h = 1 + len(es_lines) + len(en_lines)   # +1 separator
+            if len(live) > live_budget:
+                live = live[-live_budget:]
+            live_h = 1 + len(live)                       # +1 separator
             body_h = max(0, rows - 1 - live_h)
             # history (most recent at the bottom), fills remaining space,
             # interleaved + speaker-tagged.
@@ -538,10 +555,8 @@ def render():
                 hist.insert(0, "")
             lines += hist
             lines.append(CSI + "2m" + ("─" * cols) + CSI + "0m")
-            for ln in es_lines:
-                lines.append(CSI + "1m" + ln + CSI + "0m")
-            for ln in en_lines:
-                lines.append(CSI + "1;36m" + ln + CSI + "0m")
+            for ln, ansi in live:
+                lines.append(CSI + ansi + ln + CSI + "0m")
             frame = CSI + "H"
             for ln in lines[:rows]:
                 frame += ln + CSI + "K\r\n"

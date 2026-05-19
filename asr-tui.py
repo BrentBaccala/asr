@@ -54,9 +54,18 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--beam", type=int, default=1)
 ap.add_argument("--mask", type=int, default=MASK_K,
                 help="words of the in-progress EN tail to hide (default 4)")
+ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
+                default=True,
+                help="when the live line fills the screen width, commit the "
+                     "leading clause at a comma (keeps live to ~1 line; "
+                     "trades some full-sentence MT coherence). On by default")
+ap.add_argument("--min-clause", type=int, default=25,
+                help="never line-flush a leading clause shorter than this "
+                     "many chars (avoids tiny-fragment mistranslation)")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
 args = ap.parse_args()
+CLAUSE_DELIM = re.compile(r'[,;:]')
 
 # ---------------- shared state ----------------
 _lock = threading.Lock()
@@ -66,6 +75,7 @@ _state = {
     "cur_en": "",          # masked live English of cur_es
     "status": "starting",
     "audio_t": 0.0,        # wall time of last audio chunk (activity)
+    "cols": 100,           # live-line width budget, kept current by render
     "stop": False,
 }
 
@@ -170,6 +180,43 @@ def take_sentences():
         _final_q.put(s)
 
 
+def clause_flush():
+    """Pressure-based: only when the in-progress Spanish would exceed one
+    live line, commit a leading clause at the *rightmost* comma that still
+    fits the line (so the flushed clause is near-full -> good context,
+    short tail restarts). No comma within a line and badly overflowing ->
+    hard word-cut so it can't run forever; mildly over with no comma ->
+    leave it (let it wrap until a comma/sentence end arrives). Each
+    flushed clause goes to history like a sentence."""
+    if not args.line_flush:
+        return
+    with _lock:
+        budget = max(40, _state["cols"] - 4)     # one ES▸ line of chars
+        buf = _state["cur_es"]
+        minc = max(15, args.min_clause)
+        flushed, changed = [], False
+        while len(buf) > budget:
+            cut = -1
+            for mt in CLAUSE_DELIM.finditer(buf[:budget + 1]):
+                if mt.end() >= minc:
+                    cut = mt.end()               # rightmost within budget
+            if cut == -1:
+                if len(buf) > 2 * budget:        # comma-less run-on: cut
+                    sp = buf.rfind(" ", minc, budget)
+                    cut = sp if sp > minc else budget
+                else:
+                    break                        # let it wrap for now
+            flushed.append(buf[:cut].strip())
+            buf = buf[cut:].lstrip()
+            changed = True
+        if changed:
+            _state["cur_es"] = buf
+            _state["cur_en"] = ""
+    for s in flushed:
+        if s:
+            _final_q.put(s)
+
+
 async def net_main():
     uri = f"ws://{HOST}:{PORT}/v1/realtime"
     try:
@@ -202,6 +249,7 @@ async def net_main():
                     with _lock:
                         _state["cur_es"] += m["delta"]
                     take_sentences()
+                    clause_flush()
                 elif t == "transcription.done":
                     take_sentences()
                     with _lock:
@@ -276,6 +324,8 @@ def render():
                 if _state["stop"]:
                     return
             cols, rows = shutil.get_terminal_size((100, 30))
+            with _lock:
+                _state["cols"] = cols
             frozen, ces, cen, status, at = st_get()
             live = "●" if (time.time() - at) < 1.5 else "○"
             head = (f" asr-tui  │  {status}  │  audio {live}  │  "

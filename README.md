@@ -1,150 +1,117 @@
-# asr — streaming speech recognition on pony
+# asr — live phone-call speech recognition + translation
 
-Live-mic ASR pipeline running on pony's RTX 3090. Part of a larger
-phone-call transcription project (see
-`~/project/docs/phone-asr-pipeline-design.md` on samsung for the
-broader design — Bluetooth antenna for the BCM20702 is the
-hardware blocker for the actual phone-audio-routing half).
+Streaming ASR tooling that runs on **pony** (RTX 3090), built for live
+phone-call transcription. samsung taps a Bluetooth call's two audio
+directions and ships them as RTP to pony; pony transcribes them with
+speaker labels and (for Spanish calls) an inline English translation.
 
-## What's here
+The primary tool is **`asr-tui.py`**. The other `stream-*.py` scripts
+are alternative ASR approaches that were evaluated along the way and
+kept for reference; Voxtral was ultimately chosen for the live pipeline.
 
-Three sibling scripts, each pairing one speech model with a Silero
-VAD chunker. Choose by trade-off, not by absolute quality — all
-three transcribe English well enough to be useful.
+## `asr-tui.py` — the live TUI (primary tool)
 
-| Script | Model | Engine | Languages | When to pick |
-|---|---|---|---|---|
-| `stream-whisper.py` | `Systran/faster-whisper-large-v3` | CTranslate2 | 99 (auto-detect) | Best multilingual coverage; lightest runtime |
-| `stream-parakeet.py` | `nvidia/parakeet-tdt-0.6b-v3` | NeMo (PyTorch) | 25 (auto-detect, en/es/fr/de/+) | Fastest inference (~1 s on 6 s audio); current best multilingual NeMo |
-| `stream-canary.py` | `nvidia/canary-1b-flash` | NeMo (PyTorch) | en/es/fr/de | Single-pass ASR + translation in one model (`--task ast --source-lang es --target-lang en`) |
+A terminal UI showing live Spanish transcription with an in-place,
+continuously-refining English translation, freezing finished sentences
+into a scrolling speaker-tagged history.
 
-Common shape: read raw 16-bit-LE mono PCM from stdin at 16 kHz,
-chunk on Silero VAD utterance boundaries (500 ms silence
-trigger), run each utterance through the model, print one line
-per utterance with timing tags. ^C to stop.
+Pipeline:
 
-## How to run
-
-```bash
-ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
-  | ~/asr/stream-parakeet.py'
+```
+audio → Voxtral-Mini-4B-Realtime-2602   (vLLM /v1/realtime WS, GPU, Spanish ASR)
+      → NLLB-200-distilled-600M int8     (CTranslate2, CPU, ES→EN)
 ```
 
-Substitute any of the three scripts. Each script's shebang
-absolute-paths to its venv; `chmod +x` is already set, so no
-explicit interpreter on the command line.
+Cascade (not direct speech-to-text-translation) because the 3090 only
+has ~2.3 GB free after Voxtral; NLLB on CPU adds no GPU contention and
+keeps both the Spanish transcript and the English.
 
-The pony-side mic is a Blue Snowball USB condenser plugged into
-`hw:Snowball,0`. claude is in the `audio` group and goes through
-ALSA directly — does not contend with cosine's pipewire (which
-is the active audio session on pony for everything else).
+Run it:
 
-## Two venvs because of Python 3.14
+```bash
+# single stream (remote party only) — audio piped in on stdin
+pw-record --target rtp_call_remote_source --format=s16 --rate=16000 \
+          --channels=1 - | ~/asr/asr-tui.py
 
-| Venv | Python | Purpose |
+# dual stream — script owns both taps, [Remote] + [Me] labelled
+~/asr/asr-tui.py --dual
+
+# headless (no TUI; prints finalized ES/EN lines) — add --plain
+~/asr/asr-tui.py --dual --plain
+```
+
+In `--dual` the script spawns its own two `pw-record` subprocesses on
+the canonical PipeWire sources `rtp_call_remote_source` (Remote) and
+`rtp_call_me_source` (Me), and runs two independent Voxtral WS sessions
+concurrently. Both speakers' in-progress blocks are shown stacked and
+always present (no active-speaker switching — a silent channel's
+sporadic deltas can't flip the panel). Finalized pairs interleave in
+one chronological, speaker-tagged history.
+
+A live line is finalized into history by any of four triggers:
+sentence punctuation, width pressure (`clause_flush`), a speech pause
+(`--pause-ms`, default 800 ms; empty/whitespace deltas do not refresh
+the pause clock, so a trailed-off line still promotes when the source
+goes silent), or end-of-stream.
+
+Quit with Ctrl-C (the terminal is restored cleanly).
+
+Requires the Voxtral vLLM server running locally on `:8000`
+(`/v1/realtime`). The latency knob is `transcription_delay_ms` in the
+model snapshot's `tekken.json` (read only at server start). Note: in
+`--dual` two growing Voxtral sequences share one `--max-model-len`
+KV-cache budget, roughly halving the per-stream context ceiling — a
+long bidirectional call can approach it.
+
+## `asr-call-transcribe` — pre-Voxtral dual-stream transcriber
+
+The earlier faster-whisper dual-stream tool: two `pw-record` taps on
+the same two sources, one thread per source, a shared Whisper model
+serialized by a lock, interleaved timestamped `[Remote]`/`[Me]` lines.
+Superseded by `asr-tui.py` for live use, kept as the reference design.
+
+```bash
+~/asr/asr-call-transcribe [model] [lang]      # default small.en
+~/asr/asr-call-transcribe large-v3 es         # Spanish, GPU
+```
+
+## Alternative streaming scripts (evaluated, reference)
+
+Each reads 16-bit-LE mono 16 kHz PCM on stdin and prints transcripts;
+they explore different latency/quality trade-offs.
+
+| Script | Model / engine | Note |
 |---|---|---|
-| `~/asr/asr-env/` | 3.14.4 (system) | faster-whisper stack: ctranslate2, silero-vad, onnxruntime |
-| `~/venv-3.12-torch/` | 3.12.13 (uv-installed) | torch stack: torch 2.9.1+cu128, nemo_toolkit[asr], silero-vad, onnxruntime, torchaudio |
+| `stream-voxtral.py` | Voxtral-Realtime (vLLM WS) | headless ES stream — the cascade's ASR half |
+| `stream-voxtral-translate.py` | Voxtral + NLLB | headless live ES + inline EN (pre-TUI form) |
+| `stream-vosk.py` | Vosk/Kaldi | true-streaming Spanish, ≈Whisper accuracy on clean audio |
+| `stream-sherpa-ipa.py` | sherpa-onnx zipformer (bookbot) | true-streaming ES, IPA phonemes (no word boundaries) |
+| `stream-parakeet-live.py` | parakeet-tdt-0.6b-v3 | immediate-emit, low latency |
+| `stream-parakeet.py` | parakeet-tdt-0.6b-v3 + Silero VAD | VAD-chunked; `--max-sec` force-flush for pauseless speech |
+| `stream-parakeet-buffered.py` | parakeet-tdt (offline) | LocalAgreement-2 sliding window |
+| `stream-whisper.py` | faster-whisper-large-v3 | 99-language auto-detect |
+| `stream-whisper-buffered.py` | faster-whisper | LocalAgreement-2, language-pinned |
+| `stream-canary.py` | canary-1b-flash (NeMo) | single-pass ASR + translation |
+| `stream-cacheaware.py` | NeMo fastconformer | true cache-aware English streaming |
 
-Pony runs Ubuntu 26.04 (Resolute Raccoon) which ships only
-Python 3.14. NeMo's released wheels target 3.10–3.12; on 3.14
-several of NeMo's deps fail to resolve. Workaround: `uv python
-install 3.12` pulls a standalone CPython 3.12 build (lives at
-`~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/`) and
-`~/venv-3.12-torch/` points at it.
+## Runtime deps (not in git)
 
-The torch venv lives at `~/venv-3.12-torch/`, not under
-`~/asr/`, because torch-based tooling extends beyond ASR
-(e.g. music stem-splitting via demucs). Hoisted out so other
-projects can share it without polluting the ~/asr tree.
+Model weights and the Python venvs are large and **gitignored**
+(`models/`, `*-env/`). On pony they live in `~/asr.bak/` (the
+pre-GitHub-migration working tree) and are symlinked into `~/asr/`;
+script shebangs are absolute and resolve through the symlinks. A fresh
+clone has no models/venvs until those symlinks (or real dirs) are in
+place. The Voxtral vLLM server is launched separately, outside this
+repo.
 
-faster-whisper installs cleanly on 3.14 — no need to consolidate.
-The two venvs total ~7 GB on disk and don't conflict.
+## Workflow
 
-## System-wide deps (apt-installed)
-
-`libcublas12` and `nvidia-cudnn` from Ubuntu multiverse — needed
-because **ctranslate2 looks up CUDA libraries on the system loader
-path** (it doesn't bundle them, unlike PyTorch / NeMo / ollama
-which all ship their own bundled CUDA libs in their package trees).
-The install dragged in the full CUDA 12.4 dev toolkit (~5 GB) as
-a transitive dep of the `nvidia-cudnn` install-script package, but
-that's also useful for any future from-source GPU builds (llama.cpp,
-custom CUDA kernels, etc.).
-
-NVIDIA's `ubuntu2604` apt repo is added (via `cuda-keyring`) but
-empty for our needs — it ships only CUDA 13.x packages, and
-ctranslate2 is built against CUDA 12. Not currently used; can be
-removed if it ever causes friction.
-
-## Model storage
-
-All model weights live in the shared HuggingFace cache at
-`~/.cache/huggingface/hub/`. Currently ~23 GB across:
-
-- `Systran/faster-whisper-large-v3` (~3 GB)
-- `Helsinki-NLP/opus-mt-es-en` (~300 MB) — translator, currently
-  unused but downloaded for a possible Whisper+Marian two-hop path
-- `nvidia/canary-1b-flash` (~3 GB)
-- `nvidia/canary-1b-v2` (~3 GB)
-- `nvidia/parakeet-tdt-0.6b-v3` (~6 GB — ships both `.nemo` and
-  HF safetensors)
-- `nvidia/multitalker-parakeet-streaming-0.6b-v1` (~5 GB —
-  downloaded for streaming research; not yet wired up)
-
-Both venvs see the same cache (HF default location).
-
-## TODO — `stream-multitalker.py`
-
-The multitalker streaming model is downloaded but no script yet
-because the integration is significantly heavier than a drop-in
-swap:
-
-- Requires a *second* model (`nvidia/diar_streaming_sortformer_4spk-v2.1`,
-  not yet downloaded) running in parallel for streaming diarization
-- Per-speaker model instances: 1 ASR copy per speaker, so 2-speaker
-  call = 2× the 0.6B model in VRAM
-- Streaming inference uses `CacheAwareStreamingAudioBuffer` +
-  `SpeakerTaggedASR` orchestrator from NeMo, designed for
-  pre-recorded files; adapting to a live arecord stream + extracting
-  transcripts mid-stream (rather than at end-of-stream) is non-trivial
-- Reference implementation:
-  https://github.com/NVIDIA-NeMo/NeMo/blob/main/examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py
-
-For 1:1 phone calls where the speaker identity is known by routing,
-diarization adds little. Lighter alternatives if the goal is just
-sub-second latency:
-
-- `nvidia/parakeet_realtime_eou_120m-v1` — streaming-native, 80–160 ms
-  latency, self-detects end-of-utterance via `<EOU>` token. English
-  only. Drops VAD entirely. Smallest engineering lift among the
-  streaming-native options.
-- Tighter VAD threshold (`min_silence_duration_ms=200`) on any of the
-  existing scripts gives snappier perceived response without
-  architectural changes.
-
-## Tested
-
-- Smoke-tested all three scripts post-move (`script < /dev/null`):
-  models load, silero-vad initializes, ready-to-listen banner prints.
-- Live mic input has been confirmed working on `stream-whisper.py`
-  earlier in development (pre-rename / pre-move). The other two
-  haven't been tested with real speech yet.
-- `/tmp/out.wav` (a 5.8-second 8 kHz BBB IVR clip) transcribes
-  identically (ignoring brand-name capitalization differences) on
-  all four models tried so far: faster-whisper-large-v3,
-  canary-1b-flash, parakeet-tdt-0.6b-v3, and
-  multitalker-parakeet-streaming-0.6b-v1 (via the offline transcribe
-  interface, not its streaming API).
-
----
-
-> **Note:** this README documents only the original whisper/parakeet/
-> canary trio and is **stale** — it predates `asr-tui.py` (the Voxtral
-> dual-stream `[Remote]`/`[Me]` translation TUI), `asr-call-transcribe`,
-> and the cosine phone-call pipeline that are now the primary tools
-> here. See the commit history and the script docstrings for current
-> behavior.
+This repo is canonical on GitHub. Development and pushing happen on
+**samsung** (`/home/claude/asr`); **pony** pulls read-only over https
+(`git -C ~/asr pull`) and is the only host that *runs* the pipeline
+(it has the GPU, the audio session, the venvs/models). pony has no
+GitHub push credentials by design. Loop: edit on samsung → push →
+pull on pony → run on pony.
 
 ---
 

@@ -1,4 +1,4 @@
-#!/home/claude/asr/asr-env/bin/python
+#!/home/cosine/asr/asr-env/bin/python
 """
 Streaming faster-whisper transcription from stdin PCM audio.
 

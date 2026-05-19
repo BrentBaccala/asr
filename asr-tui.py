@@ -69,6 +69,10 @@ CLAUSE_DELIM = re.compile(r'[,;:]')
 
 # ---------------- shared state ----------------
 _lock = threading.Lock()
+# Set by the signal handler ONLY. Never acquire _lock in the handler:
+# the handler runs in the main thread and would deadlock if interrupted
+# while the main thread already holds _lock (this hung a run for 15 min).
+_STOP = threading.Event()
 _state = {
     "frozen": [],          # list[(es, en)]
     "cur_es": "",          # in-progress Spanish (no sentence end yet)
@@ -118,9 +122,8 @@ _final_q: "queue.Queue[str]" = queue.Queue()
 def mt_worker():
     last_src = None
     while True:
-        with _lock:
-            if _state["stop"]:
-                return
+        if _STOP.is_set():
+            return
         # 1. priority: finalize completed sentences
         try:
             s = _final_q.get_nowait()
@@ -201,11 +204,13 @@ def clause_flush():
                 if mt.end() >= minc:
                     cut = mt.end()               # rightmost within budget
             if cut == -1:
-                if len(buf) > 2 * budget:        # comma-less run-on: cut
-                    sp = buf.rfind(" ", minc, budget)
-                    cut = sp if sp > minc else budget
-                else:
-                    break                        # let it wrap for now
+                # No comma within the line: word-cut at the last space
+                # that fits, so the live region ALWAYS stays ~1 line and
+                # the chunk promotes into history. (The old "let it wrap
+                # until a comma" grace left long comma-poor sentences
+                # stuck, wrapped, never promoting — the reported bug.)
+                sp = buf.rfind(" ", minc, budget)
+                cut = sp if sp > minc else budget
             flushed.append(buf[:cut].strip())
             buf = buf[cut:].lstrip()
             changed = True
@@ -282,6 +287,22 @@ async def net_main():
             await asyncio.wait_for(rx, timeout=10)
         except asyncio.TimeoutError:
             pass
+        # Promote whatever is still in the live buffer (the speaker/audio
+        # ended mid-sentence, so no period and maybe no transcription.done
+        # ever arrives — without this the tail stays stuck, wrapped, in
+        # the live region instead of moving into history).
+        with _lock:
+            rem = _state["cur_es"].strip()
+            # only promote a substantive tail; a 1-3 char scrap ("se")
+            # just makes NLLB hallucinate boilerplate — drop it.
+            if rem and len(rem) >= max(12, args.min_clause // 2):
+                _state["cur_es"] = ""
+                _state["cur_en"] = ""
+            else:
+                rem = ""
+        if rem:
+            _final_q.put(rem)
+            time.sleep(2.0)            # let the MT worker finalize it
 
 
 def net_thread():
@@ -320,9 +341,8 @@ def render():
     sys.stdout.flush()
     try:
         while True:
-            with _lock:
-                if _state["stop"]:
-                    return
+            if _STOP.is_set():
+                return
             cols, rows = shutil.get_terminal_size((100, 30))
             with _lock:
                 _state["cols"] = cols
@@ -387,9 +407,8 @@ def plain_loop():
     # mt_worker prints ES/EN on finalize; just keep alive + show live EN
     last = ""
     while True:
-        with _lock:
-            if _state["stop"]:
-                return
+        if _STOP.is_set():
+            return
         _, _, cen, _, _ = st_get()
         if cen and cen != last:
             sys.stderr.write(f"\r[live EN] {cen[:120]}\033[K")
@@ -400,8 +419,7 @@ def plain_loop():
 
 def main():
     def _stop(*_):
-        with _lock:
-            _state["stop"] = True
+        _STOP.set()                 # lock-free: signal-handler safe
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     threading.Thread(target=mt_worker, daemon=True).start()

@@ -2,3 +2,5 @@ asr-env/
 *-env/
 models/
 vosk-env/
+__pycache__/
+*.bak

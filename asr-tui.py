@@ -281,8 +281,29 @@ def render():
             head = (f" asr-tui  │  {status}  │  audio {live}  │  "
                     f"{len(frozen)} done  │  Ctrl-C quit")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
-            body_h = rows - 1 - 4          # header + 4-line live block
-            # history (most recent at the bottom)
+            # --- live block: full text, multi-line, expands/contracts ---
+            def wrap_pref(text, prefix):
+                indent = " " * len(prefix)
+                body = wrap(text, max(8, cols - len(prefix)))
+                return [(prefix if i == 0 else indent) + ln
+                        for i, ln in enumerate(body)]
+
+            es_lines = wrap_pref(ces, "ES▸ ") if ces else ["ES▸"]
+            en_lines = (wrap_pref(cen, "EN▸ ") if cen
+                        else ["EN▸ (translating…)"])
+            # never overflow the screen (that would scroll the terminal
+            # and corrupt the layout): header + separator + live must fit.
+            # If the live block is huge, keep its most recent lines —
+            # the refining EN tail — and prioritise EN over ES.
+            live_budget = max(2, rows - 2)
+            if len(es_lines) + len(en_lines) > live_budget:
+                en_keep = min(len(en_lines), max(1, live_budget // 2))
+                es_keep = max(1, live_budget - en_keep)
+                es_lines = es_lines[-es_keep:]
+                en_lines = en_lines[-en_keep:]
+            live_h = 1 + len(es_lines) + len(en_lines)   # +1 separator
+            body_h = max(0, rows - 1 - live_h)
+            # history (most recent at the bottom), fills remaining space
             hist = []
             for es, en in frozen:
                 for i, ln in enumerate(wrap(es, cols - 4)):
@@ -295,13 +316,11 @@ def render():
             while len(hist) < body_h:
                 hist.insert(0, "")
             lines += hist
-            # live block
             lines.append(CSI + "2m" + ("─" * cols) + CSI + "0m")
-            es_l = wrap("ES▸ " + ces, cols)[-1] if ces else "ES▸"
-            en_l = wrap("EN▸ " + cen, cols)[-1] if cen else \
-                "EN▸ \033[2m(translating…)\033[0m"
-            lines.append(CSI + "1m" + es_l[:cols] + CSI + "0m")
-            lines.append(CSI + "1;36m" + en_l[:cols] + CSI + "0m")
+            for ln in es_lines:
+                lines.append(CSI + "1m" + ln + CSI + "0m")
+            for ln in en_lines:
+                lines.append(CSI + "1;36m" + ln + CSI + "0m")
             frame = CSI + "H"
             for ln in lines[:rows]:
                 frame += ln + CSI + "K\r\n"

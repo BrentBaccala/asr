@@ -1,0 +1,121 @@
+#!/home/cosine/asr-env/bin/python3
+"""asr-call-transcribe — live phone-call transcription on pony.
+
+Reads two RTP-streamed audio sources (remote party + local mic from
+samsung), runs faster-whisper with VAD, prints timestamped speaker-
+tagged transcripts to stdout.
+
+Audio sources are exposed by:
+  ~/.config/pipewire/pipewire.conf.d/91-rtp-call-stream-source.conf
+
+Usage:
+  asr-call-transcribe                       # default: small.en, English
+  asr-call-transcribe large-v3              # GPU, best quality (English)
+  asr-call-transcribe large-v3 es           # Spanish (needs a multilingual model)
+  asr-call-transcribe large-v3 auto         # auto-detect language per chunk
+  asr-call-transcribe base.en               # lower latency / lighter
+
+Second argument is the language code passed to faster-whisper
+(en, es, fr, ...). Use "auto" (or "none") to let Whisper detect the
+language per chunk. The .en models (small.en, base.en) are
+English-only — pair a non-English language with a multilingual model
+(large-v3, small, medium, ...).
+
+Audio lives in cosine's PipeWire session, so this script must run as
+cosine. From any account on pony:
+  sudo -u cosine /home/cosine/bin/asr-call-transcribe [model] [language]
+"""
+import os
+import sys
+import subprocess
+import threading
+import time
+from datetime import datetime
+
+# Ensure XDG_RUNTIME_DIR is set so pw-record finds cosine's PipeWire
+# even when invoked via `sudo -u cosine ...` without env passthrough.
+if not os.environ.get("XDG_RUNTIME_DIR"):
+    os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+
+import numpy as np
+from faster_whisper import WhisperModel
+
+MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "small.en"
+LANGUAGE = sys.argv[2] if len(sys.argv) > 2 else "en"
+# "auto"/"none"/"detect" -> let Whisper detect the language per chunk
+if LANGUAGE.lower() in ("auto", "none", "detect"):
+    LANGUAGE = None
+
+if MODEL_NAME.endswith(".en") and LANGUAGE not in (None, "en"):
+    print(f"[asr-call-transcribe] WARNING: model {MODEL_NAME} is "
+          f"English-only; language={LANGUAGE!r} will be ignored. Use a "
+          f"multilingual model (e.g. large-v3) for non-English.",
+          file=sys.stderr)
+
+CHUNK_SEC = 2
+SAMPLE_RATE = 16000
+
+SOURCES = [
+    # (PipeWire node name,       label,    ANSI color)
+    ("rtp_call_remote_source",   "Remote", "1;36"),  # cyan
+    ("rtp_call_me_source",       "Me",     "1;32"),  # green
+]
+
+print(f"[asr-call-transcribe] loading model: {MODEL_NAME} "
+      f"(language: {LANGUAGE or 'auto-detect'})", file=sys.stderr)
+try:
+    model = WhisperModel(MODEL_NAME, compute_type="auto")
+except Exception as e:
+    sys.exit(f"failed to load model {MODEL_NAME}: {e}")
+print("[asr-call-transcribe] ready. listening for samsung audio...",
+      file=sys.stderr)
+
+model_lock = threading.Lock()
+
+
+def capture_loop(source_name: str, label: str, color: str) -> None:
+    cmd = [
+        "pw-record", "--target", source_name,
+        "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    bytes_per_chunk = SAMPLE_RATE * CHUNK_SEC * 2  # 2 bytes per S16 sample
+    while True:
+        buf = b""
+        while len(buf) < bytes_per_chunk:
+            piece = proc.stdout.read(bytes_per_chunk - len(buf))
+            if not piece:
+                break
+            buf += piece
+        if not buf:
+            time.sleep(0.5)
+            continue
+        audio = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
+        with model_lock:
+            segments, _ = model.transcribe(
+                audio,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 400},
+                language=LANGUAGE,
+                beam_size=1,
+            )
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"\033[{color}m[{ts}] [{label:>6}]\033[0m {text}", flush=True)
+
+
+threads = [
+    threading.Thread(target=capture_loop, args=args, daemon=True)
+    for args in SOURCES
+]
+for t in threads:
+    t.start()
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n[asr-call-transcribe] bye.", file=sys.stderr)

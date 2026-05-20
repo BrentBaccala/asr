@@ -977,56 +977,64 @@ def render():
                     f"│  ^C quit  ^L clear")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 
-            def wrap_pref(text, prefix):
-                indent = " " * len(prefix)
-                body = wrap(text, max(8, cols - len(prefix)))
-                return [(prefix if i == 0 else indent) + ln
-                        for i, ln in enumerate(body)]
+            def wrap_pref(text, prefix, prefix_w, body_color):
+                """Wrap `text` to (cols - prefix_w) and prefix the first
+                line. `prefix` may already embed ANSI codes (its visible
+                width is `prefix_w`, separate from len()). Each output
+                line is fully formatted: prefix + body in body_color +
+                CSI 0m, so the outer render code can append the line
+                verbatim with no extra wrapping."""
+                body_lines = wrap(text, max(8, cols - prefix_w))
+                out = []
+                for i, ln in enumerate(body_lines):
+                    head = prefix if i == 0 else " " * prefix_w
+                    out.append(head + CSI + body_color + "m"
+                               + ln + CSI + "0m")
+                return out
 
             # --- live block: three lines per stream — Live (raw
             # Voxtral transcription), ES (NLLB Spanish translation,
             # masked-tail preview), EN (NLLB English translation,
-            # masked-tail preview). Always shown, both streams
-            # stacked; no active-speaker selection.
-            live = []   # list[(text, ansi)]
+            # masked-tail preview). The whole '[Remote] Live▸ ' /
+            # '[Remote] ES▸ ' / '[Remote] EN▸ ' prefix sits inside the
+            # speaker accent block, so the three label rows form one
+            # visually-coherent colored stripe per stream.
+            live = []   # list[str] (fully ANSI-formatted)
             for lbl, ces_live, ces_trans, cen_trans in snap:
                 if dual:
-                    live_pref = f"[{lbl}] Live▸ "
-                    es_pref   = f"[{lbl}] ES▸   "
-                    en_pref   = f"[{lbl}] EN▸   "
+                    acc = ACCENT.get(lbl, "0")
+                    opener = CSI + acc + "m"
+                    closer = CSI + "0m"
+                    live_raw = f"[{lbl}] Live▸ "
+                    es_raw   = f"[{lbl}] ES▸   "
+                    en_raw   = f"[{lbl}] EN▸   "
+                    live_pref = opener + live_raw + closer
+                    es_pref   = opener + es_raw   + closer
+                    en_pref   = opener + en_raw   + closer
                 else:
-                    live_pref = "Live▸ "
-                    es_pref   = "ES▸   "
-                    en_pref   = "EN▸   "
+                    live_raw = live_pref = "Live▸ "
+                    es_raw   = es_pref   = "ES▸   "
+                    en_raw   = en_pref   = "EN▸   "
+                live_pw = len(live_raw)
+                es_pw   = len(es_raw)
+                en_pw   = len(en_raw)
                 # Pending placeholder is the same '⋯' as the history
-                # rows, so the visual language is consistent across the
-                # two panels. Dim coloring distinguishes pending vs.
-                # real content; idle (cur_live empty) is also dim.
-                live_l = (wrap_pref(ces_live, live_pref) if ces_live
-                          else [live_pref.rstrip()])
-                live_ansi = "1m" if ces_live else "2m"
+                # rows. Dim distinguishes pending vs. real content;
+                # idle channels render only the styled prefix.
                 if not ces_live:
-                    es_l, es_ansi = [es_pref.rstrip()], "2;33m"
-                    en_l, en_ansi = [en_pref.rstrip()], "2;36m"
+                    live.append(live_pref.rstrip())
+                    live.append(es_pref.rstrip())
+                    live.append(en_pref.rstrip())
+                    continue
+                live.extend(wrap_pref(ces_live, live_pref, live_pw, "1"))
+                if ces_trans:
+                    live.extend(wrap_pref(ces_trans, es_pref, es_pw, "1;33"))
                 else:
-                    if ces_trans:
-                        es_l   = wrap_pref(ces_trans, es_pref)
-                        es_ansi = "1;33m"
-                    else:
-                        es_l   = [es_pref + "⋯"]
-                        es_ansi = "2;33m"
-                    if cen_trans:
-                        en_l   = wrap_pref(cen_trans, en_pref)
-                        en_ansi = "1;36m"
-                    else:
-                        en_l   = [en_pref + "⋯"]
-                        en_ansi = "2;36m"
-                for ln in live_l:
-                    live.append((ln, live_ansi))
-                for ln in es_l:
-                    live.append((ln, es_ansi))
-                for ln in en_l:
-                    live.append((ln, en_ansi))
+                    live.append(es_pref + CSI + "2;33m" + "⋯" + CSI + "0m")
+                if cen_trans:
+                    live.extend(wrap_pref(cen_trans, en_pref, en_pw, "1;36"))
+                else:
+                    live.append(en_pref + CSI + "2;36m" + "⋯" + CSI + "0m")
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)
@@ -1037,38 +1045,48 @@ def render():
             # history (most recent at the bottom). Each chunk renders
             # three lines — Live (raw transcription), ES (NLLB Spanish
             # translation), EN (NLLB English translation), plus a
-            # separator blank. es/en are None until the whole sentence
-            # is translated, "" when the marker-split placed that
-            # field's content on a neighboring chunk (rendered "—").
-            def _trans_line(en_tag, value, ansi):
+            # separator blank. The whole '[Remote] Live ' / '[Remote]
+            # ES   ' / '[Remote] EN   ' prefix sits inside the speaker
+            # accent block (matches the live region). es/en are None
+            # until the whole sentence is translated, "" when the
+            # marker-split placed that field's content on a neighbor.
+            def _trans_line(tag, tag_w, value, ansi):
                 if value is None:
-                    return CSI + "2;" + ansi + "m" + en_tag + "⋯" + CSI + "0m"
+                    return CSI + "2;" + ansi + "m" + tag + "⋯" + CSI + "0m"
                 if value == "":
-                    return CSI + "2;" + ansi + "m" + en_tag + "—" + CSI + "0m"
-                wrapped = wrap(value, cols - 4)
+                    return CSI + "2;" + ansi + "m" + tag + "—" + CSI + "0m"
+                wrapped = wrap(value, max(8, cols - tag_w))
                 return [(CSI + ansi + "m"
-                         + (en_tag if i == 0 else "  ")
+                         + (tag if i == 0 else " " * tag_w)
                          + ln + CSI + "0m")
                         for i, ln in enumerate(wrapped)]
             hist = []
             for spk, raw, es, en, _cid in frozen:
                 if spk == SOLO:
-                    live_tag = "Live "
-                    es_tag = "ES   "
-                    en_tag = "EN   "
+                    live_tag = live_raw = "Live "
+                    es_tag   = es_raw   = "ES   "
+                    en_tag   = en_raw   = "EN   "
                 else:
                     acc = ACCENT.get(spk, "0")
-                    lead = CSI + acc + "m" + f"[{spk}] " + CSI + "0m"
-                    live_tag = lead + "Live "
-                    es_tag   = lead + "ES   "
-                    en_tag   = lead + "EN   "
+                    opener = CSI + acc + "m"
+                    closer = CSI + "0m"
+                    live_raw = f"[{spk}] Live "
+                    es_raw   = f"[{spk}] ES   "
+                    en_raw   = f"[{spk}] EN   "
+                    live_tag = opener + live_raw + closer
+                    es_tag   = opener + es_raw   + closer
+                    en_tag   = opener + en_raw   + closer
+                live_w = len(live_raw)
+                es_w   = len(es_raw)
+                en_w   = len(en_raw)
                 # Live (raw) — never None/empty: it's what got emitted.
-                for i, ln in enumerate(wrap(raw, cols - 4)):
-                    hist.append((live_tag if i == 0 else "  ") + ln)
-                for fn, tag, ansi in (
-                        (es, es_tag, "33"),   # yellow for ES translation
-                        (en, en_tag, "36")):  # cyan for EN translation
-                    out = _trans_line(tag, fn, ansi)
+                for i, ln in enumerate(wrap(raw, max(8, cols - live_w))):
+                    hist.append((live_tag if i == 0 else " " * live_w)
+                                + ln)
+                for fn, tag, tag_w, ansi in (
+                        (es, es_tag, es_w, "33"),   # yellow for ES
+                        (en, en_tag, en_w, "36")):  # cyan for EN
+                    out = _trans_line(tag, tag_w, fn, ansi)
                     if isinstance(out, list):
                         hist.extend(out)
                     else:
@@ -1095,8 +1113,8 @@ def render():
                 hist.insert(0, "")
             lines += hist
             lines.append(CSI + "2m" + ("─" * cols) + CSI + "0m")
-            for ln, ansi in live:
-                lines.append(CSI + ansi + ln + CSI + "0m")
+            for ln in live:
+                lines.append(ln)
             # Position each row ABSOLUTELY with CSI <r>;1H rather than
             # advancing with \r\n. The header is exactly `cols` chars
             # wide; on eager-wrap terminals the cols-th char auto-wraps

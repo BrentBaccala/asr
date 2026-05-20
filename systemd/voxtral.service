@@ -36,6 +36,12 @@ After=network.target
 
 [Service]
 Type=exec
+# PIECEWISE cudagraph compile shells out to `ninja` (installed inside
+# the venv, not on the system PATH); without this Environment=PATH=
+# inductor fails with `FileNotFoundError: 'ninja'` and the EngineCore
+# never finishes initializing. The previous /tmp/serve_voxtral.sh
+# launcher exported the same prefix on PATH for the same reason.
+Environment=PATH=%h/asr/vllm-env/bin:/usr/local/bin:/usr/bin:/bin
 Environment=VLLM_DISABLE_COMPILE_CACHE=1
 ExecStart=%h/asr/vllm-env/bin/vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 \
     --compilation_config '{"cudagraph_mode":"PIECEWISE"}' \

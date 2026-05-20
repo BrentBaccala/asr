@@ -199,6 +199,11 @@ def _new_stream_state():
         "last_speech_t": 0.0,
         "vad_frames_since_recycle": 0,
         "recycle_count": 0,
+        # Wall time of the last audio chunk this stream's _ws_session
+        # sent to vLLM. Per-stream so the header can show audio
+        # liveness per channel ('Remote ● Me ●') and surface a
+        # single-stream pw-record failure.
+        "audio_t": 0.0,
     }
 
 
@@ -207,7 +212,6 @@ _state = {
     "streams": {lbl: _new_stream_state() for lbl in STREAMS},
     "active": STREAMS[0],  # label of the last stream to get a delta
     "status": "starting",
-    "audio_t": 0.0,        # wall time of last audio chunk, any stream
     "cols": 100,           # live-line width budget, kept current by render
     "next_chunk_id": 1,    # monotonic; survives FROZEN_CAP truncation
     # Scrollback: how many rendered rows the history region is scrolled
@@ -225,7 +229,7 @@ def st_get():
         act = _state["active"]
         s = _state["streams"][act]
         return (list(_state["frozen"]), act, s["cur_live"], s["cur_en"],
-                _state["status"], _state["audio_t"])
+                _state["status"], s["audio_t"])
 
 
 # ---------------- NLLB ----------------
@@ -874,7 +878,7 @@ async def _ws_session(label, q):
                     pass
                 break
             with _lock:
-                _state["audio_t"] = time.time()
+                _state["streams"][label]["audio_t"] = time.time()
             try:
                 await ws.send(json.dumps(
                     {"type": "input_audio_buffer.append",
@@ -1135,15 +1139,27 @@ def render():
                 _state["cols"] = cols
                 frozen = list(_state["frozen"])
                 status = _state["status"]
-                at = _state["audio_t"]
+                audio_ts = {lbl: _state["streams"][lbl]["audio_t"]
+                            for lbl in STREAMS}
                 snap = [(lbl,
                          _state["streams"][lbl]["cur_live"],
                          _state["streams"][lbl]["cur_es"],
                          _state["streams"][lbl]["cur_en"])
                         for lbl in STREAMS]
-            live_mark = "●" if (time.time() - at) < 1.5 else "○"
             dual = STREAMS != [SOLO]
-            spk_tag = "  │  Remote+Me" if dual else ""
+            now = time.time()
+            def _mark(t):
+                return "●" if (now - t) < 1.5 else "○"
+            # Per-stream audio liveness in the header (solo collapses
+            # to a single 'audio ●'). Catches the single-stream
+            # pw-record failure case the previous shared 'audio_t'
+            # missed in dual mode.
+            if dual:
+                audio_tag = ("  │  "
+                             + "  ".join(f"{lbl} {_mark(audio_ts[lbl])}"
+                                         for lbl in STREAMS))
+            else:
+                audio_tag = f"  │  audio {_mark(audio_ts[SOLO])}"
             with _lock:
                 so = _state["scroll_offset"]
                 rc_counts = [(lbl, _state["streams"][lbl]["recycle_count"])
@@ -1159,8 +1175,8 @@ def render():
                     rc_tag = f"  │  ↻ {rc_counts[0][1]}"
             else:
                 rc_tag = ""
-            head = (f" asr-tui  │  {status}  │  audio {live_mark}"
-                    f"{spk_tag}{scroll_tag}{rc_tag}  │  {len(frozen)} done  "
+            head = (f" asr-tui  │  {status}{audio_tag}"
+                    f"{scroll_tag}{rc_tag}  │  {len(frozen)} done  "
                     f"│  ^C quit  ^L clear")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 

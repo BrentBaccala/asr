@@ -339,6 +339,32 @@ that predates `asr-tui.py --dual`. Same `rtp_call_remote_source` /
 instead of Voxtral + NLLB. Kept as the reference design for the
 two-source plumbing.
 
+### Recreating the alternative venvs and models
+
+Only `mt-env` (asr-tui's interpreter) and `vllm-env` (the Voxtral
+serving runtime) are needed to run the deliverable. The other venvs
+the alternative scripts reference aren't shipped in the repo —
+they're easy to recreate with `uv` if you want to use those scripts.
+
+| Venv | Used by | Setup (with [uv](https://docs.astral.sh/uv/)) |
+|---|---|---|
+| `asr-env` | `stream-whisper.py`, `stream-whisper-buffered.py`, `asr-call-transcribe` | `uv venv ~/asr/asr-env && uv pip install --python ~/asr/asr-env/bin/python faster-whisper silero-vad onnxruntime` |
+| `sherpa-env` | `stream-sherpa-ipa.py` | `uv venv ~/asr/sherpa-env && uv pip install --python ~/asr/sherpa-env/bin/python sherpa-onnx` |
+| `vosk-env` | `stream-vosk.py` | `uv venv ~/asr/vosk-env && uv pip install --python ~/asr/vosk-env/bin/python vosk srt` |
+
+The torch-based scripts (`stream-canary.py`, `stream-parakeet*.py`,
+`stream-cacheaware.py`) expect a separate `~/venv-3.12-torch/` venv
+shared with other torch projects — outside this repo by design, see
+each script's docstring.
+
+Model files those scripts load (also not shipped):
+
+| Model dir | Used by | Source |
+|---|---|---|
+| `models/vosk-model-es-0.42` | `stream-vosk.py` | <https://alphacephei.com/vosk/models> |
+| `models/vosk-model-small-es-0.42` | `stream-vosk.py --small` | <https://alphacephei.com/vosk/models> |
+| `models/sherpa-es-ipa` | `stream-sherpa-ipa.py` | <https://huggingface.co/bookbot/sherpa-onnx-zipformer-streaming-robust-es-v0> |
+
 ---
 
 *This repository is developed with the assistance of an AI agent

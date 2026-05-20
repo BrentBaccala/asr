@@ -1179,7 +1179,12 @@ def render():
                 age_frames = [(lbl,
                                _state["streams"][lbl]["vad_frames_since_recycle"])
                               for lbl in STREAMS]
-            scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
+            # scroll_tag will be right-aligned to the far edge of the
+            # header so its appear/disappear doesn't push the other
+            # fields around. No leading "  │  " separator since it
+            # floats alone on the right against the trailing reverse-
+            # video padding.
+            scroll_tag = f"↑ scrolled +{so} " if so > 0 else ""
             # Auto-recycle counter (↻) + current session age. Always
             # visible when auto-recycle is enabled: counter ticks up
             # at each recycle; age resets to 0 alongside and counts
@@ -1207,9 +1212,14 @@ def render():
             else:
                 rc_tag = ""
                 age_tag = ""
-            head = (f" asr-tui  │  {status}{audio_tag}"
-                    f"{scroll_tag}{rc_tag}{age_tag}  │  {len(frozen)} done  "
-                    f"│  ^C quit  ^L clear")
+            head_left = (f" asr-tui  │  {status}{audio_tag}"
+                         f"{rc_tag}{age_tag}  │  {len(frozen)} done  "
+                         f"│  ^C quit  ^L clear")
+            if scroll_tag:
+                pad = max(1, cols - len(head_left) - len(scroll_tag))
+                head = head_left + " " * pad + scroll_tag
+            else:
+                head = head_left
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 
             def wrap_pref(text, prefix, prefix_w, body_color):

@@ -761,13 +761,17 @@ async def net_main(source_name, label, q, loop):
         with _lock:
             _state["streams"][label]["reset"] = False
             # Session is starting fresh — the new WS has zero KV. The
-            # audio-budget counter lives with the SESSION, so reset
-            # here. (recycle_count is cosmetic and persists across
-            # recycles.) status is intentionally NOT flipped to
-            # "reconnecting" — with eager auto-recycle both streams
-            # flicker through this state several times a minute, which
-            # made the header twitch. The ↻ counter is the proper
-            # indicator of recycle activity.
+            # audio-budget counter lives with the SESSION, so MUST be
+            # reset here, or the watcher sees the counter still above
+            # min_age_frames on its next 200ms tick after we clear
+            # the reset flag, immediately fires again, and we
+            # ping-pong at ~0.5s. (recycle_count is cosmetic and
+            # persists across recycles.) status is intentionally NOT
+            # flipped to "reconnecting" — with eager auto-recycle both
+            # streams flicker through this state several times a
+            # minute, which made the header twitch. The ↻ counter is
+            # the proper indicator of recycle activity.
+            _state["streams"][label]["vad_frames_since_recycle"] = 0
         while not q.empty():
             try:
                 q.get_nowait()
@@ -1165,9 +1169,11 @@ def render():
                 rc_counts = [(lbl, _state["streams"][lbl]["recycle_count"])
                              for lbl in STREAMS]
             scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
-            # Compact auto-recycle counter so we can see it working: e.g.
-            # "  │  ↻ R:3 M:5" in dual, "  │  ↻ 3" in solo.
-            if any(n for _, n in rc_counts) and _AUTO_RECYCLE_ENABLED:
+            # Compact auto-recycle counter, always visible when
+            # auto-recycle is enabled (even at 0). Confirms at a
+            # glance that the feature is alive and shows pace once
+            # recycles start firing.
+            if _AUTO_RECYCLE_ENABLED:
                 if dual:
                     rc_tag = "  │  ↻ " + " ".join(
                         f"{lbl[0]}:{n}" for lbl, n in rc_counts)

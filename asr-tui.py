@@ -1182,12 +1182,20 @@ def render():
                 if dual:
                     rc_tag = "  │  ↻ " + " ".join(
                         f"{lbl[0]}:{n}" for lbl, n in rc_counts)
+                    # 3-digit-wide age field (right-aligned) so the
+                    # header layout stays stable as values cross
+                    # 10/100s thresholds. Backstop is 1100s, so
+                    # 4 digits is the worst case and that only fires
+                    # if the field has badly drifted — at which point
+                    # one extra column of header shift is the least
+                    # of our worries.
                     age_tag = "  │  " + " ".join(
-                        f"{lbl[0]}:{int(f * VAD_FRAME_S)}s"
+                        f"{lbl[0]}:{int(f * VAD_FRAME_S):>3d}s"
                         for lbl, f in age_frames)
                 else:
                     rc_tag = f"  │  ↻ {rc_counts[0][1]}"
-                    age_tag = f"  │  {int(age_frames[0][1] * VAD_FRAME_S)}s"
+                    age_tag = (f"  │  "
+                               f"{int(age_frames[0][1] * VAD_FRAME_S):>3d}s")
             else:
                 rc_tag = ""
                 age_tag = ""

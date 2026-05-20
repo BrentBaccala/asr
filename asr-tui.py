@@ -259,9 +259,19 @@ def _split_on_markers(en: str, expected_n: int) -> list:
 _final_q: "queue.Queue[tuple]" = queue.Queue()
 
 
-def _emit_chunk_locked(spk, es_text, is_final):
-    """Caller holds _lock. Appends a visual chunk to `frozen` with
-    en=None (live ES flow); marker-joins it into the stream's sent_raw.
+def _emit_chunk_locked(spk, es_text, is_final,
+                       prelim_es=None, prelim_en=None):
+    """Caller holds _lock. Appends a visual chunk to `frozen` and
+    marker-joins it into the stream's sent_raw. The chunk's es/en
+    start as the supplied preliminary values (typically the live
+    preview translation at the moment of emission — see the callers
+    that capture cur_es/cur_en just before wiping them). They render
+    as a real translation until marker-MT lands the properly aligned
+    segment and overwrites them. Pass None for an honest 'pending'
+    placeholder (renders as '⋯'). Empty-string preliminaries are
+    treated as None — '' is reserved for the marker-MT 'this chunk
+    merged into a neighbor' signal (renders as '—').
+
     Returns a (spk, sent_raw, open_ids) sentence-finalize job iff
     is_final and there's a sentence to translate, else None — caller
     queues the job after releasing the lock."""
@@ -270,9 +280,10 @@ def _emit_chunk_locked(spk, es_text, is_final):
     if es_text:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1
-        # 5-tuple: (spk, raw, es_translation, en_translation, chunk_id);
-        # both translations start as None pending sentence-level MT.
-        _state["frozen"].append((spk, es_text, None, None, cid))
+        es_init = prelim_es if prelim_es else None
+        en_init = prelim_en if prelim_en else None
+        # 5-tuple: (spk, raw, es_translation, en_translation, chunk_id).
+        _state["frozen"].append((spk, es_text, es_init, en_init, cid))
         _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
         # Marker BEFORE this chunk if it isn't the first of the sentence.
         # Number the markers 1, 2, ... per the probe (which used [1][2][3]).
@@ -418,10 +429,23 @@ def take_sentences(spk):
             out.append(m.group(1).strip())
             pos = m.end()
         if out:
+            # Capture the live preview BEFORE wiping it, so the first
+            # emitted chunk inherits a preliminary translation (the live
+            # ES/EN of the whole pre-cut cur_live). Marker-MT replaces
+            # it shortly after with the marker-aligned segment.
+            prelim_es, prelim_en = s["cur_es"], s["cur_en"]
             s["cur_live"] = buf[pos:]
-            s["cur_es"] = s["cur_en"] = ""             # reset live EN for the new sentence
-        for sent in out:
-            job = _emit_chunk_locked(spk, sent, is_final=True)
+            s["cur_es"] = s["cur_en"] = ""
+        else:
+            prelim_es = prelim_en = None
+        for i, sent in enumerate(out):
+            # Only the FIRST chunk inherits the preview (it's the one
+            # the preview's text covers). Subsequent sentences in the
+            # same buffer were not yet visible — leave their prelim None.
+            pe = prelim_es if i == 0 else None
+            pn = prelim_en if i == 0 else None
+            job = _emit_chunk_locked(spk, sent, is_final=True,
+                                     prelim_es=pe, prelim_en=pn)
             if job is not None:
                 jobs.append(job)
     for job in jobs:
@@ -459,14 +483,22 @@ def clause_flush(spk):
             buf = buf[cut:].lstrip()
             changed = True
         if changed:
+            # Capture preview BEFORE wiping so the first cut piece
+            # inherits a preliminary translation.
+            prelim_es, prelim_en = s["cur_es"], s["cur_en"]
             s["cur_live"] = buf
             s["cur_es"] = s["cur_en"] = ""
-        # Visual chunks: NOT is_final. The chunk lands in `frozen` with
-        # en=None and joins this sentence's marker-laden sent_raw; the EN
-        # will backfill when the sentence completes (punctuation/pause).
-        for piece in flushed:
+        else:
+            prelim_es = prelim_en = None
+        # Visual chunks: NOT is_final. The first cut piece carries the
+        # preview as a preliminary es/en; later pieces in the same flush
+        # weren't visible in the preview, leave their prelim None.
+        for i, piece in enumerate(flushed):
             if piece:
-                _emit_chunk_locked(spk, piece, is_final=False)
+                pe = prelim_es if i == 0 else None
+                pn = prelim_en if i == 0 else None
+                _emit_chunk_locked(spk, piece, is_final=False,
+                                   prelim_es=pe, prelim_en=pn)
 
 
 def pause_watcher():
@@ -508,19 +540,24 @@ def pause_watcher():
                 # close so open chunks' ES/EN can backfill.
                 if (close_s is not None and gap >= close_s
                         and (rem or s["open_ids"])):
+                    # capture preview before wipe
+                    pe, pn = s["cur_es"], s["cur_en"]
                     s["cur_live"] = ""
                     s["cur_es"] = s["cur_en"] = ""
                     tail = rem if (rem and len(rem) >= min_sub) else ""
-                    job = _emit_chunk_locked(lbl, tail, is_final=True)
+                    job = _emit_chunk_locked(lbl, tail, is_final=True,
+                                             prelim_es=pe, prelim_en=pn)
                     if job is not None:
                         jobs.append(job)
                 # Short pause: flush a visual chunk, keep the sentence
                 # open so MT still translates the whole utterance.
                 elif (visual_s is not None and gap >= visual_s
                       and rem and len(rem) >= min_sub):
+                    pe, pn = s["cur_es"], s["cur_en"]
                     s["cur_live"] = ""
                     s["cur_es"] = s["cur_en"] = ""
-                    _emit_chunk_locked(lbl, rem, is_final=False)
+                    _emit_chunk_locked(lbl, rem, is_final=False,
+                                       prelim_es=pe, prelim_en=pn)
         for job in jobs:
             _final_q.put(job)
 
@@ -628,10 +665,13 @@ async def _ws_session(label, q):
                         s = _state["streams"][label]
                         rem = s["cur_live"].strip()
                         if rem or s["open_ids"]:
+                            pe, pn = s["cur_es"], s["cur_en"]
                             s["cur_live"] = ""
                             s["cur_es"] = s["cur_en"] = ""
                             job = _emit_chunk_locked(label, rem,
-                                                    is_final=True)
+                                                    is_final=True,
+                                                    prelim_es=pe,
+                                                    prelim_en=pn)
                     if job is not None:
                         _final_q.put(job)
                 elif t == "error":
@@ -681,11 +721,13 @@ async def _ws_session(label, q):
                 s = _state["streams"][label]
                 rem = s["cur_live"].strip()
                 if rem or s["open_ids"]:
+                    pe, pn = s["cur_es"], s["cur_en"]
                     s["cur_live"] = ""
                     s["cur_es"] = s["cur_en"] = ""
                     tail = rem if (rem and len(rem)
                                    >= max(12, args.min_clause // 2)) else ""
-                    job = _emit_chunk_locked(label, tail, is_final=True)
+                    job = _emit_chunk_locked(label, tail, is_final=True,
+                                             prelim_es=pe, prelim_en=pn)
             if job is not None:
                 _final_q.put(job)
                 time.sleep(2.0)

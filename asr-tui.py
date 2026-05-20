@@ -1181,7 +1181,7 @@ def render():
             if _AUTO_RECYCLE_ENABLED:
                 if dual:
                     rc_tag = "  │  ↻ " + " ".join(
-                        f"{lbl[0]}:{n}" for lbl, n in rc_counts)
+                        f"{lbl[0]}:{n:>3d}" for lbl, n in rc_counts)
                     # 3-digit-wide age field (right-aligned) so the
                     # header layout stays stable as values cross
                     # 10/100s thresholds. Backstop is 1100s, so
@@ -1193,7 +1193,7 @@ def render():
                         f"{lbl[0]}:{int(f * VAD_FRAME_S):>3d}s"
                         for lbl, f in age_frames)
                 else:
-                    rc_tag = f"  │  ↻ {rc_counts[0][1]}"
+                    rc_tag = f"  │  ↻ {rc_counts[0][1]:>3d}"
                     age_tag = (f"  │  "
                                f"{int(age_frames[0][1] * VAD_FRAME_S):>3d}s")
             else:

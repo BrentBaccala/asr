@@ -712,8 +712,16 @@ def recycle_watcher():
                     continue
                 if age_frames < min_age_frames:
                     continue
-                if s["last_speech_t"] <= 0.0:
-                    continue                        # never heard speech
+                # A stream that has NEVER heard speech (last_speech_t
+                # still 0.0) is treated as "silent forever" — the
+                # comparison `now - 0.0` is huge so it falls through to
+                # the recycle. That's intentional: a silent stream has
+                # no transcript content to preserve, so eager recycling
+                # is free. The audio gap during reconnect is in silent
+                # audio anyway. The previous "never heard speech ->
+                # skip" guard let a perpetually-silent stream sit
+                # untouched until the 18-min backstop, with no visible
+                # indicator activity in the meantime.
                 if now - s["last_speech_t"] < silence_s:
                     continue                        # still active
                 if s["cur_live"].strip() or s["open_ids"]:

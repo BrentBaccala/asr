@@ -153,6 +153,7 @@ def _new_stream_state():
         # each open chunk's es/en is backfilled by its chunk_id.
         "sent_raw": "",      # marker-laden raw text for the in-progress sentence
         "open_ids": [],      # chunk_ids whose es/en are pending backfill
+        "reset": False,      # Ctrl-L requested: cycle the WS to free vLLM KV
     }
 
 
@@ -520,52 +521,96 @@ def pause_watcher():
 
 
 async def net_main(source_name, label, q, loop):
-    """One Voxtral /v1/realtime WS session + one audio feed for `label`.
-    source_name is the pw-record target in --dual, or None for the
-    stdin (single-stream) path. `q` is this session's audio queue."""
+    """Persistent driver for one stream's audio + Voxtral /v1/realtime
+    sessions. The audio reader (pw-record subprocess in --dual, stdin
+    in single-stream) is started ONCE here and persists across WS
+    reconnects. The WS itself is wrapped in a session loop: on Ctrl-L
+    (per-stream `reset` flag) we close+reopen the WS so vLLM frees the
+    KV cache for this stream — the workaround for the --max-model-len
+    duration ceiling."""
+    if source_name is None:
+        threading.Thread(target=stdin_reader, args=(q, loop),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=pw_reader,
+                         args=(source_name, q, loop),
+                         daemon=True).start()
+
+    while not _STOP.is_set():
+        eof = await _ws_session(label, q)
+        if eof or _STOP.is_set():
+            return
+        # Reset path: clear the per-stream flag, drain audio that piled
+        # up in q while the WS was closing (those frames are pre-Ctrl-L
+        # and would otherwise be transcribed into the freshly-cleared
+        # history), settle briefly, then reconnect.
+        with _lock:
+            _state["streams"][label]["reset"] = False
+            _state["status"] = "session reset (reconnecting…)"
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        await asyncio.sleep(0.3)
+
+
+async def _ws_session(label, q):
+    """One Voxtral /v1/realtime WS session for `label`. Returns True
+    on natural EOF (audio stream ended -> caller must NOT reconnect)
+    or on a hard server failure; False when the user reset us via
+    Ctrl-L (caller reconnects)."""
+    def _reset():
+        with _lock:
+            return _state["streams"][label]["reset"]
+
     uri = f"ws://{HOST}:{PORT}/v1/realtime"
     try:
         ws = await websockets.connect(uri, max_size=None)
     except Exception as e:
         with _lock:
             _state["status"] = f"vLLM unreachable: {e}"
-        return
+        return True
     async with ws:
-        r = json.loads(await ws.recv())
+        try:
+            r = json.loads(await ws.recv())
+        except Exception as e:
+            with _lock:
+                _state["status"] = f"ws handshake failed: {e}"
+            return True
         if r.get("type") != "session.created":
             with _lock:
                 _state["status"] = f"unexpected: {r}"
-            return
+            return True
         await ws.send(json.dumps({"type": "session.update", "model": MODEL}))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         with _lock:
             _state["status"] = "streaming"
 
-        if source_name is None:
-            threading.Thread(target=stdin_reader, args=(q, loop),
-                             daemon=True).start()
-        else:
-            threading.Thread(target=pw_reader,
-                             args=(source_name, q, loop),
-                             daemon=True).start()
+        eof = False
 
         async def receiver():
             while True:
-                m = json.loads(await ws.recv())
+                if _reset():
+                    return
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    return     # WS closed under us
+                if _reset():
+                    return     # ignore the in-flight message on reset
+                m = json.loads(raw)
                 t = m.get("type")
                 if t == "transcription.delta":
                     d = m["delta"]
                     with _lock:
                         s = _state["streams"][label]
-                        s["cur_live"] += d          # keep text fidelity
-                        # Only a delta with non-whitespace content counts
-                        # as speech activity. An always-on channel keeps
-                        # streaming silence; Voxtral answers with empty/
-                        # whitespace deltas, which must NOT refresh the
-                        # pause clock (else pause_watcher never fires and
-                        # a trailed-off line stays stuck — observed when
-                        # the source audio is stopped but RTP keeps
-                        # sending zeros).
+                        s["cur_live"] += d
+                        # Non-whitespace deltas only refresh the pause
+                        # clock — a silent always-on channel emits empty
+                        # deltas that must not keep the clock fresh.
                         if d.strip():
                             s["delta_t"] = time.time()
                             _state["active"] = label
@@ -580,8 +625,6 @@ async def net_main(source_name, label, q, loop):
                         if rem or s["open_ids"]:
                             s["cur_live"] = ""
                             s["cur_es"] = s["cur_en"] = ""
-                            # Always close the sentence; if rem is empty
-                            # we still need to flush any open chunks.
                             job = _emit_chunk_locked(label, rem,
                                                     is_final=True)
                     if job is not None:
@@ -592,41 +635,57 @@ async def net_main(source_name, label, q, loop):
                     return
 
         rx = asyncio.create_task(receiver())
-        while True:
-            chunk = await q.get()
+        while not _STOP.is_set():
+            if _reset():
+                break
+            try:
+                chunk = await asyncio.wait_for(q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
             if chunk is None:
+                eof = True
                 with _lock:
                     _state["status"] = "audio stream ended"
-                await ws.send(json.dumps(
-                    {"type": "input_audio_buffer.commit", "final": True}))
+                try:
+                    await ws.send(json.dumps(
+                        {"type": "input_audio_buffer.commit",
+                         "final": True}))
+                except Exception:
+                    pass
                 break
             with _lock:
                 _state["audio_t"] = time.time()
-            await ws.send(json.dumps(
-                {"type": "input_audio_buffer.append",
-                 "audio": base64.b64encode(chunk).decode()}))
+            try:
+                await ws.send(json.dumps(
+                    {"type": "input_audio_buffer.append",
+                     "audio": base64.b64encode(chunk).decode()}))
+            except Exception:
+                break          # WS closed mid-send (e.g. server crash)
         try:
-            await asyncio.wait_for(rx, timeout=10)
+            await asyncio.wait_for(rx, timeout=3)
         except asyncio.TimeoutError:
-            pass
-        # Close the in-progress sentence: emit any substantive tail as
-        # the final chunk, then translate sent_raw so open chunks get
-        # backfilled. If only a 1-3 char scrap remains we discard the
-        # tail (NLLB hallucinates on scraps) but still close so any
-        # earlier-flushed chunks finish.
-        job = None
-        with _lock:
-            s = _state["streams"][label]
-            rem = s["cur_live"].strip()
-            if rem or s["open_ids"]:
-                s["cur_live"] = ""
-                s["cur_es"] = s["cur_en"] = ""
-                tail = rem if (rem and len(rem)
-                               >= max(12, args.min_clause // 2)) else ""
-                job = _emit_chunk_locked(label, tail, is_final=True)
-        if job is not None:
-            _final_q.put(job)
-            time.sleep(2.0)            # let the MT worker finalize it
+            rx.cancel()
+
+        # Final-tail close — ONLY on natural EOF, not on user reset
+        # (on reset, _clear_history already cleared the per-stream state
+        # and emitting now would put a stale partial sentence into the
+        # freshly-cleared history).
+        if eof:
+            job = None
+            with _lock:
+                s = _state["streams"][label]
+                rem = s["cur_live"].strip()
+                if rem or s["open_ids"]:
+                    s["cur_live"] = ""
+                    s["cur_es"] = s["cur_en"] = ""
+                    tail = rem if (rem and len(rem)
+                                   >= max(12, args.min_clause // 2)) else ""
+                    job = _emit_chunk_locked(label, tail, is_final=True)
+            if job is not None:
+                _final_q.put(job)
+                time.sleep(2.0)
+
+        return eof
 
 
 def net_thread():
@@ -734,22 +793,29 @@ def _scroll(delta):
 
 
 def _clear_history():
-    """Ctrl-L: wipe the history pane + the in-flight sentence state.
-    Live region (cur_live/cur_es/cur_en) is left alone — the speaker's
-    current utterance keeps streaming — but each stream's sent_raw and
-    open_ids reset to empty, so post-clear chunks are translated as a
-    fresh sentence rather than trying to backfill into rows that no
-    longer exist. Any pending sentence-complete jobs are drained from
-    _final_q (their chunk_ids reference gone rows — backfill would
-    silently no-op but draining avoids burning MT cycles)."""
+    """Ctrl-L: full clean slate. Wipe history + in-flight sentence
+    state + live region, then signal each WS session to recycle.
+
+    Cycling the WebSocket is the load-bearing piece: vLLM allocates KV
+    cache per WS session, and closing+reopening frees it. Combined
+    with --max-model-len 16384 (currently a ~20 min ceiling), Ctrl-L
+    at any natural pause effectively resets the duration budget — a
+    cheap workaround until we raise --max-model-len for real.
+
+    Live region (cur_live/cur_es/cur_en) is cleared too: the new vLLM
+    session starts with a fresh KV anyway, so keeping the old partial
+    transcription on the client side would just be misleading."""
     with _lock:
         _state["frozen"].clear()
         _state["scroll_offset"] = 0
         _state["last_hist_total"] = 0
         for lbl in STREAMS:
             s = _state["streams"][lbl]
+            s["cur_live"] = ""
+            s["cur_es"] = s["cur_en"] = ""
             s["sent_raw"] = ""
             s["open_ids"] = []
+            s["reset"] = True      # net_main session loop sees this
     while True:
         try:
             _final_q.get_nowait()

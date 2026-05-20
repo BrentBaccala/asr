@@ -69,7 +69,7 @@ MODEL = "mistralai/Voxtral-Mini-4B-Realtime-2602"
 NLLB_DIR = os.path.expanduser("~/asr/models/nllb-600m-ct2")
 CHUNK = 2048 * 2
 SENT_RE = re.compile(r'(.+?[.!?…]+["»”\'\)\]]*)(?:\s+|$)', re.S)
-MASK_K = 4              # words of the live EN tail to hide (unstable)
+MASK_K = 2              # words of the live EN/ES tail to hide (unstable)
 FROZEN_CAP = 300
 SAMPLE_RATE = 16000
 
@@ -357,9 +357,14 @@ def mt_worker():
                 except Exception as e:
                     es = en = f"[mt error: {e}]"
                 with _lock:
-                    # only write back if still the current text (the
-                    # stream may have flushed while we translated)
-                    if _state["streams"][lbl]["cur_live"].strip() == cur:
+                    # Write back if cur_live still STARTS WITH cur — i.e.
+                    # it merely grew during translation (continuous
+                    # speech), not that a chunk flush truncated/reset
+                    # it. Strict equality (==) discarded the result on
+                    # every cycle when Voxtral deltas kept arriving
+                    # mid-translation, so the preview never wrote back
+                    # during sustained speech ("(translating…)" stuck).
+                    if _state["streams"][lbl]["cur_live"].strip().startswith(cur):
                         _state["streams"][lbl]["cur_es"] = \
                             mask_tail(es, args.mask)
                         _state["streams"][lbl]["cur_en"] = \

@@ -1016,10 +1016,17 @@ def _tty_restore():
 
 def _scroll(delta):
     """Adjust scroll_offset by delta (positive = back/up, negative =
-    down/toward live). Clamping happens in render() — it knows the
-    true upper bound (total hist lines - body_h)."""
+    down/toward live), clamped to [0, last_hist_total - last_body_h]
+    against the most recent render's bounds. Clamping at the source
+    keeps the wheel indicator from briefly overshooting between input
+    events and the next render-tick clamp (which would then snap the
+    value back — the springback the user saw at the top of the
+    history)."""
     with _lock:
-        _state["scroll_offset"] = max(0, _state["scroll_offset"] + delta)
+        max_off = max(0,
+                      _state["last_hist_total"] - _state["last_body_h"])
+        new_off = _state["scroll_offset"] + delta
+        _state["scroll_offset"] = max(0, min(new_off, max_off))
 
 
 def _clear_history():
@@ -1107,8 +1114,9 @@ def input_reader(fd):
             if buf.startswith(b"\x1b[5~"):   _scroll(+_state["last_body_h"]); buf = buf[4:]; continue
             if buf.startswith(b"\x1b[6~"):   _scroll(-_state["last_body_h"]); buf = buf[4:]; continue
             if buf.startswith(b"\x1b[H") or buf.startswith(b"\x1b[1~"):
-                with _lock:
-                    _state["scroll_offset"] = 10**9   # clamped down to max in render
+                # Jump to the top of the available history. _scroll
+                # clamps to last_hist_total - last_body_h.
+                _scroll(10**9)
                 buf = buf[3 if buf[2:3] == b"H" else 4:]; continue
             if buf.startswith(b"\x1b[F") or buf.startswith(b"\x1b[4~"):
                 with _lock:

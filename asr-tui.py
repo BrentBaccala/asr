@@ -1168,21 +1168,31 @@ def render():
                 so = _state["scroll_offset"]
                 rc_counts = [(lbl, _state["streams"][lbl]["recycle_count"])
                              for lbl in STREAMS]
+                age_frames = [(lbl,
+                               _state["streams"][lbl]["vad_frames_since_recycle"])
+                              for lbl in STREAMS]
             scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
-            # Compact auto-recycle counter, always visible when
-            # auto-recycle is enabled (even at 0). Confirms at a
-            # glance that the feature is alive and shows pace once
-            # recycles start firing.
+            # Auto-recycle counter (↻) + current session age. Always
+            # visible when auto-recycle is enabled: counter ticks up
+            # at each recycle; age resets to 0 alongside and counts
+            # back up to the next recycle. Age is in audio-seconds
+            # consumed by the current WS session — the actual KV-
+            # budget metric, not wall time.
             if _AUTO_RECYCLE_ENABLED:
                 if dual:
                     rc_tag = "  │  ↻ " + " ".join(
                         f"{lbl[0]}:{n}" for lbl, n in rc_counts)
+                    age_tag = "  │  " + " ".join(
+                        f"{lbl[0]}:{int(f * VAD_FRAME_S)}s"
+                        for lbl, f in age_frames)
                 else:
                     rc_tag = f"  │  ↻ {rc_counts[0][1]}"
+                    age_tag = f"  │  {int(age_frames[0][1] * VAD_FRAME_S)}s"
             else:
                 rc_tag = ""
+                age_tag = ""
             head = (f" asr-tui  │  {status}{audio_tag}"
-                    f"{scroll_tag}{rc_tag}  │  {len(frozen)} done  "
+                    f"{scroll_tag}{rc_tag}{age_tag}  │  {len(frozen)} done  "
                     f"│  ^C quit  ^L clear")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 

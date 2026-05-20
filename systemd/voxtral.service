@@ -1,0 +1,60 @@
+# vLLM Voxtral-Mini-4B-Realtime server — backend for asr-tui.py.
+#
+# Installation (one-time, on the machine that will run vLLM):
+#   ln -s ~/asr/systemd/voxtral.service ~/.config/systemd/user/voxtral.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now voxtral
+#
+# Inspection:
+#   systemctl --user status voxtral
+#   journalctl --user -u voxtral -f       # live log
+#
+# Manual control:
+#   systemctl --user stop voxtral          # free the GPU for other tools
+#   systemctl --user start voxtral         # ~70-95s to /health=200
+#   systemctl --user restart voxtral
+#
+# After clone-or-pull, daemon-reload picks up any unit-file edits:
+#   systemctl --user daemon-reload && systemctl --user restart voxtral
+#
+# Notes:
+#   - %h expands to the user's home directory at runtime, so the unit
+#     is portable across users; the symlink target stays ~/asr/systemd/
+#     under whichever account installs it.
+#   - With `loginctl enable-linger <user>` set, this service starts at
+#     boot without anyone logging in (typical for a dedicated inference
+#     host that wants vLLM ready by the time the first client connects).
+#   - vLLM doesn't ship sd_notify support, so Type=exec is the most
+#     accurate signal we can give systemd (it means "the exec call
+#     succeeded", not "ready to serve"). Voxtral itself takes ~70-95s
+#     to load + cudagraph-capture; /health responds 200 once ready.
+
+[Unit]
+Description=vLLM Voxtral-Mini-4B-Realtime server (asr-tui.py backend)
+Documentation=https://github.com/BrentBaccala/asr
+After=network.target
+
+[Service]
+Type=exec
+Environment=VLLM_DISABLE_COMPILE_CACHE=1
+ExecStart=%h/asr/vllm-env/bin/vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 \
+    --compilation_config '{"cudagraph_mode":"PIECEWISE"}' \
+    --host 127.0.0.1 --port 8000 \
+    --max-model-len 16384 --gpu-memory-utilization 0.92
+
+# Auto-restart on crash. vLLM exits non-zero on the --max-model-len
+# AssertionError in _bookkeeping_sync that killed the EngineCore on
+# 2026-05-19 ("Sampled token IDs exceed the max model length. Total
+# number of tokens: 16385 > max_model_len: 16384"). asr-tui's
+# VAD-driven WS auto-recycle should prevent that in normal use, but
+# defense-in-depth is cheap.
+Restart=on-failure
+RestartSec=10
+
+# Be patient on first start: PIECEWISE cudagraph capture + Voxtral
+# load takes ~70-95s; systemd would otherwise mark the unit failed
+# after the default 90s TimeoutStartSec on a cold-cache start.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

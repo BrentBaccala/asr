@@ -82,7 +82,11 @@ DUAL_SOURCES = [
 # Single-stream sentinel label (stdin path).
 SOLO = "(solo)"
 
-ap = argparse.ArgumentParser()
+ap = argparse.ArgumentParser(
+    # Auto-appends "(default: ...)" to every option's help line so the
+    # current value is visible from --help — useful when tuning the
+    # latency / chunking / mask knobs.
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 ap.add_argument("--beam", type=int, default=1)
 ap.add_argument("--dual", action="store_true",
                 help="dual-stream: the script owns both taps "
@@ -100,11 +104,14 @@ ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
 ap.add_argument("--min-clause", type=int, default=25,
                 help="never line-flush a leading clause shorter than this "
                      "many chars (avoids tiny-fragment mistranslation)")
-ap.add_argument("--pause-ms", type=int, default=800,
+ap.add_argument("--pause-ms", type=int, default=1500,
                 help="short pause: flush the live region as a VISUAL "
                      "chunk after this many ms with no new delta. The "
                      "sentence stays open so MT runs on the whole "
-                     "sentence (good context). 0 disables visual flush.")
+                     "sentence (good context). 0 disables visual flush. "
+                     "Natural inter-clause breaths are ~500-1000ms; "
+                     "this default sits above them and below "
+                     "--sentence-close-ms so only larger pauses flush.")
 ap.add_argument("--sentence-close-ms", type=int, default=3000,
                 help="long pause: CLOSE the sentence after this many ms "
                      "with no new delta (speaker truly stopped). Marker-"

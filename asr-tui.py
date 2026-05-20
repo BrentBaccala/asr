@@ -87,7 +87,11 @@ ap = argparse.ArgumentParser(
     # current value is visible from --help — useful when tuning the
     # latency / chunking / mask knobs.
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--beam", type=int, default=1)
+ap.add_argument("--beam", type=int, default=1,
+                help="NLLB beam-search width. 1 = greedy decoding "
+                     "(fastest); 2+ explores more hypotheses for "
+                     "marginally better translations at proportional "
+                     "cost (beam 2 ≈ 15%% slower on this model).")
 ap.add_argument("--dual", action="store_true",
                 help="dual-stream: the script owns both taps "
                      "(rtp_call_remote_source=Remote, "

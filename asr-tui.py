@@ -998,25 +998,35 @@ def render():
                     live_pref = "Live▸ "
                     es_pref   = "ES▸   "
                     en_pref   = "EN▸   "
+                # Pending placeholder is the same '⋯' as the history
+                # rows, so the visual language is consistent across the
+                # two panels. Dim coloring distinguishes pending vs.
+                # real content; idle (cur_live empty) is also dim.
                 live_l = (wrap_pref(ces_live, live_pref) if ces_live
                           else [live_pref.rstrip()])
-                # "(translating…)" only when there's raw text awaiting a
-                # translation — not when the channel is idle (cur_live
-                # empty), where all three lines should sit empty.
+                live_ansi = "1m" if ces_live else "2m"
                 if not ces_live:
-                    es_l = [es_pref.rstrip()]
-                    en_l = [en_pref.rstrip()]
+                    es_l, es_ansi = [es_pref.rstrip()], "2;33m"
+                    en_l, en_ansi = [en_pref.rstrip()], "2;36m"
                 else:
-                    es_l = (wrap_pref(ces_trans, es_pref) if ces_trans
-                            else [es_pref + "(translating…)"])
-                    en_l = (wrap_pref(cen_trans, en_pref) if cen_trans
-                            else [en_pref + "(translating…)"])
+                    if ces_trans:
+                        es_l   = wrap_pref(ces_trans, es_pref)
+                        es_ansi = "1;33m"
+                    else:
+                        es_l   = [es_pref + "⋯"]
+                        es_ansi = "2;33m"
+                    if cen_trans:
+                        en_l   = wrap_pref(cen_trans, en_pref)
+                        en_ansi = "1;36m"
+                    else:
+                        en_l   = [en_pref + "⋯"]
+                        en_ansi = "2;36m"
                 for ln in live_l:
-                    live.append((ln, "1m"))           # raw: bold
+                    live.append((ln, live_ansi))
                 for ln in es_l:
-                    live.append((ln, "1;33m"))        # ES: bold yellow
+                    live.append((ln, es_ansi))
                 for ln in en_l:
-                    live.append((ln, "1;36m"))        # EN: bold cyan
+                    live.append((ln, en_ansi))
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)

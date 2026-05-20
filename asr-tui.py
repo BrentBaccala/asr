@@ -756,12 +756,14 @@ async def net_main(source_name, label, q, loop):
         # history), settle briefly, then reconnect.
         with _lock:
             _state["streams"][label]["reset"] = False
-            # Session is starting fresh — the new WS has zero KV. Both
-            # the audio-budget counter and the recycle counter live with
-            # the SESSION, so reset the counter here. (recycle_count is
-            # cosmetic and persists across recycles.)
-            _state["streams"][label]["vad_frames_since_recycle"] = 0
-            _state["status"] = "session reset (reconnecting…)"
+            # Session is starting fresh — the new WS has zero KV. The
+            # audio-budget counter lives with the SESSION, so reset
+            # here. (recycle_count is cosmetic and persists across
+            # recycles.) status is intentionally NOT flipped to
+            # "reconnecting" — with eager auto-recycle both streams
+            # flicker through this state several times a minute, which
+            # made the header twitch. The ↻ counter is the proper
+            # indicator of recycle activity.
         while not q.empty():
             try:
                 q.get_nowait()

@@ -62,7 +62,14 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import websockets
 import ctranslate2
+import numpy as np
 from transformers import AutoTokenizer
+try:
+    import torch
+    from silero_vad import load_silero_vad
+    _SILERO_AVAILABLE = True
+except ImportError:
+    _SILERO_AVAILABLE = False
 
 HOST, PORT = "127.0.0.1", 8000
 MODEL = "mistralai/Voxtral-Mini-4B-Realtime-2602"
@@ -123,6 +130,23 @@ ap.add_argument("--sentence-close-ms", type=int, default=3000,
                      "MT runs and chunk ES/EN backfill. Must be > "
                      "--pause-ms; should be long enough to not fire "
                      "during a natural inter-clause pause.")
+ap.add_argument("--auto-recycle-silence-ms", type=int, default=800,
+                help="VAD-driven WS auto-recycle: when per-stream "
+                     "silence (Silero VAD) lasts this long AND nothing "
+                     "is in flight, close+reopen that stream's vLLM "
+                     "session to free its KV cache budget. 0 disables. "
+                     "Phone-call sides are mostly idle individually, so "
+                     "this keeps each session short and the cap "
+                     "(--max-model-len) effectively out of reach.")
+ap.add_argument("--auto-recycle-min-s", type=float, default=10.0,
+                help="don't auto-recycle a session younger than this "
+                     "many seconds of audio sent (anti-thrash).")
+ap.add_argument("--auto-recycle-backstop-s", type=float, default=1100.0,
+                help="safety backstop: force a recycle once a stream's "
+                     "session reaches this many seconds of audio "
+                     "regardless of in-flight state. Should be safely "
+                     "below the cap (--max-model-len 16384 × 80ms ≈ "
+                     "1310s; default leaves ~3.5min headroom).")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
 args = ap.parse_args()
@@ -165,7 +189,16 @@ def _new_stream_state():
         # each open chunk's es/en is backfilled by its chunk_id.
         "sent_raw": "",      # marker-laden raw text for the in-progress sentence
         "open_ids": [],      # chunk_ids whose es/en are pending backfill
-        "reset": False,      # Ctrl-L requested: cycle the WS to free vLLM KV
+        "reset": False,      # Ctrl-L OR auto-recycle: cycle the WS
+        # Silero-VAD-driven auto-recycle bookkeeping (per-stream):
+        # last_speech_t = wall time of the last VAD frame that crossed
+        # the speech threshold (0.0 until the first such frame ever).
+        # vad_frames_since_recycle counts 32ms VAD frames consumed by
+        # the current WS session — reset to 0 when the WS reconnects.
+        # recycle_count is cosmetic, surfaced in the header.
+        "last_speech_t": 0.0,
+        "vad_frames_since_recycle": 0,
+        "recycle_count": 0,
     }
 
 
@@ -201,6 +234,61 @@ _tok = AutoTokenizer.from_pretrained(NLLB_DIR)
 _tok.src_lang = "spa_Latn"
 _tr = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
                              inter_threads=1, intra_threads=8)
+
+
+# ---------------- Silero VAD (per-stream) ----------------
+# 32 ms frames at 16 kHz = 512 samples; threshold 0.5 is silero's
+# default. Cost on CPU is ~0.3 ms per frame (~1% of real-time per
+# stream). Each stream gets its own model instance because silero's
+# internal LSTM is stateful — using a single shared instance across
+# concurrently-arriving frames from two streams would interleave
+# their hidden state.
+VAD_FRAME_SAMPLES = 512
+VAD_FRAME_S = VAD_FRAME_SAMPLES / SAMPLE_RATE   # 0.032
+VAD_THRESHOLD = 0.5
+_VAD_MODELS = {}
+_AUTO_RECYCLE_ENABLED = (args.auto_recycle_silence_ms > 0
+                         and _SILERO_AVAILABLE)
+if _AUTO_RECYCLE_ENABLED:
+    print("loading Silero VAD (per-stream)...", file=sys.stderr, flush=True)
+    for _lbl in STREAMS:
+        _VAD_MODELS[_lbl] = load_silero_vad(onnx=True)
+elif args.auto_recycle_silence_ms > 0 and not _SILERO_AVAILABLE:
+    print("WARNING: silero_vad/onnxruntime not installed; "
+          "auto-recycle disabled. pip install silero-vad onnxruntime "
+          "to enable.", file=sys.stderr, flush=True)
+
+
+def _vad_score_chunk(label, pcm_bytes):
+    """Score a raw int16-LE PCM chunk by Silero VAD, frame-by-frame
+    (512 samples each), and update last_speech_t whenever a frame
+    exceeds the speech threshold. Also bumps vad_frames_since_recycle.
+    Cheap (~0.3 ms per 32 ms frame on CPU)."""
+    if not _AUTO_RECYCLE_ENABLED:
+        return
+    model = _VAD_MODELS.get(label)
+    if model is None:
+        return
+    # int16 -> float32 normalized
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    n_frames = len(pcm) // VAD_FRAME_SAMPLES
+    if n_frames == 0:
+        return
+    speech_now = False
+    for i in range(n_frames):
+        frame = pcm[i * VAD_FRAME_SAMPLES:(i + 1) * VAD_FRAME_SAMPLES]
+        try:
+            prob = float(model(torch.from_numpy(frame), SAMPLE_RATE).item())
+        except Exception:
+            return  # never let VAD failure kill the audio pipeline
+        if prob >= VAD_THRESHOLD:
+            speech_now = True
+    now = time.time()
+    with _lock:
+        s = _state["streams"][label]
+        s["vad_frames_since_recycle"] += n_frames
+        if speech_now:
+            s["last_speech_t"] = now
 
 
 def translate(text: str, tgt: str = "eng_Latn") -> str:
@@ -398,18 +486,20 @@ def mt_worker():
 
 
 # ---------------- network (asyncio in a thread) ----------------
-def stdin_reader(q, loop):
+def stdin_reader(label, q, loop):
     while True:
         b = sys.stdin.buffer.read(CHUNK)
         if not b:
             loop.call_soon_threadsafe(q.put_nowait, None)
             return
+        _vad_score_chunk(label, b)
         loop.call_soon_threadsafe(q.put_nowait, b)
 
 
-def pw_reader(source_name, q, loop):
-    """Dual-stream feed: one pw-record subprocess -> queue (asr-call-
-    transcribe's capture shape, but raw byte chunks for the WS)."""
+def pw_reader(source_name, label, q, loop):
+    """Dual-stream feed: one pw-record subprocess -> queue. VAD-scores
+    each chunk in-place so the auto-recycle watcher can see speech vs.
+    silence on this stream."""
     cmd = ["pw-record", "--target", source_name,
            "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -419,6 +509,7 @@ def pw_reader(source_name, q, loop):
             b = proc.stdout.read(CHUNK)
             if not b:
                 break
+            _vad_score_chunk(label, b)
             loop.call_soon_threadsafe(q.put_nowait, b)
     finally:
         loop.call_soon_threadsafe(q.put_nowait, None)
@@ -574,6 +665,63 @@ def pause_watcher():
             _final_q.put(job)
 
 
+def recycle_watcher():
+    """VAD-driven WS auto-recycle, per stream. When Silero VAD reports
+    silence on stream X for >--auto-recycle-silence-ms AND nothing is
+    in flight (no in-progress live text, no chunks pending marker-MT
+    backfill), set the stream's `reset` flag — the existing net_main
+    session loop sees it, closes the WS, and reopens it with a fresh
+    KV cache budget. By recycling at every natural pause, each session
+    is bounded by the duration of continuous speech rather than the
+    duration of the whole call — phone-call sides are mostly silent
+    individually, so this keeps the --max-model-len cap effectively
+    out of reach.
+
+    Two trigger paths:
+      • normal: silence + clean state + session ≥ --auto-recycle-min-s
+      • backstop: session ≥ --auto-recycle-backstop-s, fire even with
+        in-flight state (rare; only if a single side talks non-stop
+        for ~18 min). We discard the in-flight chunks honestly rather
+        than crash vLLM."""
+    if not _AUTO_RECYCLE_ENABLED:
+        return
+    silence_s = args.auto_recycle_silence_ms / 1000.0
+    min_age_frames = int(args.auto_recycle_min_s / VAD_FRAME_S)
+    backstop_frames = int(args.auto_recycle_backstop_s / VAD_FRAME_S)
+    while not _STOP.is_set():
+        time.sleep(0.2)
+        now = time.time()
+        with _lock:
+            for lbl in STREAMS:
+                s = _state["streams"][lbl]
+                if s["reset"]:
+                    continue                        # already armed
+                age_frames = s["vad_frames_since_recycle"]
+                if age_frames >= backstop_frames:
+                    # Safety backstop: cap is close enough that mid-
+                    # sentence cut beats a crash. Clear in-flight state
+                    # so the new session doesn't try to backfill cids
+                    # the marker-MT will never see (vLLM's chunks for
+                    # the old session are about to be discarded).
+                    s["cur_live"] = ""
+                    s["cur_es"] = s["cur_en"] = ""
+                    s["sent_raw"] = ""
+                    s["open_ids"] = []
+                    s["reset"] = True
+                    s["recycle_count"] += 1
+                    continue
+                if age_frames < min_age_frames:
+                    continue
+                if s["last_speech_t"] <= 0.0:
+                    continue                        # never heard speech
+                if now - s["last_speech_t"] < silence_s:
+                    continue                        # still active
+                if s["cur_live"].strip() or s["open_ids"]:
+                    continue                        # wait for clean state
+                s["reset"] = True
+                s["recycle_count"] += 1
+
+
 async def net_main(source_name, label, q, loop):
     """Persistent driver for one stream's audio + Voxtral /v1/realtime
     sessions. The audio reader (pw-record subprocess in --dual, stdin
@@ -583,11 +731,11 @@ async def net_main(source_name, label, q, loop):
     KV cache for this stream — the workaround for the --max-model-len
     duration ceiling."""
     if source_name is None:
-        threading.Thread(target=stdin_reader, args=(q, loop),
+        threading.Thread(target=stdin_reader, args=(label, q, loop),
                          daemon=True).start()
     else:
         threading.Thread(target=pw_reader,
-                         args=(source_name, q, loop),
+                         args=(source_name, label, q, loop),
                          daemon=True).start()
 
     while not _STOP.is_set():
@@ -600,6 +748,11 @@ async def net_main(source_name, label, q, loop):
         # history), settle briefly, then reconnect.
         with _lock:
             _state["streams"][label]["reset"] = False
+            # Session is starting fresh — the new WS has zero KV. Both
+            # the audio-budget counter and the recycle counter live with
+            # the SESSION, so reset the counter here. (recycle_count is
+            # cosmetic and persists across recycles.)
+            _state["streams"][label]["vad_frames_since_recycle"] = 0
             _state["status"] = "session reset (reconnecting…)"
         while not q.empty():
             try:
@@ -983,9 +1136,21 @@ def render():
             spk_tag = "  │  Remote+Me" if dual else ""
             with _lock:
                 so = _state["scroll_offset"]
+                rc_counts = [(lbl, _state["streams"][lbl]["recycle_count"])
+                             for lbl in STREAMS]
             scroll_tag = f"  │  ↑ scrolled +{so}" if so > 0 else ""
+            # Compact auto-recycle counter so we can see it working: e.g.
+            # "  │  ↻ R:3 M:5" in dual, "  │  ↻ 3" in solo.
+            if any(n for _, n in rc_counts) and _AUTO_RECYCLE_ENABLED:
+                if dual:
+                    rc_tag = "  │  ↻ " + " ".join(
+                        f"{lbl[0]}:{n}" for lbl, n in rc_counts)
+                else:
+                    rc_tag = f"  │  ↻ {rc_counts[0][1]}"
+            else:
+                rc_tag = ""
             head = (f" asr-tui  │  {status}  │  audio {live_mark}"
-                    f"{spk_tag}{scroll_tag}  │  {len(frozen)} done  "
+                    f"{spk_tag}{scroll_tag}{rc_tag}  │  {len(frozen)} done  "
                     f"│  ^C quit  ^L clear")
             lines = [CSI + "7m" + head[:cols].ljust(cols) + CSI + "0m"]
 
@@ -1171,6 +1336,7 @@ def main():
     threading.Thread(target=mt_worker, daemon=True).start()
     threading.Thread(target=net_thread, daemon=True).start()
     threading.Thread(target=pause_watcher, daemon=True).start()
+    threading.Thread(target=recycle_watcher, daemon=True).start()
     if args.plain:
         plain_loop()
     else:

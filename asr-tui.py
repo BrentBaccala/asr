@@ -95,7 +95,8 @@ ap.add_argument("--dual", action="store_true",
                      "subprocesses + two Voxtral WS sessions. Without "
                      "this, audio is read from stdin (single stream).")
 ap.add_argument("--mask", type=int, default=MASK_K,
-                help="words of the in-progress EN tail to hide (default 4)")
+                help="words of the in-progress EN/ES tail to hide "
+                     "(model tokens at the very end are unstable)")
 ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
                 default=True,
                 help="when the live line fills the screen width, commit the "
@@ -514,14 +515,14 @@ def pause_watcher():
     frames; each stream has its own delta_t, refreshed only by deltas
     with non-whitespace content).
 
-      • short pause (--pause-ms, default 800ms) -> flush the live
-        region as a VISUAL chunk (is_final=False). The chunk lands in
-        history with ES/EN = "⋯"; sent_raw keeps accumulating with the
-        next [N] marker. Marker-MT does NOT run yet. This gives the
-        comfortable visual flow between clauses without fragmenting MT.
-      • long  pause (--sentence-close-ms, default 3000ms) -> CLOSE the
-        sentence (is_final=True). Marker-MT translates the whole
-        sent_raw and all open chunks get their ES/EN backfilled.
+      • short pause (--pause-ms) -> flush the live region as a VISUAL
+        chunk (is_final=False). The chunk lands in history with
+        ES/EN = "⋯"; sent_raw keeps accumulating with the next [N]
+        marker. Marker-MT does NOT run yet. This gives the comfortable
+        visual flow between clauses without fragmenting MT.
+      • long  pause (--sentence-close-ms) -> CLOSE the sentence
+        (is_final=True). Marker-MT translates the whole sent_raw and
+        all open chunks get their ES/EN backfilled.
 
     delta_t == 0.0 until the first delta on a stream ever arrives: a
     silent direction must not flush a phantom line during startup."""

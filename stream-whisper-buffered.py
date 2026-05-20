@@ -1,4 +1,4 @@
-#!/home/cosine/asr-env/bin/python3
+#!/home/cosine/asr/asr-env/bin/python3
 """
 Low-latency buffered streaming transcription with faster-whisper,
 language hard-pinned (default Spanish).

@@ -1,4 +1,4 @@
-#!/home/cosine/asr-env/bin/python3
+#!/home/cosine/asr/asr-env/bin/python3
 """asr-call-transcribe — live phone-call transcription on pony.
 
 Reads two RTP-streamed audio sources (remote party + local mic from

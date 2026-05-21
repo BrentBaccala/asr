@@ -149,6 +149,9 @@ ap.add_argument("--auto-recycle-backstop-s", type=float, default=1100.0,
                      "1310s; default leaves ~3.5min headroom).")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
+ap.add_argument("--trace-emit", action="store_true",
+                help="stderr trace of chunk emits, pause-watcher fires, "
+                     "and recycles with monotonic timestamps. Diagnostic.")
 args = ap.parse_args()
 CLAUSE_DELIM = re.compile(r'[,;:]')
 
@@ -164,6 +167,24 @@ _lock = threading.Lock()
 # the handler runs in the main thread and would deadlock if interrupted
 # while the main thread already holds _lock (this hung a run for 15 min).
 _STOP = threading.Event()
+
+
+# ---------------- diagnostic trace ----------------
+# --trace-emit logs every chunk emission, pause-watcher fire, and
+# recycle to stderr. Redirect stderr to a file (e.g. `2>/tmp/asr.log`)
+# when running the TUI, since stderr lines on the terminal will
+# corrupt the alt-screen rendering. Headless (--plain) is fine.
+_TRACE_LOCK = threading.Lock()
+def _trace(category, **fields):
+    if not args.trace_emit:
+        return
+    ts = time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+    parts = [f"{k}={v!r}" if isinstance(v, str) else f"{k}={v}"
+             for k, v in fields.items()]
+    line = f"[trace {ts}] {category} {' '.join(parts)}\n"
+    with _TRACE_LOCK:
+        sys.stderr.write(line)
+        sys.stderr.flush()
 
 
 def _new_stream_state():
@@ -381,6 +402,10 @@ def _emit_chunk_locked(spk, es_text, is_final,
     queues the job after releasing the lock."""
     es_text = es_text.strip()
     s = _state["streams"][spk]
+    _trace("emit", spk=spk, is_final=is_final,
+           raw=es_text[:60], raw_len=len(es_text),
+           open_ids_before=len(s["open_ids"]),
+           prelim_es=bool(prelim_es), prelim_en=bool(prelim_en))
     if es_text:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1
@@ -647,6 +672,11 @@ def pause_watcher():
                 # close so open chunks' ES/EN can backfill.
                 if (close_s is not None and gap >= close_s
                         and (rem or s["open_ids"])):
+                    _trace("pause_close", spk=lbl, gap=round(gap, 2),
+                           threshold=close_s, rem=rem[:60],
+                           rem_len=len(rem), min_sub=min_sub,
+                           open_ids=len(s["open_ids"]),
+                           tail_kept=bool(rem and len(rem) >= min_sub))
                     # capture preview before wipe
                     pe, pn = s["cur_es"], s["cur_en"]
                     s["cur_live"] = ""
@@ -660,6 +690,9 @@ def pause_watcher():
                 # open so MT still translates the whole utterance.
                 elif (visual_s is not None and gap >= visual_s
                       and rem and len(rem) >= min_sub):
+                    _trace("pause_visual", spk=lbl, gap=round(gap, 2),
+                           threshold=visual_s, rem=rem[:60],
+                           rem_len=len(rem), min_sub=min_sub)
                     pe, pn = s["cur_es"], s["cur_en"]
                     s["cur_live"] = ""
                     s["cur_es"] = s["cur_en"] = ""
@@ -702,6 +735,10 @@ def recycle_watcher():
                     continue                        # already armed
                 age_frames = s["vad_frames_since_recycle"]
                 if age_frames >= backstop_frames:
+                    _trace("recycle", spk=lbl, reason="backstop",
+                           age_s=round(age_frames * VAD_FRAME_S, 1),
+                           had_live=bool(s["cur_live"].strip()),
+                           open_ids=len(s["open_ids"]))
                     # Safety backstop: cap is close enough that mid-
                     # sentence cut beats a crash. Clear in-flight state
                     # so the new session doesn't try to backfill cids
@@ -730,6 +767,9 @@ def recycle_watcher():
                     continue                        # still active
                 if s["cur_live"].strip() or s["open_ids"]:
                     continue                        # wait for clean state
+                _trace("recycle", spk=lbl, reason="silence",
+                       age_s=round(age_frames * VAD_FRAME_S, 1),
+                       silence_for_s=round(now - s["last_speech_t"], 1))
                 s["reset"] = True
                 s["recycle_count"] += 1
 
@@ -839,9 +879,12 @@ async def _ws_session(label, q):
                         if d.strip():
                             s["delta_t"] = time.time()
                             _state["active"] = label
+                            _trace("delta", spk=label, d=d[:30],
+                                   cur_live_len=len(s["cur_live"]))
                     take_sentences(label)
                     clause_flush(label)
                 elif t == "transcription.done":
+                    _trace("transcription_done", spk=label)
                     take_sentences(label)
                     job = None
                     with _lock:

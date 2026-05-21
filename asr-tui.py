@@ -1323,11 +1323,11 @@ def render():
                 if ces_trans:
                     live.extend(wrap_pref(ces_trans, es_pref, es_pw, "0"))
                 else:
-                    live.append(es_pref + CSI + "2;33m" + "⋯" + CSI + "0m")
+                    live.append(es_pref + "⋯")
                 if cen_trans:
                     live.extend(wrap_pref(cen_trans, en_pref, en_pw, "0"))
                 else:
-                    live.append(en_pref + CSI + "2;36m" + "⋯" + CSI + "0m")
+                    live.append(en_pref + "⋯")
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)
@@ -1351,10 +1351,13 @@ def render():
                 # rows can't reproduce the prefix's embedded reset
                 # (so the first row ends up white and later rows
                 # end up `ansi`-colored — the symptom this fixes).
+                # `ansi` is kept in the signature in case we want
+                # per-channel placeholder color back; currently unused.
+                del ansi
                 if value is None:
-                    return CSI + "2;" + ansi + "m" + tag + "⋯" + CSI + "0m"
+                    return tag + "⋯"
                 if value == "":
-                    return CSI + "2;" + ansi + "m" + tag + "—" + CSI + "0m"
+                    return tag + "—"
                 wrapped = wrap(value, max(8, cols - tag_w))
                 return [(tag if i == 0 else " " * tag_w) + ln
                         for i, ln in enumerate(wrapped)]

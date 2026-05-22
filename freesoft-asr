@@ -13,10 +13,12 @@ refining inline translation, in a terminal UI.
             --channels=1 - | freesoft-asr --source -
   freesoft-asr --source - --plain                    # headless log
 
-  # dual-stream preset (the author's RTP phone-call setup —
-  # rtp_call_remote_source=Remote, rtp_call_me_source=Local):
-  freesoft-asr --dual
-  freesoft-asr --dual --plain
+  # named profile (a full config overlay). The built-in "dual" profile
+  # is the author's two-stream RTP phone-call setup
+  # (rtp_call_remote_source=Remote, rtp_call_me_source=Local):
+  freesoft-asr --profile dual
+  freesoft-asr --profile dual --plain
+  freesoft-asr --list-profiles            # list available profiles
 
   # emit a fully-commented default config you can edit:
   freesoft-asr --write-config
@@ -37,9 +39,13 @@ switching (a silent channel's sporadic deltas must not flip the panel).
 
 Configuration is a TOML file at $XDG_CONFIG_HOME/freesoft-asr/
 config.toml (default ~/.config/freesoft-asr/config.toml), overridable
-with --config PATH. Precedence: built-in defaults < config file < CLI
-flags. `--write-config` emits a commented default config that
-round-trips.
+with --config PATH. A [profiles.<name>] table is a FULL named overlay:
+it may set any top-level key AND define its own [[profiles.<name>.source]]
+streams. Select one with --profile NAME (or the default_profile config
+key). Precedence: built-in defaults < config file < selected profile
+overlay < CLI flags. A built-in "dual" profile reproduces the author's
+phone-call setup with no config. `--write-config` emits a commented
+default config that round-trips; `--list-profiles` lists profiles.
 
 Audio is read from stdin (--source -), the default sink monitor, or
 named PipeWire nodes via owned pw-record subprocesses, so the TUI
@@ -78,9 +84,10 @@ MASK_K = 2              # words of the live translation tail to hide (unstable)
 FROZEN_CAP = 300
 SAMPLE_RATE = 16000
 
-# --dual preset: the author's RTP phone-call sources. Expands to two
-# [[source]] streams (Remote cyan / Local green) each translating into
-# Spanish + English — i.e. the historical hardcoded behaviour.
+# Built-in "dual" profile sources: the author's RTP phone-call setup.
+# Two [[source]] streams (Remote cyan / Local green) each translating
+# into Spanish + English — i.e. the historical hardcoded behaviour that
+# the old --dual flag produced.
 DUAL_PRESET = [
     {"target": "rtp_call_remote_source", "label": "Remote",
      "accent": "1;36", "src_lang": None,
@@ -89,6 +96,13 @@ DUAL_PRESET = [
      "accent": "1;32", "src_lang": None,
      "tgt_langs": ["spa_Latn", "eng_Latn"]},          # green
 ]
+# Built-in profiles. A profile is a FULL config overlay: a dict that may
+# carry scalar overrides (host, beam, tgt_langs, …) and/or a "sources"
+# list. `--profile NAME` selects one. A config [profiles.NAME] table of
+# the same name fully REPLACES the built-in (simple replace, not merge).
+BUILTIN_PROFILES = {
+    "dual": {"sources": [dict(s) for s in DUAL_PRESET]},
+}
 # Accent palette auto-assigned to sources that don't set `accent`.
 ACCENT_PALETTE = ["1;36", "1;32", "1;33", "1;35", "1;34", "1;31"]
 # Default sink-monitor capture sentinel (D2): pw-record with
@@ -162,8 +176,16 @@ DEFAULTS = {
     "tgt_langs": [],             # global default targets (empty = none)
     "default_src_lang": "eng_Latn",   # fastText-unavailable fallback (D8)
     # Sources: list of {target,label,accent,src_lang,tgt_langs}. Empty
-    # here (and no --dual / --source) => the default-sink monitor (D2).
+    # here (and no --profile / --source) => the default-sink monitor (D2).
     "sources": [],
+    # Named profiles (full config overlays). Each value is a dict with
+    # optional scalar overlays + optional "sources" list. Built-in
+    # profiles (BUILTIN_PROFILES) are merged in at config-load time;
+    # a config profile of the same name replaces the built-in.
+    "profiles": {},
+    # Profile selected when no --profile is given on the CLI. None =>
+    # no profile (top-level config / monitor default).
+    "default_profile": None,
 }
 
 
@@ -180,15 +202,41 @@ def load_config(path: str) -> dict:
     (harmless) but a malformed file raises with a clear message."""
     cfg = dict(DEFAULTS)
     cfg["sources"] = [dict(s) for s in DEFAULTS["sources"]]
+    cfg["profiles"] = {}
     if path and os.path.exists(path):
         with open(path, "rb") as f:
             data = tomllib.load(f)
         # [[source]] arrays-of-tables land under the "source" key.
         srcs = data.pop("source", None)
+        # [profiles.<name>] tables land under the "profiles" key. Each
+        # may carry scalar overlays and an array-of-tables `source`
+        # (its own [[profiles.<name>.source]]). Normalize that nested
+        # `source` key into a flat "sources" list per profile.
+        prof_data = data.pop("profiles", None)
+        if prof_data is not None:
+            for name, pdef in prof_data.items():
+                pdict = dict(pdef)
+                psrcs = pdict.pop("source", None)
+                if psrcs is not None:
+                    pdict["sources"] = [dict(s) for s in psrcs]
+                cfg["profiles"][name] = pdict
         for k, v in data.items():
             cfg[k] = v
         if srcs is not None:
             cfg["sources"] = [dict(s) for s in srcs]
+    # Names that came from the config file (a config profile of the same
+    # name as a built-in REPLACES it, and should be reported as config
+    # in --list-profiles).
+    cfg["_config_profile_names"] = set(cfg["profiles"])
+    # Merge built-in profiles UNDER config profiles (config wins: a
+    # config profile of the same name fully replaces the built-in).
+    merged = {}
+    for name, pdef in BUILTIN_PROFILES.items():
+        merged[name] = dict(pdef)
+        if "sources" in pdef:
+            merged[name]["sources"] = [dict(s) for s in pdef["sources"]]
+    merged.update(cfg["profiles"])
+    cfg["profiles"] = merged
     return cfg
 
 
@@ -246,18 +294,47 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 #   src_lang  : per-stream source-language override (optional).
 #   tgt_langs : per-stream targets (optional; inherits global tgt_langs).
 #
-# The author's phone-call setup (same as --dual):
 # [[source]]
+# target    = "monitor"
+# tgt_langs = ["spa_Latn"]
+
+# ---- profiles (named full config overlays) ----
+# A [profiles.<name>] table is a FULL overlay selected with
+# `--profile <name>`. It may set ANY top-level key above (host, port,
+# model, beam, mask, src_lang, tgt_langs, pause timings, auto-recycle,
+# default_src_lang, …) AND define its own streams via
+# [[profiles.<name>.source]]. Resolution precedence (low -> high):
+#   built-in defaults < top-level config < selected profile < CLI flags.
+# Scalar keys present in the profile override the top-level value. If the
+# profile defines sources they REPLACE the top-level sources; if it
+# defines none, it inherits the top-level sources. CLI --source / other
+# CLI flags still win over the profile. List profiles with
+# --list-profiles. Set default_profile to auto-select one when no
+# --profile is passed (unset => no profile).
+#
+# default_profile = "dual"
+
+# The built-in "dual" profile (the author's two-stream phone-call setup,
+# what the old --dual flag produced). Defining it here REPLACES the
+# built-in of the same name. Shown as an editable example:
+# [[profiles.dual.source]]
 # target    = "rtp_call_remote_source"
 # label     = "Remote"
 # accent    = "1;36"
 # tgt_langs = ["spa_Latn", "eng_Latn"]
 #
-# [[source]]
+# [[profiles.dual.source]]
 # target    = "rtp_call_me_source"
 # label     = "Local"
 # accent    = "1;32"
 # tgt_langs = ["spa_Latn", "eng_Latn"]
+
+# A scalar-overlay example: a "tv" profile that translates the default
+# sink monitor into English with a wider beam. It sets scalars only, so
+# it inherits the top-level [[source]] streams (here, the monitor):
+# [profiles.tv]
+# beam      = 4
+# tgt_langs = ["eng_Latn"]
 '''
 
 
@@ -296,8 +373,9 @@ ap.add_argument("--source", action="append", dest="sources", default=None,
                 metavar="TARGET[=LABEL]",
                 help="add an audio source. TARGET is '-' (stdin), "
                      "'monitor' (default sink monitor), or a PipeWire "
-                     "node name. Repeat for multiple streams. With no "
-                     "--source/--dual the default sink monitor is used.")
+                     "node name. Repeat for multiple streams. Overrides "
+                     "the selected profile's / config's sources. With no "
+                     "--source the default sink monitor is used.")
 ap.add_argument("--src-lang", default=None,
                 help="global source-language override (FLORES-200 code, "
                      "e.g. spa_Latn). Disables fastText auto-detection. "
@@ -316,13 +394,17 @@ ap.add_argument("--beam", type=int, default=None,
                      "(fastest); 2+ explores more hypotheses for "
                      "marginally better translations at proportional "
                      "cost (beam 2 ≈ 15%% slower on this model).")
-ap.add_argument("--dual", action="store_true",
-                help="dual-stream preset: the script owns both phone-call "
-                     "taps (rtp_call_remote_source=Remote, "
-                     "rtp_call_me_source=Local) via two pw-record "
-                     "subprocesses + two Voxtral WS sessions, each "
-                     "translating into Spanish + English (the historical "
-                     "default behaviour).")
+ap.add_argument("--profile", default=None, metavar="NAME",
+                help="select a named profile (a full config overlay). The "
+                     "built-in 'dual' profile reproduces the author's "
+                     "two-stream phone-call setup (rtp_call_remote_source="
+                     "Remote, rtp_call_me_source=Local, each translating "
+                     "into Spanish + English) with no config. A profile "
+                     "overlays its scalar keys + sources between the "
+                     "top-level config and the CLI flags. Unset uses the "
+                     "default_profile config key, if any.")
+ap.add_argument("--list-profiles", action="store_true",
+                help="list available profiles (built-in + config) and exit.")
 ap.add_argument("--mask", type=int, default=None,
                 help="words of the in-progress translation tail to hide "
                      "(model tokens at the very end are unstable)")
@@ -373,8 +455,46 @@ if args.write_config:
     print(f"wrote default config to {out_path}", file=sys.stderr)
     sys.exit(0)
 
-# Build the effective config: defaults < file < CLI flags.
+# Build the effective config: defaults < file < (profile) < CLI flags.
 CONFIG = load_config(args.config or _xdg_config_path())
+
+# --list-profiles: print available profiles (built-in + config) and exit.
+if args.list_profiles:
+    names = sorted(CONFIG["profiles"])
+    if not names:
+        print("no profiles defined", file=sys.stderr)
+    else:
+        print("Available profiles:", file=sys.stderr)
+        cfg_names = CONFIG.get("_config_profile_names", set())
+        for name in names:
+            # A config profile (even one with a built-in's name) is
+            # reported as config since it replaces the built-in.
+            tag = "config" if name in cfg_names else "built-in"
+            print(f"  {name}  ({tag})", file=sys.stderr)
+    sys.exit(0)
+
+# Profile selection: CLI --profile, else config default_profile, else
+# none. The selected profile is a FULL overlay applied between the
+# top-level config and the CLI flags (config < profile < CLI).
+SELECTED_PROFILE = args.profile or CONFIG.get("default_profile")
+PROFILE_SOURCES = None   # set below if the profile defines its own
+if SELECTED_PROFILE is not None:
+    if SELECTED_PROFILE not in CONFIG["profiles"]:
+        avail = ", ".join(sorted(CONFIG["profiles"])) or "(none)"
+        print(f"{APP_NAME}: unknown profile {SELECTED_PROFILE!r}; "
+              f"available profiles: {avail}", file=sys.stderr)
+        sys.exit(2)
+    _prof = CONFIG["profiles"][SELECTED_PROFILE]
+    # Overlay scalar keys onto CONFIG (every key except "sources").
+    for _k, _v in _prof.items():
+        if _k == "sources":
+            continue
+        CONFIG[_k] = _v
+    # Sources: a profile that defines sources REPLACES the top-level
+    # sources; one that defines none inherits them (handled by leaving
+    # PROFILE_SOURCES = None).
+    if _prof.get("sources"):
+        PROFILE_SOURCES = [dict(s) for s in _prof["sources"]]
 
 
 def _apply(flag_val, key):
@@ -417,18 +537,17 @@ CLAUSE_DELIM = re.compile(r'[,;:]')
 
 
 def _build_sources():
-    """Resolve the active source list from --dual / --source / config /
-    the default-monitor fallback, applying per-stream language
-    inheritance and auto-assigning accent colours + a SOLO label when
-    there's a single unlabelled source.
+    """Resolve the active source list from --source / the selected
+    profile / config / the default-monitor fallback, applying per-stream
+    language inheritance and auto-assigning accent colours + a SOLO label
+    when there's a single unlabelled source.
 
     Returns a list of dicts with keys: target, label, accent, src_lang,
     tgt_langs. The list order is the render/iteration order."""
-    # 1. pick the raw source list (precedence: --dual > --source > config
-    #    [[source]] > default-monitor fallback).
-    if args.dual:
-        raw = [dict(s) for s in DUAL_PRESET]
-    elif args.sources:
+    # 1. pick the raw source list (precedence: --source (CLI) > selected
+    #    profile's sources > top-level config [[source]] > default-monitor
+    #    fallback).
+    if args.sources:
         raw = []
         for spec in args.sources:
             if "=" in spec:
@@ -436,6 +555,8 @@ def _build_sources():
             else:
                 tgt, lbl = spec, None
             raw.append({"target": tgt, "label": lbl})
+    elif PROFILE_SOURCES:
+        raw = [dict(s) for s in PROFILE_SOURCES]
     elif CONFIG["sources"]:
         raw = [dict(s) for s in CONFIG["sources"]]
     else:
@@ -1266,8 +1387,8 @@ def recycle_watcher():
 
 async def net_main(source_name, label, q, loop):
     """Persistent driver for one stream's audio + Voxtral /v1/realtime
-    sessions. The audio reader (pw-record subprocess in --dual, stdin
-    in single-stream) is started ONCE here and persists across WS
+    sessions. The audio reader (pw-record subprocess for a named/monitor
+    source, stdin for "-") is started ONCE here and persists across WS
     reconnects. The WS itself is wrapped in a session loop: on Ctrl-L
     (per-stream `reset` flag) we close+reopen the WS so vLLM frees the
     KV cache for this stream — the workaround for the --max-model-len

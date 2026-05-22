@@ -89,9 +89,13 @@ ES/EN.
   translation when the sentence completes. No more `elocuencia` →
   `I'm not a good speaker` from context-free fragments.
 - **Multi-stream concurrent transcription** — independent vLLM sessions
-  per source, separately auto-recycled. `--dual` is a built-in preset
-  expanding to the author's two RTP phone-call sources (Remote + Local,
-  each Spanish→{Spanish,English}).
+  per source, separately auto-recycled. The built-in **`dual`** profile
+  (`--profile dual`) expands to the author's two RTP phone-call sources
+  (Remote + Local, each Spanish→{Spanish,English}).
+- **Named profiles** — `[profiles.<name>]` config tables are full
+  config overlays (scalars + their own `[[profiles.<name>.source]]`
+  streams), selected with `--profile NAME`. `--list-profiles` lists
+  them; a `default_profile` key auto-selects one.
 - **Scrollback** — mouse wheel + ↑/↓/PgUp/PgDn/Home/End on the
   history pane. Live region keeps updating regardless.
 - **Ctrl-L** clears the history and recycles the WS sessions (frees
@@ -113,7 +117,8 @@ ES/EN.
 `freesoft-asr` reads a TOML file at
 `$XDG_CONFIG_HOME/freesoft-asr/config.toml` (default
 `~/.config/freesoft-asr/config.toml`). Precedence is **built-in defaults
-< config file < CLI flags**. Generate a fully-commented starter file:
+< config file < selected profile overlay < CLI flags**. Generate a
+fully-commented starter file:
 
 ```bash
 freesoft-asr --write-config          # writes to the standard path
@@ -121,8 +126,8 @@ freesoft-asr --write-config --config ./my.toml
 ```
 
 Every key mirrors a CLI flag (snake_case). Example config expressing the
-author's phone-call setup (the same as `--dual`) plus a third target on
-one stream:
+author's phone-call setup (the same as the built-in `dual` profile) plus
+a third target on one stream:
 
 ```toml
 host  = "127.0.0.1"
@@ -150,6 +155,56 @@ tgt_langs = ["spa_Latn", "eng_Latn", "fra_Latn"]
 
 A `[[source]]` inherits the global `src_lang` / `tgt_langs` unless it
 overrides them. An empty `tgt_langs` makes a stream transcription-only.
+
+### Profiles
+
+A `[profiles.<name>]` table is a **full named config overlay**. It may
+set any top-level key (host, port, model, beam, mask, languages, pause
+timings, auto-recycle, …) **and** define its own streams via
+`[[profiles.<name>.source]]`. Select one with `--profile NAME`:
+
+```toml
+default_profile = "dual"            # auto-select when no --profile given
+
+# Replaces the built-in "dual" profile (config wins over the built-in):
+[[profiles.dual.source]]
+target    = "rtp_call_remote_source"
+label     = "Remote"
+accent    = "1;36"
+tgt_langs = ["spa_Latn", "eng_Latn"]
+
+[[profiles.dual.source]]
+target    = "rtp_call_me_source"
+label     = "Local"
+accent    = "1;32"
+tgt_langs = ["spa_Latn", "eng_Latn"]
+
+# A scalar-only profile inherits the top-level [[source]] streams:
+[profiles.tv]
+beam      = 4
+tgt_langs = ["eng_Latn"]
+```
+
+Resolution rules:
+
+- **Scalars**: a key present in the selected profile overrides the
+  top-level value (which overrides the built-in default).
+- **Sources**: if the profile defines sources they **replace** the
+  top-level sources; if it defines none, the top-level sources are
+  inherited (so a scalar-only profile still has streams).
+- **CLI wins**: `--source`, `--beam`, etc. on the command line override
+  the selected profile. `--profile` overrides `default_profile`.
+
+A built-in **`dual`** profile ships in the code, so `--profile dual`
+reproduces the author's two-stream phone-call setup with no config at
+all. A config `[profiles.dual]` of the same name fully replaces it.
+List the available profiles (built-in + config) with:
+
+```bash
+freesoft-asr --list-profiles
+```
+
+An unknown `--profile NAME` errors and lists the available names.
 
 ## Running
 
@@ -194,7 +249,7 @@ Add translation with `--tgt-lang` (repeatable):
 your_audio_source | freesoft-asr --source - --tgt-lang eng_Latn --tgt-lang fra_Latn
 ```
 
-### Multi-stream and the `--dual` preset
+### Multi-stream and the built-in `dual` profile
 
 Repeat `--source TARGET[=LABEL]` for several streams:
 
@@ -204,22 +259,23 @@ freesoft-asr --source 'rtp_call_remote_source=Remote' \
              --tgt-lang spa_Latn --tgt-lang eng_Latn
 ```
 
-`--dual` is a built-in preset for exactly the author's phone-call setup —
+The built-in **`dual`** profile is exactly the author's phone-call setup —
 the PipeWire sources **`rtp_call_remote_source`** (Remote, cyan) and
 **`rtp_call_me_source`** (Local, green), each translating into Spanish +
 English:
 
 ```bash
-freesoft-asr --dual
+freesoft-asr --profile dual
 ```
 
 Either configure PipeWire to expose your sources under those names (see
-below), or use `--source` / a `[[source]]` config with your own names.
+below), or use `--source` / a `[[source]]` config / your own
+`[profiles.<name>]` with your own names.
 
 ### Headless / `--plain`
 
 ```bash
-freesoft-asr [--dual] --plain
+freesoft-asr [--profile dual] --plain
 ```
 
 Skips the alt-screen TUI and prints `[spk] Live` + one row per target
@@ -260,8 +316,8 @@ Highlights:
   warning if missing.
 - A **CUDA GPU** with ≥ 16 GB VRAM (Voxtral weights + KV cache at
   `--max-model-len 16384`).
-- **PipeWire** (Linux) for the `monitor` / named-source / `--dual` audio
-  capture; the `--source -` stdin path works with any audio source
+- **PipeWire** (Linux) for the `monitor` / named-source / `dual`-profile
+  audio capture; the `--source -` stdin path works with any audio source
   (PipeWire, ALSA, sox, ffmpeg, etc.).
 
 End-to-end setup — venvs, model conversion, the optional vLLM systemd
@@ -278,7 +334,7 @@ UDP RTP stream to the receiver running `freesoft-asr`. This makes the
 transcribing machine independent of where the audio source actually
 lives (and lets you run the GPU on a separate, more powerful host).
 
-### On the receiver (the machine running `freesoft-asr --dual`)
+### On the receiver (the machine running `freesoft-asr --profile dual`)
 
 Drop this into
 `~/.config/pipewire/pipewire.conf.d/91-rtp-call-stream-source.conf`:
@@ -323,8 +379,8 @@ context.modules = [
 
 Then restart PipeWire (`systemctl --user restart pipewire wireplumber
 pipewire-pulse`) or log out and back in. Verify with `pw-cli ls Node |
-grep rtp_call_` — both sources should appear. `freesoft-asr --dual`
-will then find them by name and start streaming.
+grep rtp_call_` — both sources should appear. `freesoft-asr --profile
+dual` will then find them by name and start streaming.
 
 `pw-record`'s own resampler converts 48 kHz stereo down to 16 kHz
 mono on the consumer side, so the RTP wire format stays at the
@@ -452,7 +508,7 @@ for the final TUI. Each is self-contained — reads raw 16-bit-LE mono
 | `stream-cacheaware.py` | NeMo fastconformer | true cache-aware English streaming |
 
 `asr-call-transcribe` is a faster-whisper dual-stream transcriber
-that predates `freesoft-asr --dual`. Same `rtp_call_remote_source` /
+that predates `freesoft-asr --profile dual`. Same `rtp_call_remote_source` /
 `rtp_call_me_source` audio-input architecture but with whisper
 instead of Voxtral + NLLB. Kept as the reference design for the
 two-source plumbing.

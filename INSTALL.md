@@ -11,9 +11,9 @@ the repo (too large to track).
 
 ## Prerequisites
 
-- **Linux + PipeWire.** The `--dual` audio path uses `pw-record`;
-  single-stream mode just needs anything that pipes 16-kHz mono
-  S16LE PCM to stdin.
+- **Linux + PipeWire.** The named-source / `dual`-profile audio path
+  uses `pw-record`; single-stream mode just needs anything that pipes
+  16-kHz mono S16LE PCM to stdin.
 - **CUDA-capable GPU** with ≥ 16 GB VRAM (Voxtral weights + KV cache
   at `--max-model-len 16384`). Tested on an RTX 3090.
 - **[`uv`](https://docs.astral.sh/uv/)** (default install location
@@ -143,7 +143,8 @@ hand in a terminal — `cat ~/asr/systemd/voxtral.service` has it.
 
 ```bash
 ~/asr/freesoft-asr                  # transcribe the default sink monitor
-~/asr/freesoft-asr --dual           # if PipeWire RTP sources are set up
+~/asr/freesoft-asr --profile dual   # if PipeWire RTP sources are set up
+~/asr/freesoft-asr --list-profiles  # list available profiles
 # or single-stream from stdin:
 pw-record --target <your-source> --format=s16 --rate=16000 \
           --channels=1 - | ~/asr/freesoft-asr --source -
@@ -151,7 +152,7 @@ pw-record --target <your-source> --format=s16 --rate=16000 \
 
 `freesoft-asr --help` documents the CLI knobs with current defaults, and
 `freesoft-asr --write-config` emits a commented starter config. The
-PipeWire setup for the `--dual` RTP sources is in
+PipeWire setup for the `dual`-profile RTP sources is in
 [README.md](README.md#pipewire-setup-for-the-dual-stream-rtp-path).
 
 ## Recreating the alternative venvs and models

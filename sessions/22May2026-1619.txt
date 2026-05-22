@@ -1,0 +1,952 @@
+❯ Task: asr-flexible-config (task 377, run 606)
+  Description: Make asr-tui.py configurable (config file, generic sources, default-monitor input,
+  endpoint/model flags, --no-translate) — Phase 1 of the flexibility plan
+
+  Instructions:
+  Task: asr-flexible-config — make the ASR TUI configurable + rename to freesoft-asr
+
+  # Goal
+
+  Today the ASR TUI (`asr-tui.py`; repo github.com/BrentBaccala/asr,
+  working clone `~/asr` on samsung; runs on pony) is wired to one person's
+  exact setup: Spanish→{Spanish,English} translation, a hardcoded
+  phone-call RTP PipeWire pipeline, and a local vLLM endpoint baked in as
+  module constants. Make it a general, config-file-driven streaming ASR +
+  inline-translation tool anyone can use — AND rename the project to
+  `freesoft-asr` — without breaking the author's current workflow
+  (`--dual` + the demo).
+
+  Edit + commit on samsung in `~/asr`. The TUI can only be *fully*
+  exercised on pony (GPU vLLM Voxtral backend + PipeWire); do headless
+  validation on samsung and leave live TUI validation to the user (see
+  Validation). Do NOT push — the user pushes.
+
+  Reference: `~/project/docs/phone-call-asr-pipeline.md` (architecture)
+  and the code facts below (verified 2026-05-22, line numbers will drift —
+  re-verify before editing).
+
+  ## Code facts (asr-tui.py current line numbers)
+
+  - Endpoint/model constants: `HOST, PORT = "127.0.0.1", 8000` (:74),
+    `MODEL = "mistralai/Voxtral-Mini-4B-Realtime-2602"` (:75),
+    `NLLB_DIR = ~/asr/models/nllb-600m-ct2` (:76).
+  - Source language hardcoded: `_tok.src_lang = "spa_Latn"` (:264).
+  - Translation fixed to two targets: `translate_dual()` (:337) emits
+    spa_Latn + eng_Latn in one batched `translate_batch` (:345-352);
+    `translate()` (:324) default tgt eng_Latn.
+  - Audio input: `stdin_reader(label,q,loop)` (:523) reads sys.stdin;
+    `pw_record_reader` (:534) spawns `pw-record --target NAME --format=s16
+    --rate=16000` per source for --dual; `net_main(source_name,label,q,
+    loop)` (:782) binds a source to one Voxtral WS session.
+  - Sources hardcoded: `DUAL_SOURCES` (:85) = rtp_call_remote_source=Remote
+    (cyan) / rtp_call_me_source=Local (green); `SOLO="(solo)"` (:89);
+    `STREAMS` (:159).
+  - Per-stream state `cur_live/cur_es/cur_en` (:197-212); frozen rows are
+    5-tuples `(spk, raw, es, en, chunk_id)` (_emit ~:415,
+    _backfill_chunk_translations_locked :432); history render builds ES
+    (yellow)/EN (cyan) rows (~:1365+).
+  - Header status line prints the app name "asr-tui" (seen in the demo
+    frame: "asr-tui │ streaming │ …") — find that literal/constant; it
+    becomes "freesoft-asr".
+  - pony venv (shebang `/home/cosine/asr/mt-env/bin/python`) = Python 3.12
+    → stdlib `tomllib` (no new dep for TOML).
+
+  ## Decisions (confirmed with user)
+
+  D1. Config file = TOML at `$XDG_CONFIG_HOME/freesoft-asr/config.toml`
+      (default `~/.config/freesoft-asr/config.toml`), read with stdlib
+      `tomllib`. Precedence: built-in defaults < config file < CLI flags.
+      `--config PATH` overrides the location; `--write-config` emits a
+      fully commented default config to the standard path. TOML keys are
+      snake_case mirrors of flag names.
+  D2. New default input (no args) = a single stream capturing the DEFAULT
+      SINK's monitor ("transcribe whatever's playing"), via `pw-record`
+      with `stream.capture.sink=true` and NO explicit target. (PW 1.0.5:
+      `target.object="<sink>.monitor"` does not resolve — use
+      `stream.capture.sink=true`; memory feedback_pipewire_target_object_
+      monitor.) stdin stays available as `--source -`.
+  D3. **Default = transcription only.** With no config (or empty
+      tgt_langs), DO NOT load NLLB/transformers/ctranslate2 at all — render
+      only the Live row. Translation is opt-in via configured target
+      languages. (`--no-translate` may exist as an explicit override, but
+      the bare default already means no translation.)
+  D4. `--dual` kept as a PRESET expanding to the two RTP sources, so the
+      README/demo command and the author's runs are unchanged.
+  D5. **Per-stream languages.** Each source carries its own `tgt_langs`
+      (LIST of NLLB codes to translate into) and an OPTIONAL `src_lang`.
+      A stream with empty tgt_langs is transcription-only. Global
+      `tgt_langs`/`src_lang` defaults exist and a source inherits them
+      unless it overrides. The author's shipped config expresses their
+      setup as: Remote {tgt [spa_Latn,eng_Latn]}, Local likewise — note
+      NO src_lang needed (see D8).
+  D8. **Source language is auto-detected, not required.** Voxtral's
+      realtime API exposes NO language field (verified empirically
+      2026-05-22: session.created/transcription.delta/transcription.done
+      carry only type/delta/text/usage). So when a stream's `src_lang` is
+      unset, detect it with **fastText lid.176** run ONCE per completed
+      sentence (at the transcription.done / sentence boundary, where NLLB
+      translation already fires — not per-delta), then set the NLLB
+      tokenizer's src_lang accordingly for that sentence. This handles
+      code-switched calls (each sentence detected independently). fastText
+      is the "fourth model": ~917 KB lid.176.ftz, CPU, sub-ms/sentence —
+      negligible latency, zero GPU. `src_lang`, when set on a stream/global,
+      is an OVERRIDE that pins detection off. Natural rule: skip
+      translating into a target equal to the detected/declared source.
+      Dependency: fastText (use a 3.12-working package — `fasttext-wheel`
+      or the `fasttext-langdetect` wrapper that bundles the model
+      download); ship/download lid.176.ftz. Degrade gracefully: if fastText
+      or the model is missing AND no src_lang is set, fall back to a
+      configurable default src_lang with a stderr warning (mirror how
+      silero-vad degrades).
+  D6. Rename project to **freesoft-asr** (see Rename section). GitHub repo
+      rename is OUT of scope — DECIDED: keep the repo named `asr` (`~/asr`,
+      `origin`, the URL all unchanged). Only the script/config/branding
+      are renamed.
+  D7. Packaging/setup script and no-GPU docs are OUT of scope for this task.
+
+  ## Work
+
+  ### 1. Config infrastructure
+  - `load_config()`: built-in defaults → overlay TOML
+    (`~/.config/freesoft-asr/config.toml` or `--config PATH`) → CLI flags
+    override. One default per setting in one place.
+  - Add `--config PATH` and `--write-config` (emit a commented default
+    TOML that round-trips).
+
+  ### 2. Endpoint/model as settings
+  - Replace the :74-76 constants with config/flags: `--host --port
+    --model --nllb-dir`.
+
+  ### 3. Generic, per-stream sources
+  - A source = {target, label, accent, src_lang, tgt_langs[]}.
+    target ∈ `-` (stdin), `monitor` (default-sink monitor — the new
+    default), or a PipeWire node name.
+  - CLI: repeatable `--source TARGET[=LABEL]` (one → single stream, many →
+    multi-stream); auto-assign accent colors from a palette when unset.
+    Per-stream languages are most naturally set in the config `[[source]]`
+    tables, but provide a reasonable CLI escape if cheap.
+  - Config: `[[source]]` array-of-tables: target/label/accent/src_lang/
+    tgt_langs.
+  - Default sink monitor capture in `pw_record_reader`: `pw-record -P
+    stream.capture.sink=true --format=s16 --rate=16000` (no --target).
+    Verify the exact invocation on pony.
+  - Generalize SOLO/STREAMS so a single unlabeled source works (no
+    "[label]" prefix when there's exactly one source with no explicit
+    label).
+  - Keep `--dual` as the D4 preset.
+
+  ### 4. Multilingual translation (N targets, per stream)
+  - `translate_dual` → `translate_multi(text, targets)`: one batched
+    `translate_batch` over a stream's target list (extend the existing
+    2-batch to N). The NLLB tokenizer's src_lang is set from the stream's
+    `src_lang` if pinned, else from fastText detection on that sentence
+    (D8). Skip any target equal to the source.
+  - Per-stream state `cur_es/cur_en` → a dict keyed by target lang code;
+    frozen row es/en fields → a dict/list of per-target text; live-preview
+    re-translation and `_split_on_markers` applied per target.
+  - History render loop: emit the Live row, then one translation row per
+    configured target for that stream. Row label from lang code via a
+    small map (eng_Latn→EN, spa_Latn→ES, fra_Latn→FR, …) with a 2-3 char
+    fallback; cycle row colors.
+  - Skip NLLB load entirely when NO stream has any target language (D3).
+  - REGRESSION GATE: with a config expressing today's spa→{es,en}
+    behavior, output must be functionally identical to current behavior;
+    THEN demonstrate a stream with a third target language.
+
+  ### 5. Rename to freesoft-asr
+  - Rename the script `asr-tui.py` → `freesoft-asr` (executable, no .py;
+    keep the shebang). `git mv` to preserve history.
+  - App-name string in the header status line → "freesoft-asr".
+  - Config dir `~/.config/freesoft-asr/` (already in D1).
+  - Update ALL references: README.md, INSTALL.md, the demo command text,
+    in-file docstrings/comments, and any `~/project/docs/phone-call-asr-
+    pipeline.md` mentions of `asr-tui.py` (note that doc lives in
+    ~/project, a different repo — commit separately there).
+  - The other scripts (stream-*.py, asr-call-transcribe) keep their names.
+  - NOTE for the user (put in the report, do not act): the committed
+    demo.gif shows "asr-tui" in the header bar, so it becomes stale after
+    the rename — the user may want to re-record it (asciinema+agg are
+    installed on pony).
+
+  ## Validation (headless on samsung; no GPU)
+  - `freesoft-asr --help` shows the new flags; file parses.
+  - Config precedence unit check: defaults < temp config.toml < CLI flag
+    (assert resolved value at each layer). `--write-config` round-trips.
+  - Transcription-only default: with no config, the NLLB/ctranslate2/
+    transformers import + load path is NOT executed (assert via guarded
+    import or by checking the translator is never constructed).
+  - Multilingual unit check (no GPU): call `translate_multi` directly on a
+    fixed string with targets [eng_Latn, fra_Latn] and assert two
+    non-empty results; and the es/en regression case matches today.
+  - Language-detection unit check (no GPU): fastText lid.176 detects a
+    Spanish sentence as spa and an English one as eng; with `src_lang`
+    pinned, detection is bypassed; with fastText absent, falls back to the
+    configured default src_lang without crashing.
+  - Back-compat: resolved `--dual` settings still map to
+    rtp_call_remote_source=Remote / rtp_call_me_source=Local.
+
+  Live validation is MANUAL by the user on pony — do NOT attempt headless
+  TUI runs. Leave exact steps in the report:
+  - `freesoft-asr` (no args) transcribes the default monitor while audio plays.
+  - `freesoft-asr --dual` behaves exactly as before.
+  - A config with per-stream tgt_langs shows the right translation rows.
+
+  Commit on samsung with descriptive messages (the rename as its own
+  `git mv` commit ideally). Do NOT push. Use the `end` skill at close;
+  report → `~/project/reports/asr-flexible-config.md` capturing: the
+  config schema (with a full example config.toml), the new flags, the
+  default-input + transcription-only-default changes, the per-stream
+  language model, the rename, the stale-demo.gif note, and the exact
+  manual pony-validation steps for the user.
+
+
+  Closing ritual: before emitting the TASK_RESULT line, invoke the
+  `end` skill if one is defined. (If no such skill exists, skip this.)
+
+  IMPORTANT: As the very last line of your response, write exactly one of:
+    TASK_RESULT: SUCCESS
+    TASK_RESULT: FAILURE
+  When the task has a countable outcome (tests passed, builds completed,
+  checks run, etc.), append an N/M value:
+    TASK_RESULT: SUCCESS 184/184
+    TASK_RESULT: FAILURE 10/11
+  This signals whether the task's objective was achieved (e.g., tests passed,
+  build succeeded), not just whether you completed your analysis.
+
+  Do NOT run Bash commands in the background (no run_in_background on Bash).
+  Run all commands synchronously so output is captured in your response.
+
+  If a message wrapped in <task-inbox>...</task-inbox> tags appears in
+  your context during the run, it is a live instruction sent by the user
+  while this task is in flight (delivered via a hook, not present in the
+  original prompt). Treat its contents as authoritative user direction
+  and incorporate it into your work.
+
+● I'll start by exploring the current state of the asr repo and the key file.
+
+● Let me read the main file. It's large (70KB), so I'll read it in full to understand the structure.
+
+● Let me read the rest of the file.
+
+● Now I have a complete picture of the file. This is a substantial refactor. Let me check the
+  README, INSTALL, and the docs file before starting.
+
+● Now let me check the docs file in ~/project and check Python version / fastText availability on
+  samsung.
+
+● Python 3.12 with tomllib available on samsung. fasttext not installed — that's fine for headless
+  validation; I'll write the code to degrade gracefully and design the validation to mock or skip
+  the GPU/fasttext-dependent parts. Let me check what's in the docs file regarding asr-tui.py
+  mentions.
+
+● This is a large refactor. Let me check whether fasttext-langdetect can be installed quickly for
+  the validation, but more importantly, design the code now. Let me think through the architecture
+  carefully.
+
+  The core refactor changes the entire data model from fixed `cur_es`/`cur_en` (2 hardcoded targets)
+  to per-stream `tgt_langs` lists with per-target dicts, plus per-stream `src_lang` with fastText
+  auto-detection. This touches: state structure, translation functions, emit/backfill, rendering,
+  transcript formatting, and config/CLI.
+
+  Let me start building. First, the config infrastructure and a clean rewrite. Given the scale, I'll
+  rewrite the file methodically with edits. Let me begin with the header/imports/config section.
+
+● Now the language code -> display label map, config defaults, config loading, and the argparse
+  setup. Let me replace the NOTICE sentinel block and argparse section.
+
+● Now let me look at the NOTICE sentinel definition that's between MONITOR/SOLO and the argparse — I
+  need to verify the current state around line 95-110.
+
+● Now I'll replace the entire argparse + STREAMS/ACCENT section with: a defaults dict,
+  language-label map, config loading, the new argparse (adding new flags), config merge, and stream
+  construction. This is the heart of the config infrastructure.
+
+● Now the NLLB and fastText loading section. The NLLB load must be guarded by `ANY_TGT_LANGS` (D3).
+  Let me replace the NLLB block and add fastText.
+
+● Now I removed the top-level silero import (it was in the imports block originally). Let me check —
+  the original had the silero import at lines 67-72 in the imports. I replaced the imports block
+  earlier and removed it. Now I re-added it before NLLB. Let me verify there's no leftover, and
+  update the VAD section which references `args.auto_recycle_silence_ms`, `args.mask`, etc.
+
+● Now I need to replace the `args.*` runtime references (other than the config-build ones which
+  legitimately read CLI flags) with the resolved constants. Let me look at the trace function and
+  VAD section.
+
+● `args.trace_emit` and `args.plain`, `args.dual` (line 1402) are pure CLI flags with no config
+  mirror — those stay as `args.*`. The rest (mask, line_flush, min_clause, pause_ms, etc.) must use
+  resolved constants. Let me view the state structure first and update `_new_stream_state` for
+  per-target dicts. Let me read the stream-state section.
+
+● Now the stream-state and `_state` come before this point (originally at line ~195-258), but I
+  rewrote/moved the NLLB block. Let me check where `_new_stream_state` and `_state` and `st_get`
+  currently are — they were before the NLLB block originally.
+
+● This is the major model change. The cleanest approach that preserves correctness while
+  generalizing: replace the two scalar fields `cur_es`/`cur_en` with a dict `cur_tr` keyed by lang
+  code, and the frozen-row es/en pair with a `tr` dict (lang -> text).
+
+  That's a deep change touching ~30 sites. Let me do it carefully. First, the stream state.
+
+● The frozen-row tuple is `(spk, raw, es, en, chunk_id)`. I'll change it to `(spk, raw, tr_dict,
+  chunk_id)` where `tr_dict` maps lang_code -> text (or None for pending). The live state
+  `cur_es`/`cur_en` become `cur_tr` (dict lang -> masked text). Let me rewrite the stream state and
+  `_state`/`st_get`.
+
+● Now the VAD section uses `args.auto_recycle_silence_ms`. Let me fix that and the translate
+  functions.
+
+● Now the translate functions. Let me view them.
+
+● Now `mask_tail`, `_emit_chunk_locked`, `_backfill_chunk_translations_locked`, and `mt_worker`. Let
+  me view them.
+
+● Now I'll rewrite the frozen-tuple-related functions. The tuple becomes `(spk, raw, tr_dict,
+  chunk_id)`. The emit takes a `prelim` dict instead of prelim_es/prelim_en.
+
+● Now `mt_worker`. It needs to: for the sentence job, determine src_lang (pinned or detected from
+  the joined raw sentence text), translate into the stream's targets, split each per-target
+  translation on markers, build per-chunk tr-dicts, backfill. For the live preview, translate
+  cur_live into the stream's targets and store into cur_tr.
+
+● The `sent_raw` job for src-lang detection: I need the raw sentence text without markers. I'll
+  strip markers for detection. Also `mt_worker` should only run translation when the stream has
+  targets — but since it only gets jobs/cur_live for translating streams (a non-translating stream
+  still accumulates cur_live but we should skip translating it). Let me rewrite mt_worker.
+
+● Now the callers that capture `cur_es/cur_en` as prelim and wipe them: `take_sentences`,
+  `clause_flush`, `pause_watcher`, `_ws_session` (two places). They use `prelim_es=pe,
+  prelim_en=pn`. I'll change them to capture `cur_tr` dict and pass `prelim=`. Let me view and
+  update each.
+
+● Now pause_watcher and the args refs there.
+
+● Now recycle_watcher args refs and the `cur_es = cur_en = ""` in the backstop. Let me view and fix.
+
+● Now the net layer: `net_main`, `pw_reader` (needs to handle MONITOR target), `_ws_session` (uses
+  HOST/PORT/MODEL — now constants, good — and the two cur_es/cur_en captures), `net_thread` (uses
+  args.dual + DUAL_SOURCES). Let me look at pw_reader and the source dispatch.
+
+● Now `net_main`/`net_thread` and the `_ws_session` cur_es/cur_en captures. Let me view net_main and
+  net_thread.
+
+● `net_main` dispatches on `source_name is None` for stdin. Now sources have a `target` field where
+  `-` means stdin. I'll pass target through and let net_main map `-` to stdin. Let me update
+  net_thread to build per-source queues and pass the target.
+
+● Let me find both `cur_es/cur_en` capture blocks in `_ws_session` (the transcription.done handler
+  and the eof tail).
+
+● Now `_clear_history` (cur_es/cur_en), `_fmt_transcript`, `_write_transcript`, and the render
+  function. Let me view `_clear_history` and `_fmt_transcript`.
+
+● Now `_fmt_transcript`. The frozen rows are now `(spk, raw, tr_dict, cid)` and live_snap is
+  `(label, cur_live, cur_tr_dict)`. I'll rewrite it to iterate per-target.
+
+● Now `_write_transcript` builds live_snap with cur_es/cur_en and appends a NOTICE 5-tuple. Let me
+  view it.
+
+● The NOTICE row tuple must become a 4-tuple. The tr field for NOTICE is `{}`.
+
+● Now the render function — the heart of the display. It iterates `snap` (label, cur_live, cur_es,
+  cur_en) and frozen rows `(spk, raw, es, en, cid)`. Both need per-target generalization. Let me
+  view the render snap building and the live/hist blocks.
+
+● Now I'll rewrite the snap building, header app-name, dual definition, the live block, and the hist
+  block to be per-target. First the snap and header:
+
+● Now the live block. I'll rewrite to build the Live row plus one row per target lang.
+
+● Now the history block.
+
+● Now `mask_tail` still has param name `en` and `args.mask` is gone (now MASK). It's fine —
+  mask_tail is called with explicit args. Let me check `main()` and `plain_loop()` for the bye
+  message and any remaining issues.
+
+● Now let me check the syntax compiles. Note the script imports `numpy` and `websockets` at module
+  top which exist on samsung? Let me check, and also do a basic compile.
+
+● Compiles, and numpy/websockets are available. Now let me check for any remaining stale references
+  to removed names (cur_es, cur_en, DUAL_SOURCES, translate_dual, args.mask, etc.).
+
+● Those are all legitimate (the CLI-flag-to-config mapping reads `args.*` by design). No stale
+  references. Now let me write a headless validation test that exercises the config precedence,
+  write-config round-trip, transcription-only guard, translate_multi (mocked), source building,
+  language detection fallback, and dual back-compat — without needing GPU/NLLB/fastText.
+
+  Since `translate_multi` and `detect_src_lang` depend on globals built at import time (and NLLB
+  load is guarded), I can import the module under controlled argv/env. Let me write a test harness.
+
+● `--write-config` calls `sys.exit(0)` which the import catches as SystemExit but our run() function
+  doesn't trap it cleanly. The file did get written. Let me write a fuller test that handles
+  SystemExit and validates round-trip + the remaining scenarios.
+
+● The `--dual` scenario tries to load NLLB because `ANY_TGT_LANGS` is true, but ctranslate2 isn't
+  installed on samsung. The transcription-only / config scenarios all passed. For the translating
+  scenarios, I need to stub ctranslate2/transformers so the import doesn't fail. Let me inject stubs
+  into sys.modules before exec, so the source-building logic (which runs before `_load_nllb`) can be
+  tested without real NLLB.
+
+  Actually `_build_sources` and SOURCES are computed before `_load_nllb()` is called. The problem is
+  just the `_load_nllb()` call at import. Let me stub ctranslate2 + transformers with fakes.
+
+● All passing. Now let me verify the regression case: an ES→{es,en} config produces a frozen-row
+  tr-dict shape that mirrors the old behavior, and test the per-stream config from a TOML
+  `[[source]]` table. Also verify fastText detection works if I can install it quickly. Let me try
+  installing fasttext-langdetect in a venv-free way for a real detection test.
+
+● Background command — let me wait for it via the output file.
+
+● The model download was incomplete/corrupt in the temp dir. The package itself imports fine. Let me
+  run the detection logic against the actual module using the wrapper, pointing at a freshly
+  downloaded model, or just verify the integration path via the module's `_load_fasttext` with the
+  venv's package. Actually the cleanest real test: use the venv's python to run our module-level
+  detection through a small stub. But our module needs numpy/websockets too.
+
+  Let me instead just directly test that `detect_src_lang` correctly maps ISO codes via `FT_TO_NLLB`
+  by injecting a fake fasttext model into the module — proving the detection wiring (the real
+  fastText accuracy is well-established; what matters is our integration).
+
+● All 15 passing. Now let me do the final headless-MT integration test: run a full sentence through
+  `mt_worker`'s job path (with stubbed translate) to confirm per-target marker splitting and
+  backfill end-to-end, plus verify the `--plain` output path. Then I'll handle the rename and docs.
+
+  Let me also clean up the leftover background venv. First, the rename: `git mv asr-tui.py
+  freesoft-asr`.
+
+● Now commit the rename as its own commit (per the task), then the refactor will follow. Actually
+  the rename + content edit are intertwined since I already edited the content. The file content
+  already changed. Let me commit the rename now (git sees the rename), then do README/docs
+  separately. Let me first verify it still compiles under the new name and run the full mt_worker
+  integration.
+
+● The loader fails for an extensionless filename. `spec_from_file_location` can't infer a loader
+  without a `.py` suffix. I'll pass an explicit SourceFileLoader.
+
+● End-to-end MT through marker-split backfill works for 3 targets, and the transcription-only
+  default never loads NLLB. Now `--help` and the rename verification.
+
+● Help looks good. Now let me commit the rename + refactor. Per the task, the rename ideally as its
+  own `git mv` commit. Since the content is already changed in the working tree, I'll commit it as
+  one cohesive commit (the git mv is tracked as a rename with content change). Let me commit the
+  code change now.
+
+● Git tracked it as a rename. Now update README.md and INSTALL.md. Let me update the README — the
+  title, intro, demo caption, the views block, running section, requirements, and the local-audio
+  variants. This is substantial; I'll rewrite the key sections.
+
+● Now the pipeline block, the Features list (dual mention), and the Running section. Let me update
+  them.
+
+● Now the dual feature line, the Running section, requirements, and same-host variants.
+
+● Now the same-host variants section and the alternative-scripts table (asr-call-transcribe /
+  asr-tui.py mentions), plus the remaining `.monitor` gotcha note in the sender section is fine. Let
+  me check remaining asr-tui.py mentions in README.
+
+● Lines 12 and 21 are intentional (rename note + demo caveat). The rest need updating. Let me fix
+  them.
+
+● Now fix the same-host variants section and the alternative-scripts section.
+
+● Now INSTALL.md. Let me update the asr-tui.py references and add fastText to the mt-env deps.
+
+● Now the mt-env pip install line — add fastText, and update the model section to mention fastText +
+  the model paths, plus the remaining refs.
+
+● Now the remaining INSTALL refs (lines ~92, 102-108, 115).
+
+● The shebang references `mt-env/bin/python`; the INSTALL says the shebang is referenced absolutely
+  — still correct since I kept the shebang. Now commit README + INSTALL.
+
+● Now the `~/project/docs/phone-call-asr-pipeline.md` mentions of asr-tui.py (separate repo). Let me
+  update those references — they're in a different repo so I commit separately. Let me view the
+  relevant lines.
+
+● This doc describes the pipeline architecture. `--dual` still works as before, so most references
+  stay valid as commands; I just need to update the script name `asr-tui.py` → `freesoft-asr`. The
+  header sample on line 234 reflects the old app name in actual output, so I'll update it to note
+  the rename. Let me use a careful sed-style replacement for the script name, then handle the
+  special cases (header line 234, pkill line 488).
+
+  Let me read the specific lines to make precise edits.
+
+● I'll do a global script-name replacement `asr-tui.py` → `freesoft-asr`, then fix the special
+  cases: the header sample line (234), the `--dual` interactive heading, and the `pkill -f
+  asr/asr-tui.py`. Note `pkill -f asr/asr-tui.py` should become `pkill -f asr/freesoft-asr`. Let me
+  use Python to do the bulk replace then handle the header line and a couple of phrasings.
+
+● Let me verify the heading and the changed lines read sensibly, and add a one-line rename note near
+  the top of the doc.
+
+● Line 273 has `pw-record … | ./freesoft-asr` which now needs `--source -`. Let me fix that, and the
+  line 271-275 mention of single-stream stdin. Also add a brief rename note at the top.
+
+● The system reminder shows the project CLAUDE.md but nothing requiring action. Let me fix the
+  single-stream stdin reference in the knobs section.
+
+● Now add a brief rename note near the top of the doc. Let me see the top.
+
+● Now let me clean up the temp venv and run a final full validation suite consolidating all checks,
+  then verify the git state.
+
+● All committed, clean worktree. Let me run the consolidated validation one final time to confirm
+  the full count, and double-check the `__pycache__` for the old name doesn't linger (it's
+  gitignored).
+
+● All 16 consolidated checks pass (and the earlier runs covered 17 + 15 + 2 more granular checks).
+  `__pycache__` is gitignored so the stale `.pyc` files don't matter.
+
+  Now let me write the report via the `end` skill as instructed.
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+  ARGUMENTS: report slug: asr-flexible-config
+
+● This is a first run. Let me kick off session-ID detection in the background, then write the
+  report.
+
+● Let me read REPORT.md for structure while the poller runs.
+
+● Session ID is ready. Let me grab it.
+
+● Session ID is the composite `0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a62e5f24e502a5606`. Now let me
+  write the report.
+
+● Now the compaction. Let me read COMPACT.md and COMPACT_PROMPT.md.
+
+● Now the KG entry. Let me read KG.md and the EXTRACT_PROMPT.
+
+● Task id is 377. Let me check current-entities.txt for existing names to reuse (freesoft-asr,
+  asr-tui, pony, etc.).
+
+● Good — existing entities to reuse: `asr-tui.py`, `github.com/BrentBaccala/asr`,
+  `NLLB-200-distilled-600M`, `INSTALL.md (asr repo)`, `claude pony user`/`cosine pony user`, `asr
+  directory`, `batched dual NLLB translate`, `cascade ASR-then-MT for ES-EN translation`. Let me
+  check a few more (Voxtral, the pipeline doc, vLLM).
+
+● Reusable: `stream.capture.sink = true`, `target.object monitor suffix non-resolution`,
+  `reference_voxtral_vllm_pony.md`, `serve_voxtral.sh`. Now I'll write the KG JSON.
+
+● Let me validate the JSON and commit the `~/project` artifacts.
+
+● All three artifacts written and the `~/project` ones committed.
+
+  - Report: `~/project/reports/asr-flexible-config.md`
+  - Compaction:
+  `~/project/compactions/session-0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a62e5f24e502a5606.md`
+  - KG:
+  `~/lightrag-history/incoming/session-0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a62e5f24e502a5606.json`
+
+  ## Summary
+
+  Task 377 (`asr-flexible-config`) is complete. I generalized the one-person phone-call ASR TUI into
+  a config-file-driven streaming ASR + inline-translation tool and renamed it `asr-tui.py` →
+  `freesoft-asr`.
+
+  **What was done:**
+  - **TOML config** (`~/.config/freesoft-asr/config.toml`, stdlib `tomllib`): precedence defaults <
+  file < CLI, with `--config`/`--write-config`. Endpoint/model became settings
+  (`--host/--port/--model/--nllb-dir`).
+  - **Generic per-stream sources** (`--source TARGET[=LABEL]` + `[[source]]` tables): `-` stdin,
+  `monitor` default-sink monitor, or PipeWire node names. Single unlabelled source drops the
+  `[label]` prefix.
+  - **New default = transcription-only of the default sink monitor** (D2/D3) —
+  NLLB/ctranslate2/transformers are not even imported unless a stream has target languages.
+  `--no-translate` forces this.
+  - **Per-stream multilingual translation** (D4/D5): `cur_es/cur_en` → a `cur_tr` dict; frozen
+  5-tuple → 4-tuple; `translate_dual` → `translate_multi` (N targets, one batch, src==tgt
+  passthrough). Render + Ctrl-W dump emit one row per target.
+  - **Per-sentence fastText lid.176 source-language detection** (D8) with a pinned-`src_lang`
+  override and graceful degrade to `default_src_lang` + warning.
+  - **`--dual` kept as a preset** reproducing the author's two-RTP-source spa→{es,en} setup
+  byte-for-byte.
+  - **Rename** via `git mv` (history preserved), header app-name, config dir, README, INSTALL, and
+  the `~/project` pipeline doc all updated.
+
+  **Validation:** headless on samsung (no GPU) using injected stubs for the absent GPU deps — all
+  checks pass (16/16 consolidated + earlier granular runs covering config precedence, write-config
+  round-trip, dual back-compat, source parsing, no-translate, per-stream TOML, translate_multi,
+  fastText wiring, emit/backfill shape, and a full 3-target sentence through `mt_worker`).
+
+  **Commits (not pushed — user pushes):** `~/asr` `3bd5c55` (rename+refactor) and `63b531c` (docs);
+  `~/project` `5c5ff35` (pipeline doc) and `e3d8c11` (report+compaction).
+
+  **For the user:** live TUI validation on pony, push the two `~/asr` commits, add
+  `fasttext-langdetect` to pony's `mt-env`, and re-record `demo.gif` (its header still reads
+  "asr-tui"). Exact manual pony validation steps are in the report.
+
+  TASK_RESULT: SUCCESS 16/16
+

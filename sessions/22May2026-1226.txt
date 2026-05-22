@@ -1,0 +1,2462 @@
+❯ i'd like to continue work on the asr program
+
+● I'll orient myself on where the ASR work stands. Let me check the repo state and recall the
+  project context.
+
+● The repo is clean and synced. I have solid context from memory. Let me see what's actually in the
+  repo and whether there's a tracked TODO or open thread.
+
+● Here's where ASR stands. The repo (`~/asr`, github.com/BrentBaccala/asr) is clean and synced with
+  `origin/main`. The active program is **`asr-tui.py`** — the live dual-stream phone-call
+  transcription TUI (Voxtral realtime on pony's GPU, NLLB ES/EN translation, VAD-driven WS
+  auto-recycle). Last commit was May 20; the recent burst was all TUI polish (scrollback, layout
+  stability, the auto-recycle watcher).
+
+  The one explicitly-deferred item I have on record is bumping Voxtral's `--max-model-len`
+  (currently 16384 ≈ 22 min/session) toward the model card's duration-scaled guidance for long
+  *unattended* runs — the VAD auto-recycle deflected the urgency but didn't close it.
+
+  "Continue" could mean a few different things, and the answer changes what I do next:
+
+❯ [Request interrupted by user for tool use]
+
+❯ can you give me a list of all of the Claude sessions where we've worked on asr?
+
+● The right sources here are the compaction files (one per `/end` session) and the session
+  transcripts. Let me search both for ASR-related work.
+
+● Found 12 compactions. Let me get dates for each and also scan raw session transcripts to catch any
+  ASR sessions that didn't end with `/end` (no compaction).
+
+● The JSONL grep is contaminated — the SessionStart hook injects "Voxtral"/ASR entity names into
+  *every* recent session's context, so a match doesn't mean ASR work happened. The 12 compactions
+  are the reliable signal. Let me get their real dates and filter the raw transcripts for genuine
+  ASR work.
+
+● I have a clear picture now. The pre-May rows with `uMsg≥2` but **0 file edits** are false
+  positives — they match on the word "transcript"/"whisper" in unrelated meta-discussion and predate
+  the ASR project (pony arrived in May). The genuine ASR sessions are the compactions plus the
+  sessions that actually edited ASR files. Let me grab one-line descriptions for the two big
+  sessions that have *no* compaction.
+
+● I scanned all 178 session transcripts plus the 146 compaction files. Here's the full set of
+  sessions where we worked on the ASR program. The pre-May matches in my raw grep were false
+  positives (the words "transcript"/"whisper" in unrelated meta-discussion, predating the project),
+  filtered out by requiring either a compaction or actual edits to ASR files. One May-15 hit
+  (`a45a3940`) was an *allegro* keyboard session that only brushed ASR — also dropped.
+
+  ## ASR sessions, chronological
+
+  | # | Date (start, EDT) | Session ID | What | Record |
+  |---|---|---|---|---|
+  | 1 | 2026-05-05 19:37 | `7f9f7657` | Designed the end-to-end phone-call→pony pipeline; brought up
+  PipeWire/WirePlumber/bluez audio on pony from scratch; scheduled overnight download of 4
+  ASR/translation models | compaction |
+  | 2 | 2026-05-06 20:20 | `0f989235` | Brought up the first streaming ASR pipeline (initial
+  stream-*.py experiments) | compaction |
+  | 3 | 2026-05-13 20:36 | `d024c36b` | Wifi/BT/pairing the Moto G; configured PipeWire to route
+  phone audio to pony's 3.5mm jack; pre-staged the call-transfer-then-transcribe goal | compaction |
+  | 4 | 2026-05-14 21:47 | `ed3c9d94` | Built the end-to-end phone-call ASR pipeline samsung→pony
+  (RTP sinks/loopbacks, `asr-call-transcribe` + faster-whisper, asr-env); worked through PipeWire
+  1.0.5 quirks | compaction |
+  | 5 | 2026-05-17 17:26 | `c0fe5fde` | Replicated the `~claude` ASR streaming rig; Voxtral/Spanish
+  work | compaction |
+  | 6 | 2026-05-18 18:06 | `71cb0349` | Low-latency streaming Spanish ASR on pony's single GPU |
+  compaction (+subagent) |
+  | 7 | 2026-05-18 19:36 | `213c3247` | Major buildout of the cosine phone-call pipeline (147 file
+  edits); set `--max-model-len 16384` to fix KV-cache OOM | compaction |
+  | 8 | 2026-05-19 01:58 | `0e3c0e41` | Conversational/code-switched handling on top of working
+  Voxtral-Realtime | compaction |
+  | 9 | 2026-05-19 18:52 | `f08d0019` | Continuation of the pipeline (320 edits) — this is the
+  "snipped" session that grew too big to run `/end` | compaction (partial) |
+  | 10 | 2026-05-19 18:52 | `872162d1` | Voxtral timestamps/speaker-id, **GitHub migration of the
+  repo**, VAD auto-recycle, max-model-len crash analysis (347 edits) | **transcript only — no
+  compaction** |
+  | 11 | 2026-05-19 19:30 | `6e1d421a` | Task `asr-dual-stream` (task 376, run 605) — task-runner
+  subagent | compaction |
+  | 12 | 2026-05-20 05:09 | `506293d0` | Post-`f08d0019` continuation; vLLM-vs-ollama GPU contention
+  (34 edits) | **transcript only — no compaction** |
+  | 13 | 2026-05-20 17:30 | `8c6795bf` | The `_bookkeeping_sync` AssertionError crash at the
+  max-model-len cap | compaction |
+  | 14 | 2026-05-20 23:22 | `a81faaf1` | Continued the pipeline — asr-tui polish (39 edits) |
+  compaction |
+  | 15 | 2026-05-22 16:26 | `0d59651d` | **This session** | — |
+
+  **Notes:**
+  - 12 of these have `/end` compactions in `~/project/compactions/` — the readable session records.
+  Read any with `find-compaction.py` or directly.
+  - **Two substantial sessions have no compaction** and live only as raw transcripts: `872162d1`
+  (the GitHub-migration + auto-recycle session, 347 edits) and `506293d0` (May 20 continuation).
+  `872162d1` is the origin session cited in three of the ASR memory files. If you want, I can run
+  those two through the `end` skill to backfill compactions so the history is complete.
+
+  Want me to pull up any of these in detail?
+
+❯ I think 872162d1 was too long to run the `end` skill, so I split it into two sessions, both of
+  which ran `end` - f08d0019 and 506293d0, though 506293d0 editted the compaction from f08d0019
+
+● That reconciles the two loose ends in my table. So the corrected picture is:
+
+  - **`872162d1`** — the long working session. No compaction of its own *by design* (it was too big
+  for `end`).
+  - **`f08d0019`** — ran `end`, produced the compaction that covers the work.
+  - **`506293d0`** — also ran `end`, but instead of writing its own compaction it *edited*
+  `f08d0019`'s.
+
+  So there's effectively **one** compaction (`f08d0019`'s) standing in for that whole May-19/20
+  cluster — not two missing ones. My offer to backfill compactions for `872162d1` and `506293d0` was
+  wrong; nothing's missing. Let me confirm the f08d0019 compaction actually absorbed the 872162d1
+  content (GitHub migration, auto-recycle):
+
+● Confirmed — the `f08d0019` compaction explicitly covers all of it: the GitHub migration with
+  rewritten README (line 15-16), the Silero-VAD auto-recycle (14), and the `--max-model-len` crash
+  signature (11, 28). So the record is complete; nothing to backfill.
+
+  Final tally: **14 ASR sessions** (excluding this one), of which 12 + the f08d0019/506293d0 pair
+  are captured in compactions. The only genuinely uncompacted transcript is `872162d1` itself — and
+  that's intentional, since its content lives in f08d0019's compaction.
+
+  Now — back to your original ask. What do you want to work on in the ASR program? The one item I
+  have on record as explicitly deferred is raising `--max-model-len` past 16384 for long
+  *unattended* runs (the auto-recycle made it non-urgent but didn't close it). But if you've got
+  something specific in mind, point me at it.
+
+❯ i think we'll leave max-model-len alone because auto-recycle has removed the need for it
+
+● Makes sense — auto-recycle bounds sessions by speaker-continuous talk time, so the cap is
+  effectively unreachable in normal use. I'll update the memory that still listed the bump as
+  pending, so it doesn't resurface as a suggestion.
+
+● Done — the memory now records this as a settled decision rather than a pending item, so I won't
+  resurface it.
+
+  So where would you like to take the ASR work? Some options, or tell me what's on your mind:
+  - **Run it live on pony** and watch behavior, fixing whatever surfaces
+  - **A specific feature/change** to `asr-tui.py`
+  - **Walk the current code together** to spot the highest-value next change
+
+❯ mkdir ~/asr/sessions and run format_sessions on all of those sessions.  for the long one that got
+  split, just do the long one (not the two split sections).  put the results in files labeled
+  DDMonYYYY-HHMM.txt
+
+● I'll process those 12 sessions (excluding this one, and excluding the two split sections
+  `f08d0019`/`506293d0` per your instruction — keeping the long `872162d1`). First let me check
+  `format_session.py`'s usage and the timezone of the timestamps so the filenames are right.
+
+● `format_session.py -t` renders in **local EDT** (e.g. `[19 May 14:53]`), while the raw JSONL
+  timestamps are UTC — so I'll convert to EDT for the filenames (this also matters for `0e3c0e41`,
+  whose 01:58 UTC start is actually May 18 21:58 EDT). Default `format_session` output (clean
+  transcript) at a fixed width of 100. Here goes:
+
+● All 12 written to `~/asr/sessions/`. One to flag: **`6e1d421a` came out tiny (29 lines)** — that's
+  the `asr-dual-stream` task-runner session, where the real work happened in the subagent
+  transcript, not the parent. Let me confirm what landed in that file.
+
+● Done. All 12 ASR session transcripts are in `~/asr/sessions/`, named `DDMonYYYY-HHMM.txt` in EDT:
+
+  ```
+  05May2026-1537.txt   7f9f7657   pipeline design, pony audio bring-up
+  06May2026-1620.txt   0f989235   first streaming ASR pipeline
+  13May2026-1636.txt   d024c36b   BT pairing + PipeWire jack routing
+  14May2026-1747.txt   ed3c9d94   end-to-end phone-call pipeline built
+  17May2026-1326.txt   c0fe5fde   replicated streaming rig / Voxtral
+  18May2026-1406.txt   71cb0349   low-latency streaming Spanish ASR
+  18May2026-1536.txt   213c3247   major buildout, --max-model-len set
+  18May2026-2158.txt   0e3c0e41   conversational/code-switched handling
+  19May2026-1452.txt   872162d1   the long one (GitHub migration, auto-recycle)
+  19May2026-1530.txt   6e1d421a   asr-dual-stream task (orchestration view)
+  20May2026-1330.txt   8c6795bf   _bookkeeping_sync crash analysis
+  20May2026-1922.txt   a81faaf1   asr-tui polish
+  ```
+
+  I followed your split instruction: kept the long `872162d1`, skipped its two end-bearing splits
+  (`f08d0019`, `506293d0`).
+
+  One caveat on **`19May2026-1530.txt` (`6e1d421a`)**: that was a task-runner session, so the parent
+  transcript is just the orchestration shell (launch task 376 → SUCCESS report — readable, but a
+  summary). The actual dual-stream implementation work lives in the **subagent** transcript
+  (`agent-af884ef7a2b2890d4.jsonl`, 327K). Want me to format that one too — either replacing the
+  thin file or as a companion `19May2026-1530-agent.txt`?
+
+❯ I want the subagent transcript, not the task runner session.  replace the thin file
+
+● `19May2026-1530.txt` now holds the subagent transcript (728 lines, 36K) — the actual dual-stream
+  implementation work, starting with the full task prompt. The thin orchestration file is replaced.
+
+  All 12 files in `~/asr/sessions/` are now the substantive transcripts.
+
+❯ check that directory (and its files) into the git repo
+
+● In the `~/asr` repo, `sessions/` is untracked and not gitignored. Adding and committing.
+
+● Committed as `3d8e43a` — all 12 transcripts (24,447 lines) staged and committed to the `~/asr`
+  repo. Working tree is clean.
+
+  Not pushed to GitHub, per your standing rule (push only when you ask). Want me to `git push origin
+  main`? Note these are full session transcripts going to a **public** repo — worth a beat to
+  confirm you're fine with that before they're indexed.
+
+❯ now, I'd like you to add a feature to the program where it will write out the entire current
+  running transcript to a file in cwd when the user hits a key (let's use CNTL-W).  name the file
+  DDMonYYYY-HHMM.txt and insert a notice in the running transcript stating the the file was written
+  at that point.
+
+● Let me read `asr-tui.py` to understand the key handling, the transcript/history data structure,
+  and the rendering, so I add this correctly.
+
+● Let me see the `frozen` data structure, `_clear_history`, `_state` init, and how render formats
+  history lines (so my file output matches what's on screen).
+
+● Let me check the code that mutates `frozen` by chunk_id (lines 415, 437, 470), to make sure a
+  sentinel "notice" row won't break it.
+
+● I have what I need. Let me check the constants/`wrap`/`CSI` definitions near the top so the notice
+  rendering matches existing style.
+
+● Now I'll implement. First, add the `NOTICE` sentinel:
+
+● Now add `_write_transcript()` right after `_clear_history()` (ends at line 1103, before the
+  `_MOUSE_RE` comment block):
+
+● Now wire up Ctrl-W (`\x17`) in `input_reader`, next to the Ctrl-L handler:
+
+● Now render the NOTICE rows in the history loop. The current loop body starts with `if spk ==
+  SOLO:` — I'll add a `NOTICE` branch before it:
+
+● Let me check whether the UI advertises key bindings anywhere (so I add Ctrl-W to the help), and
+  verify the file parses.
+
+● No on-screen key help exists (Ctrl-L isn't advertised either), so nothing to update there. But the
+  README documents Ctrl-L — let me add Ctrl-W there for parity.
+
+● Syntax is good. The full TUI needs vLLM + NLLB on pony, so I can't run it end-to-end here on
+  samsung — but I can verify the dump logic in isolation by extracting the actual function source
+  and exercising it with stubbed state. Let me do that.
+
+● The dump format, the pending/empty-field markers (`⋯`/`—`), the notice insertion, and the
+  same-minute `-2` suffix all work. But I notice a real problem: **DUMP 2 should contain the NOTICE
+  marker that DUMP 1 left in `frozen`, and it doesn't.** Let me investigate — that's either a test
+  artifact or a genuine bug.
+
+● `_fmt_transcript` renders the notice correctly when called directly. So why did the first test's
+  DUMP 2 omit it? Let me re-run that exact scenario with instrumentation.
+
+● FILE2 came out as the base name, not `-2`, and lacks the notice — yet `test_ctrlw.py` produced
+  `-2` correctly. Something non-deterministic. Let me instrument the actual path chosen per dump.
+
+● Resolved — and it's a **test artifact, not a code bug**. dbg3 shows the real behavior is correct:
+  dump1→base, dump2→`-2`, dump3→`-3`, with notices accumulating in `frozen` (len 2→3→4). My earlier
+  `files[-1]` picked the *base* file because `-` (0x2d) sorts before `.` (0x2e), so I was printing
+  dump1's content and concluding the notice was missing. Let me confirm the `-2` file actually
+  contains the prior notice:
+
+● Confirmed working correctly:
+  - **Solo mode** drops the `[spk]` prefix (just `Live`/`ES`/`EN`); dual mode tags each line.
+  - The `-2` file contains the prior dump's `── transcript written … ──` marker, so successive dumps
+  record each other's write points.
+  - `⋯` for pending translations, `—` for marker-split-empty fields, both match the on-screen
+  rendering.
+
+  There was no code bug — my first test just printed the wrong file (`-` sorts before `.`). Let me
+  commit.
+
+● Done. The Ctrl-W feature is implemented and committed (`6ed1311`).
+
+  **What it does:** pressing Ctrl-W in the TUI writes the entire running transcript — all frozen
+  history rows plus the in-flight live region — to `DDMonYYYY-HHMM.txt` (EDT) in the current
+  directory, then drops a dim `── transcript written to <file> at HH:MM:SS ──` marker into the
+  on-screen history at that point.
+
+  **Implementation, 4 touch points in `asr-tui.py`:**
+  - `NOTICE` sentinel speaker (next to `SOLO`) for marker rows in `frozen`
+  - `_fmt_transcript()` + `_write_transcript()` (next to `_clear_history()`) — snapshot under lock,
+  build text outside it, write, then append the notice
+  - `\x17` handler in `input_reader` (next to the Ctrl-L handler)
+  - a `NOTICE` branch in the history render loop
+  - README updated to document the binding
+
+  I verified the dump/notice/collision logic by exercising the actual extracted functions with
+  stubbed state (solo + dual, pending/empty fields, repeat dumps). What I **could not** test here is
+  the live end-to-end path — the keypress arriving through `/dev/tty` and the screen render — since
+  that needs vLLM + NLLB on pony.
+
+  Two things to flag before this is real:
+  1. **Verify on pony** — pull and run, then hit Ctrl-W during a live (or fixture) stream to confirm
+  the keypress fires and the marker appears.
+  2. **Not pushed.** You're 2 commits ahead of `origin/main` now (the sessions archive + this
+  feature). Want me to push? Same caveat as before: the sessions commit puts full transcripts in a
+  **public** repo.
+
+❯ review the transcripts - anything in there that should be reviewed before pushing to the public?
+
+● Good call — these are full session transcripts going to a public repo, and this is specifically a
+  *phone-call* ASR project, so I'll scan for both credentials and any real call/personal content.
+  Let me sweep systematically.
+
+● Found one concrete secret. Let me examine it and its context:
+
+● That's pony's WiFi SSID + password — real local network credentials. Continuing the sweep for IPs,
+  phone numbers, emails, MACs, and actual transcribed call content:
+
+● More: BT MACs (pony/samsung/phone), the user's actual phone model, and LAN IPs. Now the most
+  important category for a *phone-call* project — did any session capture **real transcribed call
+  content** (the pipeline was built around "what the doctor said")? Let me check for that plus
+  emails/phone numbers/names.
+
+● Reassuring on the big risk: the "patient artist… Maya" text (`18May2026-1536.txt`) is an
+  **audiobook fixture** (Spanish literary prose), not a real call — consistent with the record that
+  all validation used clean audiobook Spanish and real telephone audio was deferred. So no private
+  call content was captured. One last targeted sweep for cloud SIDs/PATs and to resolve that odd
+  `12.4.5.8`:
+
+● `12.4.5.8` is a false positive (a CUDA lib version). But line 2243 has a **real phone number +
+  SignalWire production identifiers**. Let me read that context:
+
+● This is **production telephony infrastructure** ([REDACTED-SIP-USER]/VAE dial-in) — a real DID,
+  SignalWire space, and username. Should not go public. Let me get exact occurrence counts for every
+  sensitive item across all files, so you have a complete redaction map.
+
+● Review complete. **Do not push as-is** — the transcripts contain real credentials and live
+  infrastructure detail. The good news: no private *call* content (the "patient artist… Maya" text
+  is an audiobook fixture, and all validation was clean audiobook Spanish), and no AWS keys, GitHub
+  PATs, JWTs, `[REDACTED-SECRET]`, or `.credentials` leaked.
+
+  ## What needs redaction
+
+  **🔴 High — real secrets / live infrastructure:**
+
+  | Item | Value | Files |
+  |------|-------|-------|
+  | WiFi password | `[REDACTED-WIFI-PW]` | `13May2026-1636.txt` (line 458) |
+  | WiFi SSID | `[REDACTED-SSID]` | `13May`, `14May`, `20May2026-1922` |
+  | SignalWire production dial-in | DID **[REDACTED-PHONE]**, space `[REDACTED-SW-SPACE]`, user
+  `[REDACTED-SIP-USER]` | `18May2026-1536.txt` (lines 2243-2247) |
+
+  The SignalWire trio is the worst of it — that's the **production [REDACTED-SIP-USER] dial-in** number
+  wired into a live FreeSWITCH dialplan. The WiFi password is a live credential for pony's network.
+
+  **🟡 Medium — hardware/network fingerprints:**
+  - Bluetooth MACs: pony `[REDACTED-MAC]`, samsung `[REDACTED-MAC]`, **phone
+  `[REDACTED-MAC]`** — across `05/13/14/20May`
+  - Phone model **"[REDACTED-DEVICE]"** — in 6 files
+  - LAN IPs `192.168.0.x` / `192.168.3.x` — RFC1918 private, low sensitivity but reveal your network
+  layout
+
+  ## Options
+
+  1. **Redact in place** — I'll replace the high-risk values (and optionally the MACs/phone model)
+  with `[REDACTED]` across the listed files, then re-commit. The commit `3d8e43a` isn't pushed yet,
+  so I can amend it cleanly with no public history. *(Recommended.)*
+  2. **Drop the sessions from the public repo** — `git reset` the sessions commit and keep the
+  transcripts local-only (or in a private repo / `~/project`). The feature commit `6ed1311` still
+  pushes fine on its own.
+  3. **Keep the feature, hold the sessions** — push only `6ed1311` (the Ctrl-W code), decide on the
+  transcripts later.
+
+  How thorough do you want the redaction, and which option?
+
+❯ do #1
+
+● Going with #1, thorough scope: redact the credentials/live-infra items **and** the device
+  fingerprints (BT MACs, phone model). I'll leave the RFC1918 LAN IPs — they're private, low-value,
+  and pervasive in the technical content. First let me pin down exact formats/counts so the
+  replacement is clean.
+
+● Mostly clean formats. Let me check two more things — the USB-dongle interface name (which embeds
+  its MAC) and any other access-point/BSSID values — then run the redaction.
+
+● The dongle interface name embeds its MAC too. Let me do a final catch-all MAC sweep so I don't
+  miss any (e.g. the BSSIDs mentioned at `20May:760`), then write the redaction script:
+
+● Complete map confirmed — only 3 full MACs exist; the `…DB:6F`/`…DB:6E` BSSIDs are already partial.
+  Running the redaction:
+
+● All replaced. Now verify nothing sensitive survives:
+
+● Verification clean — no sensitive values remain.
+
+  Now, the catch: the unredacted text is in commit `3d8e43a`, which is **not** HEAD (the feature
+  commit `6ed1311` sits on top). Adding a new redaction commit would leave the secrets in git
+  *history* — and history is just as public once pushed. Since neither commit is pushed yet, I'll
+  rebuild both commits cleanly so the unredacted blobs never exist in pushed history. Let me capture
+  the existing messages first.
+
+● Clean separation. Rebuilding both commits on top of `origin/main` so no unredacted blob ever
+  enters pushed history:
+
+● History rebuilt with new SHAs. Let me confirm the **committed** blobs (not just the working tree)
+  are clean, and that the old unredacted commit is no longer reachable from HEAD:
+
+● Done. The redaction is complete and the history is clean.
+
+  ## Summary
+
+  **Redacted across the 12 transcripts** (→ `[REDACTED-*]` placeholders):
+
+  | Category | Items | Count |
+  |----------|-------|-------|
+  | WiFi | SSID `[REDACTED-SSID]`, password | 15 + 1 |
+  | SignalWire prod dial-in | DID, space ID, SIP username | 3 |
+  | Bluetooth MACs | pony / samsung / phone | 23 |
+  | USB-dongle iface | `wlx…` (embeds MAC) | 5 |
+  | Phone model | "[REDACTED-DEVICE]" + variants | 24 |
+
+  **Left in place** (deliberately): RFC1918 LAN IPs (`192.168.x.x`) — private, low-value, and
+  pervasive in the technical content; redacting them would mangle a lot of diagnostics. Say the word
+  if you want those gone too.
+
+  **History rebuilt** so the unredacted text never reaches the public repo:
+  - `d2346d5` — sessions archive (redacted; redaction note in the commit message)
+  - `54ff6db` — Ctrl-W feature (unchanged, verified intact)
+
+  The old unredacted commit `3d8e43a` is now unreachable from HEAD (lives only in your local reflog,
+  won't be pushed). Verified: `git grep` on the committed tree finds zero sensitive values.
+
+  You're 2 commits ahead of `origin/main`, clean tree. Confirmed no real call content was ever
+  captured (audiobook-fixture Spanish only). **Ready to push when you give the word** — `git push
+  origin main`.
+
+❯ push it
+
+● Pushed. `origin/main` is now at `54ff6db` — both commits are public:
+  - `d2346d5` — 12 redacted session transcripts in `sessions/`
+  - `54ff6db` — the Ctrl-W transcript-dump feature
+
+  Working tree clean, local and remote in sync. The unredacted `3d8e43a` stayed local-only (reflog),
+  so no secrets reached GitHub.
+
+  Next step when you're back on pony: `git -C ~/asr pull`, then run `asr-tui.py` and hit **Ctrl-W**
+  during a stream to confirm the dump file lands in cwd and the marker shows up — that's the one
+  path I couldn't exercise here without the GPU/vLLM stack.
+
+❯ it seems like samsung isn't sending audio to pony right now.  can you figure out why?
+
+● This is the live PipeWire RTP pipeline (samsung taps the BT call audio → RTP → pony). Let me
+  ground myself in the reference doc and check live state at the same time.
+
+● Two PipeWire sessions are running (different users). Let me read the pipeline doc and identify the
+  session owners.
+
+● The samsung-side pipeline runs under user **baccala** (uid 1000), but I'm `claude` and can't sudo
+  into baccala's PipeWire session (`/run/user/1000` is mode 700). Let me read the doc to understand
+  the topology and figure out what I *can* observe.
+
+● The send path lives in baccala's session (I can't enter it as `claude`), but the fire-and-forget
+  UDP design means I *can* diagnose from system-wide and network state. Let me probe the most likely
+  break points in parallel: BT link to the phone (the known QCA9377 D3cold vanish), network
+  reachability to pony, and whether the RTP sockets even exist.
+
+● Found it — and it's **not** the send side. The phone is BT-connected, baccala's PipeWire has both
+  RTP sockets open and aimed at pony (`192.168.0.211 → 192.168.0.108:46000/46002`), so samsung *is*
+  transmitting. The break is the network: **pony at `192.168.0.108` is 100% unreachable.** Let me
+  localize whether it's samsung's LAN, or pony being down / off-network.
+
+● Now it's clear. samsung's LAN is healthy (gateway fine), and crucially:
+
+  - **`192.168.0.108` (pony's onboard wifi, per /etc/hosts) — 100% ping loss**, and SSH to `pony` (→
+  .108) times out.
+  - **`192.168.0.142` (pony's *old* USB-dongle address) — pings fine, 3 ms.**
+
+  So pony is alive, but reachable at `.142`, while both `/etc/hosts` and the RTP streams target
+  `.108`. The RTP audio is being fired at an address pony isn't actually serving. Let me get onto
+  pony via `.142` and confirm its interface state and whether anything is arriving.
+
+● pony's side reveals the rest. pony has **both** addresses up (`.108` onboard wlp8s0 *and* `.142`
+  USB dongle, both on the same /24) — but two things are wrong:
+
+  1. **`.108` is the address everything targets, yet samsung can't reach it** (while `.142` works
+  fine) — classic two-interfaces-on-one-subnet asymmetry plus the known flaky onboard BCM4360 link.
+  2. **pony has no UDP listener on 46000/46002 at all** — so even reachable packets would land
+  nowhere.
+
+  Let me pin down #2 (is cosine's PipeWire / rtp-source even running?) and the `.108` link quality.
+
+● Now I have the full diagnosis forming. Two distinct faults, and I want to confirm the receiver
+  config before prescribing a fix. Let me check pony's rtp-source config (what address it binds) and
+  whether the modules actually loaded in cosine's PipeWire.
+
+● I've found it. Here's the diagnosis — and it's **not** the samsung send side, which is working
+  correctly.
+
+  ## Root cause: pony's onboard WiFi link is dead, and that's the address samsung targets
+
+  **samsung side is healthy** — phone is BT-connected, baccala's PipeWire has both RTP sinks open
+  and transmitting to `192.168.0.108:46000` / `:46002`. Audio is leaving samsung fine.
+
+  **The break is the destination.** pony has *two* interfaces on the same `192.168.0.0/24`:
+  - `wlp8s0` — **onboard BCM4360, `192.168.0.108`** (metric 30, the preferred route, and what
+  `/etc/hosts` + the RTP streams target)
+  - `[REDACTED-IFACE]` — USB dongle, `192.168.0.142` (metric 200, the *old* address)
+
+  The onboard `.108` is **associated to the AP but passing zero traffic** — a dead radio link:
+  - samsung → `.108`: 100% packet loss · samsung → `.142`: 0% loss, 3 ms
+  - pony can't even ping its **own gateway** sourced from `.108` (100% loss)
+  - `iw wlp8s0 link`: associated to the AP but no signal/bitrate reported, vs. the dongle's healthy
+  **−55 dBm**
+
+  This is the known BCM4360 antenna/RSSI sensitivity (per the pony-antenna notes). samsung is firing
+  RTP at `.108`, which is a black hole; the only working path to pony right now is `.142`.
+
+  **Secondary observations (not the cause):**
+  - pony's `rtp_call_remote_source` / `rtp_call_me_source` nodes *are* loaded in cosine's PipeWire —
+  they just show no bound UDP socket because they're suspended (idle).
+  - `asr-tui.py` isn't currently running on pony, so there's no consumer pulling the streams anyway.
+
+  ## Fix options
+
+  1. **Physical (real fix):** reseat/rotate pony's antennas to restore the onboard `.108` link —
+  this needs you at the machine, per the antenna notes.
+  2. **Software stopgap (no antenna fiddling):** repoint to the working dongle `.142` — but this
+  touches things I can't change as `claude`: samsung's RTP config lives in **baccala's** PipeWire
+  session (needs baccala to edit + reload), and `/etc/hosts` needs root.
+  3. **Remote kick I *can* try now:** I have sudo on pony (via `.142`), so I can bounce `wlp8s0`
+  (down/up / reassociate) to see if `.108` re-establishes a usable link. Low-risk — my SSH session
+  is over the dongle, so it survives. Won't help if it's purely physical antenna, but worth a shot
+  if the association just went bad.
+
+  Want me to try option 3 (bounce pony's onboard wifi) while you decide on the rest? And is
+  `asr-tui` supposed to be running right now, or were you testing transport first?
+
+❯ yes, try bouncing the onboard wifi
+
+● I have sudo on pony over the dongle, so my session survives. Let me capture the onboard link
+  state, try a gentle reassociate first, and re-test.
+
+● Reassociate fixed it — `.108` went from 100% loss to **0% loss** to pony's gateway. Let me confirm
+  end-to-end from samsung:
+
+● End-to-end restored: samsung → `.108` is 0% loss, `ssh pony` (via hostname) works again, and the
+  RTP sinks are still aimed at `.108`. Let me confirm RTP packets are actually arriving at pony with
+  a quick capture:
+
+● Fixed and confirmed. Both RTP streams are now flowing samsung → pony: `46000` (Remote) and `46002`
+  (Me), ~1500 packets in 5 s — healthy continuous flow arriving on pony's `.108`.
+
+  ## What was wrong & what fixed it
+
+  pony's **onboard WiFi (`wlp8s0`, `192.168.0.108`)** was associated to the AP (5 GHz, BSSID
+  `[REDACTED-MAC]`) but passing **zero traffic** — a stale/dead association. Since `.108` is what
+  `/etc/hosts` and samsung's RTP sinks target, every audio packet was black-holing, even though
+  samsung was transmitting perfectly the whole time.
+
+  A single **`sudo wpa_cli -i wlp8s0 reassociate`** on pony brought it back: `.108` went 100% loss →
+  0% loss, `ssh pony` works again, and RTP is arriving.
+
+  ## One thing left for you
+
+  `asr-tui.py` isn't running on pony — start it (`cosine`, `--dual`) and you should see both streams
+  light up. The transport underneath it is now confirmed working.
+
+  This was the known BCM4360 flakiness — the link can go "associated but dead" without dropping, and
+  a reassociate recovers it remotely without touching antennas. Let me save that so it's a quick
+  lookup next time:
+
+● Done. Audio is flowing samsung → pony again.
+
+  **Summary:** pony's onboard WiFi (`wlp8s0` / `.108`) had gone "associated but dead" — silently
+  black-holing the RTP audio even though samsung was transmitting fine the whole time. `sudo wpa_cli
+  -i wlp8s0 reassociate` on pony fixed it; both streams are now confirmed arriving (`tcpdump` showed
+  ~1500 pkt/5 s on 46000+46002). I saved the symptom + one-line fix to memory since this is the
+  recurring BCM4360 flakiness and easy to forget the recovery command.
+
+  Last step is yours: start `asr-tui.py --dual` as `cosine` on pony and the streams should light up.
+
+❯ i tried it and it didn't work
+
+● Transport is confirmed (packets are arriving), so "didn't work" is now on the receiver/transcriber
+  side. The most likely culprit given the history is vLLM being down. Let me check pony's full
+  transcriber state.
+
+● vLLM is healthy (HTTP 200, model loaded, EngineCore on GPU) and `voxtral.service` is active — so
+  that's not it. `asr-tui` isn't running now (it must have exited when you closed it). The key
+  unknown is whether the RTP audio actually lands *inside* PipeWire's source nodes. Let me capture
+  from both sources and measure the levels.
+
+❯ [Request interrupted by user]
+
+❯ my bad - I forgot the --dual switch
+
+● Ah, that explains it. Without `--dual`, asr-tui runs in **solo mode** — it expects audio on
+  **stdin** (the SOLO path) and never touches the `rtp_call_remote_source` / `rtp_call_me_source`
+  taps. So it had nothing to transcribe. `--dual` is exactly what makes it own both RTP taps
+  internally.
+
+  Everything else is confirmed green for the `--dual` run:
+  - ✅ Transport: both streams arriving at pony (`46000`/`46002`)
+  - ✅ vLLM: HTTP 200, Voxtral model loaded, EngineCore on GPU
+  - ✅ `voxtral.service` active
+
+  Go ahead and re-run as `cosine` with `--dual` — you should see both `[Remote]` and `[Me]` streams
+  light up. Shout if anything's still off.
+
+❯ OK. now it's working.  I ran a call and hit CNTL-W twice.  It worked!  here's what I saw in the
+  *second* transcript:
+  ```
+  ASR transcript
+  Written: 22 May 2026 13:28:07 EDT
+  ==================================================
+
+  [Remote] Live Welcome to the Verizon Wireless Global Roaming Hotline.
+  [Remote] ES   Bienvenido a la línea directa de roaming global de Verizon Wireless.
+  [Remote] EN   Welcome to the Verizon Wireless Global Roaming Hotline.
+
+  [Remote] Live Para español, oprime asterisco.
+  [Remote] ES   Para español, aprima el asterisco.
+  [Remote] EN   For Spanish, press an asterisk.
+
+      ── transcript written to 22May2026-1327.txt at 13:27:39 ──
+
+  [Remote] Live Please hold while we look up your information.
+  [Remote] ES   Por favor, espere mientras busquemos su información.
+  [Remote] EN   Please hold while we look up your information.
+
+  [Remote] Live For account security, I just sent a text message to your
+  [Remote] ES   Por seguridad de la cuenta, yo sólo envié un mensaje de texto a su
+  [Remote] EN   For account security, I just sent a text message to your
+
+  ```
+  I'd like to have a final `─ transcript written to 22May2026-1328.txt ...` message at the bottom of
+  that file, reflecting the write that actually created the transcript.  and thus, we can lose the
+  `Written: 22 May 2026 13:28:07 EDT` line at the top of the file.  this way the messages will be
+  more consistent
+
+● It's working — and that's a nice clean transcript. Your suggestion makes the markers fully
+  consistent: every write point becomes a `──` marker, including the one that created the file (at
+  the bottom), so the redundant `Written:` header line goes away. Let me make that change. First let
+  me re-read the current function.
+
+● Let me verify the new format with the isolated harness, simulating your two-Ctrl-W scenario:
+
+● That's exactly the behavior you described:
+  - The `Written:` header line is gone.
+  - Each file now ends with its own `── transcript written to <thisfile> at HH:MM:SS ──` (placed
+  below any in-flight live region, at the very bottom).
+  - The second dump shows the first dump's marker inline *and* its own trailing marker — every write
+  point is now the same `──` marker, fully consistent.
+
+  Committing:
+
+● Committed (`a440ab1`). You're 1 commit ahead of `origin/main`.
+
+  The change is verified against your two-Ctrl-W scenario. Want me to push it? (No sensitive content
+  in this one — it's just `asr-tui.py`.) And on pony you'll need a `git -C ~/asr pull` before the
+  next run to pick it up.
+
+❯ one more thing - change "Me" to "Local" in all of the labels printed by the program
+
+● The functional label is line 87; everything printed derives from it. I'll change the label to
+  `Local` and update the doc/comment references that describe the printed output (the PipeWire node
+  name `rtp_call_me_source` stays — that's pony's config). Let me see the exact lines.
+
+● Now the edits — the label itself plus the human-facing references to the printed label:
+
+● Let me verify no printed-label `Me` remains, check the README, and syntax-check:
+
+● One `[Me]` reference in the README. Let me check the full README for the Me/Remote terminology and
+  update:
+
+● Let me do a quick confirmation that the dump now renders `[Local]`, then commit:
+
+● `[Local]` renders correctly in both the history and live regions. Committing:
+
+● Done. The own-voice stream is now `[Local]` everywhere it's printed — per-line tags, header
+  liveness (`Remote ● Local ●`), and transcript dumps. The PipeWire node name `rtp_call_me_source`
+  stays as-is (pony's config), and the doc comments + README were updated to match.
+
+  Committed as `bc1018a`. You're now 2 commits ahead of `origin/main`:
+  - `a440ab1` — Ctrl-W footer marker / dropped `Written:` header
+  - `bc1018a` — `Me` → `Local` rename
+
+  Both are code-only, no sensitive content. Want me to push them? And remember the `git -C ~/asr
+  pull` on pony before the next run.
+
+❯ push it
+
+● Pushed. `origin/main` is at `bc1018a` — both commits public, local and remote in sync:
+  - `a440ab1` — Ctrl-W footer marker / dropped `Written:` header
+  - `bc1018a` — `Me` → `Local` rename
+
+  To pick these up on pony: `git -C ~/asr pull`, then restart `asr-tui.py --dual`.
+
+❯ very good!
+
+  now I'd like to create an animation of the program running to put in the repo README.  "A picture
+  is worth a thousand words"
+
+  how would you suggest we do that?
+
+● Great instinct — a TUI like this really sells itself in motion. Let me check what recording
+  tooling is already on pony (where the TUI runs), so I can give you a concrete plan rather than a
+  generic one.
+
+● Here's what's on pony: `ffmpeg` and `npm` yes; no `asciinema`/`agg`/`vhs`/`cargo`/`go`. That
+  shapes the recommendation.
+
+  ## Recommended approach
+
+  **Capture with `asciinema`, render to GIF with `agg`, embed in the README.** This is the standard
+  path for a terminal TUI and gives the best result for three reasons: asciinema records the *real*
+  terminal (alt-screen, your per-speaker colors, the live-line refinement, real latency timing) into
+  a tiny text `.cast`; `agg` turns that into a clean animated GIF; and a GIF embeds natively in a
+  GitHub README (`![demo](demo.gif)`) — unlike asciinema's web player or animated SVG, which GitHub
+  won't run inline.
+
+  **Demo audio: call the Verizon Global Roaming Hotline** (the one from your test). It's ideal:
+  automated, bilingual (it literally offers Spanish), completely public/non-private, and repeatable
+  — none of the redaction worry a real personal call would bring. To also light up the `[Local]`
+  stream, say a couple of Spanish phrases into the headset mic during the call, so the GIF shows
+  both `[Remote]` and `[Local]` interleaving (otherwise the IVR is one-sided).
+
+  **The pipeline:**
+  1. On pony: `asciinema rec demo.cast` → it runs `asr-tui.py --dual` inside the recording.
+  2. Make the call, let ~25–40 s of transcription/translation play out, maybe one scroll, then `q`
+  to quit and stop the recording.
+  3. `agg demo.cast demo.gif` (tune `--cols 90 --rows 26 --idle-time-limit 2` to keep size/pacing
+  sane).
+  4. Commit `demo.gif` to the repo, add `![demo](demo.gif)` near the top of the README.
+
+  ## What I'd do vs. what needs you
+
+  I can install `asciinema` + `agg` on pony (apt for asciinema; agg ships a prebuilt binary — no
+  cargo needed), pick the right monospace font so the `● ⋯ ──` glyphs render, and handle the `agg`
+  conversion + README embed + commit afterward. **You'd need to drive the actual recording** (make
+  the call, speak the Spanish, hit `q`) since it needs the live phone + GPU pipeline and your hands
+  on the terminal.
+
+  A couple of notes/alternatives:
+  - **`vhs`** (scripted `.tape` → GIF) is the gold standard for *reproducible* demos, but it'd still
+  have to drive the real GPU+audio pipeline, so it adds setup without removing the live-call
+  dependency. Not worth it here.
+  - Keep it short (~30 s) and ~90 cols — GIFs balloon fast; I'll target well under ~2–3 MB so it's
+  friendly to clone.
+  - One privacy beat: even with the IVR, glance at the recording before we commit, in case you said
+  anything personal into the mic.
+
+  Want me to go ahead and install `asciinema` + `agg` on pony and stage the README embed spot, so
+  it's ready for you to record?
+
+❯ yes, install asciinema and agg on pony
+
+● I have passwordless sudo on pony. Installing both — `asciinema` via apt, `agg` as the prebuilt
+  binary (no cargo needed). Both go system-wide so cosine's session can use them.
+
+● Both installed system-wide (available to cosine): **asciinema 2.4.0**, **agg 1.5.0**. Let me run a
+  quick smoke test to confirm the toolchain produces a valid GIF *and* that agg's font renders the
+  TUI's special glyphs (`● ⋯ ── ▸`) before you invest in a real recording.
+
+● agg produced a valid GIF. Let me actually *look* at it to confirm the glyphs render (not tofu
+  boxes) — I'll pull it down and view it.
+
+● The Read tool only shows the GIF's first frame (still blank at t=0). Let me extract a later frame
+  with ffmpeg to actually verify the glyphs:
+
+● The `●` bullets and `──` box-drawing render cleanly. Two glyphs scrolled off (my smoke cast was
+  sloppy — literal escapes, too short). Let me do one clean check of the remaining TUI glyphs (`⋯`
+  pending-marker and `▸`) so we know the font covers everything before you record:
+
+● Toolchain fully verified end-to-end. Every glyph the TUI uses renders correctly in agg's font,
+  with ANSI colors intact:
+
+  - `●`/`○` liveness dots ✓
+  - `[Remote]` cyan / `[Local]` green accents ✓
+  - `⋯` pending-marker ✓ · `EN▸` triangle ✓ · `──` write-marker ✓
+
+  So `asciinema` 2.4.0 and `agg` 1.5.0 are installed system-wide on pony and confirmed working. Let
+  me clean up the test artifacts:
+
+● ## You're set to record
+
+  When you're ready, on pony **as `cosine`**:
+
+  ```bash
+  # size the window first (≈90×26 gives a clean, README-friendly GIF)
+  printf '\e[8;26;90t'
+
+  # record — asr-tui runs inside; quitting it (q) stops the recording
+  asciinema rec ~/demo.cast -c '~/asr/asr-tui.py --dual'
+  ```
+
+  Then: call the Verizon roaming hotline, let ~25–40 s of transcription/translation play out, say a
+  couple of Spanish phrases into the mic so `[Local]` lights up too, maybe scroll once, then hit
+  **`q`**.
+
+  That leaves `~/demo.cast` on pony. **Tell me when it's done** and I'll take it from there:
+  1. Convert with `agg` (tuning `--idle-time-limit`/size, keeping it under a couple MB),
+  2. Eyeball it with you for any personal mic audio before it's committed,
+  3. scp the GIF to `~/asr` on samsung, add the `![demo](demo.gif)` embed near the top of the
+  README, and commit/push.
+
+  One tip: don't stress about a perfect take — the `.cast` is just text, so re-recording is cheap,
+  and we can trim idle gaps at the agg stage rather than during the call.
+
+❯ done
+
+● Let me grab the recording and inspect it before converting.
+
+● Recording is 90×26, ~93 s, 1.5 MB cast. 93 s is long for a README GIF — I'll want to pick a tight
+  ~30 s window. First let me pull it to samsung and extract the readable transcript text so we can
+  do the privacy check (your mic audio) and choose a good window.
+
+● `/home/cosine` is mode 700, so the world-readable file still isn't reachable as claude. Let me
+  stage it via sudo into /tmp and pull from there.
+
+● The header repaints flooded that (the status bar's `───` matched). Let me tighten to actual
+  transcript lines and the notices:
+
+● The absolute-cursor rendering mushes the header into each frame. Let me split on the
+  cursor-position escapes to get clean per-row content for the review:
+
+● Content review is clean — no privacy issue. The `[Remote]` side is all public Verizon IVR menu
+  text, and your `[Local]` mic input was just *"I want to speak to a human."* / *"Quiero hablar con
+  un humano."* in both languages. Benign, and actually a great demo: it shows both streams, live
+  ES/EN refinement, and the bilingual translation both directions.
+
+  The useful content runs **~44 s → ~91 s** (the first 44 s was the call connecting — silence with
+  auto-recycles). I'll trim to that window, rebase timestamps, drop the alt-screen teardown at the
+  end, and let agg compress the long IVR pauses. Let me check agg's options and make the trim:
+
+● Trimmed to 47.9 s of content. Now convert on pony with idle compression and a held final frame:
+
+● The progress bar flooded the output. Let me check the resulting GIF:
+
+● 620 KB, 772×529 — great size for a README. Let me extract a couple of frames to eyeball the result
+  (the Read tool only shows a GIF's first frame):
+
+● Excellent — that mid-frame is exactly the demo we want: cyan `[Remote]` IVR Spanish with live
+  English translation, the `▸`/`⋯` live-region markers, the status bar with liveness dots and
+  recycle counters. Let me check the end frame (your `[Local]` lines):
+
+● That's the full story in one frame — both streams, bilingual, both directions: `[Local]` shows *"I
+  want to speak to a human."* → *"Quiero hablar con un humano."* → *"I want to talk to a human."*
+  The GIF is great. Let me place it in the repo and embed it in the README. First the README top:
+
+● Committing the GIF and README embed:
+
+● Committed (`2325e87`). Let me clean up the staging artifacts on both ends:
+
+● Done — the demo is in the repo and embedded at the top of the README.
+
+  ## What we produced
+  - **`demo.gif`** (772×529, 620 KB) — `asr-tui.py --dual` transcribing a live call: cyan `[Remote]`
+  IVR Spanish→English, green `[Local]` your voice both directions, the live `▸`/`⋯` refinement
+  markers, and the status bar with liveness dots + recycle counters.
+  - Recorded with asciinema on pony, trimmed to the ~48 s of actual content (dropped the 44 s of
+  call-connecting silence), rendered with agg with idle gaps compressed and a 3 s hold on the final
+  frame.
+  - Content reviewed: public IVR text + a generic "I want to speak to a human" — nothing personal.
+
+  Committed as `2325e87`; you're **1 commit ahead** of `origin/main`. Your `~cosine/demo.cast` is
+  left on pony intact in case you want to re-render later.
+
+  Want me to **push**? (It's a binary GIF to the public repo — benign content, but worth your nod
+  since it's the first non-text asset.) If yes, I'll push and you can `git -C ~/asr pull` on pony.
+
+❯ push it
+
+● Pushed. `origin/main` is at `2325e87` — the demo GIF and README embed are live on GitHub, local
+  and remote in sync.
+
+  The README now opens with the animated demo right under the intro paragraph, so anyone landing on
+  the repo sees the dual-stream bilingual transcription in motion immediately. A picture earning its
+  thousand words. 🎬
+
+  Nothing else outstanding on the asr work this session — the Ctrl-W feature, the `Local` rename,
+  the redacted session archive, and now the demo are all pushed.
+
+❯ excellent!  the description on the github repo still shows "[Me]" instead of "[Local]"  can you
+  fix that, please?
+
+● The GitHub repo's "About" description is set via the API, not the README. Let me check the current
+  value and update it:
+
+● Done — the repo's About description now reads `[Remote]/[Local]`:
+
+  > Streaming speech recognition on pony — Voxtral dual-stream **[Remote]/[Local]** phone-call
+  transcription TUI + alternative ASR scripts
+
+  One minor thing while we're here: the description still says "on **pony**" — an internal hostname,
+  on an otherwise public-facing repo. Not a secret, but it's a private-infra detail that doesn't
+  mean much to outside readers. Want me to drop it (e.g. "Streaming speech recognition — Voxtral
+  dual-stream …") or leave it as-is?
+
+❯ yes, drop "on pony"
+
+● Done. The repo description now reads:
+
+  > Streaming speech recognition — Voxtral dual-stream [Remote]/[Local] phone-call transcription TUI
+  + alternative ASR scripts
+
+  `[Local]` corrected and the internal hostname dropped.
+
+❯ it looks fantastic!
+
+  how can we make this more flexible, so other people can use it more easily?
+
+● Love that it landed well. Before I rattle off ideas, let me ground them in what's actually
+  hardcoded — let me look at the language, endpoint, and audio-source assumptions in the code.
+
+● That's the right question to be asking now — the repo looks polished, but under the hood it's
+  still wired to *your* exact setup. Here's what actually locks it down, grounded in the code:
+
+  ## What ties it to one user today
+
+  **1. Language is hardcoded to Spanish→{Spanish, English}.** `_tok.src_lang = "spa_Latn"`
+  (`asr-tui.py:264`) and `translate_dual` always emits `spa_Latn` + `eng_Latn` (`:345-352`), with
+  the rows labeled ES/EN. NLLB handles 200 languages and Voxtral is multilingual, so this is the
+  single biggest artificial limit — a German or Mandarin speaker can't use it as-is.
+
+  **2. Audio input assumes your phone-call RTP pipeline.** `--dual` is bolted to two specific
+  PipeWire node names — `rtp_call_remote_source` / `rtp_call_me_source` (`:85-88`). Nobody else has
+  those. (The solo/stdin path is already generic — that part travels fine.)
+
+  **3. Endpoint and models are module constants, not options.** `HOST/PORT = 127.0.0.1:8000`, `MODEL
+  = …Voxtral…`, `NLLB_DIR = ~/asr/models/…` (`:74-76`) — can't point at a remote vLLM or swap models
+  without editing source.
+
+  **4. Heavy, GPU-only install.** Voxtral needs vLLM + a GPU; the models/venvs are ~25 GB. Yet the
+  repo already ships lighter alternatives (whisper, vosk, parakeet, sherpa) that a no-GPU user could
+  fall back to — that path just isn't surfaced.
+
+  ## The good news
+
+  The existing CLI already has a clean flag pattern (`:102-157`), so most of this is additive —
+  `--src-lang`, `--tgt-langs`, `--host/--port/--model`, `--source`/`--label` — not a rewrite. Items
+  1 and 3 are contained and high-leverage; 2 needs a small redesign of how `--dual` is configured; 4
+  is docs + a setup script.
+
+  These are fairly independent, so let me find out where you want to aim first:
+
+❯ [Request interrupted by user for tool use]
+
+❯ i like all of your suggestions, and I want to add one of my own: we should have a config file
+  (probably in ~/.config) to set these parameters
+
+  I'd also suggest that the default should be transcription from pipewire's standard monitor (not
+  stdin)
+
+● Both additions are good calls — a config file is the right home for all these knobs, and
+  defaulting to the standard monitor ("transcribe whatever's playing") is a far more intuitive entry
+  point than piping stdin. Per the project's planning workflow, I'll write this up as a reviewable
+  plan/task rather than start editing. Let me first nail down a few code facts so the plan is
+  accurate — how audio actually gets in today, and the venv's Python version (decides the config
+  format).
+
+● Good — the architecture is clean: `stdin_reader` (`:523`) feeds the solo path, `pw_record_reader`
+  (`:534`) spawns a `pw-record --target NAME` per source for dual, and `net_main(source_name, label,
+  …)` (`:782`) ties a source to a Voxtral WS session. So generalizing "a source" (stdin / a named
+  node / the default monitor) is natural. Let me confirm the venv's Python version (decides config
+  format) before writing the plan:
+
+● Confirmed: pony's venv is **Python 3.12 with stdlib `tomllib`** — so the config file can be TOML
+  with zero new dependencies. And the audio-input layer
+  (`pw_record_reader`/`stdin_reader`/`net_main`) generalizes cleanly to a configurable list of
+  sources, including a default-monitor capture.
+
+  I have everything I need. Following the project's planning workflow, I'll write this up as a
+  reviewable plan in the task runner rather than start editing. Let me draft it.
+
+● Now let me create the task. Let me check the valid agent types first:
+
+● Plan written and queued as **task 377 `asr-flexible-config`** (pending — it won't run until you
+  say so). Here's the plan for your review.
+
+  ## Approach
+
+  Turn `asr-tui.py` from a one-user Spanish-phone-call tool into a generally configurable streaming
+  ASR + translation tool, **without breaking your current `--dual` workflow or the demo**. Phased
+  into 3 tasks; **task 377 is Phase 1** (the foundation), with 2 and 3 outlined to create after
+  review.
+
+  **Phase 1 — config infra + plumbing** (lower risk, mostly additive):
+  - **Config file**: TOML at `~/.config/asr/config.toml` (confirmed: pony's Python 3.12 has stdlib
+  `tomllib`, no new dep). Precedence: defaults < config < CLI flags. Plus `--config PATH` and
+  `--write-config` (emits a commented default).
+  - **Default input → the default sink's monitor** ("transcribe whatever's playing"), via
+  `pw-record` with `stream.capture.sink=true`. stdin moves to `--source -`.
+  - **Generic sources**: repeatable `--source TARGET[=LABEL]` (stdin / `monitor` / any PipeWire
+  node); one source = single-stream, many = multi-stream. `--dual` kept as a preset for the two RTP
+  nodes.
+  - **Endpoint/model as flags**: `--host --port --model --nllb-dir`.
+  - **`--no-translate`**: skip NLLB entirely (Live row only) — lighter for transcription-only users.
+
+  **Phase 2 — true multilingual** (separate task; the invasive one): `--src-lang`/`--tgt-langs` for
+  N languages, generalizing the fixed ES/EN rows and the translate hot path. Acceptance requires
+  byte-identical output for the default es/en config, then a third language.
+
+  **Phase 3 — packaging** (separate task): `setup.sh` + `requirements.txt` + model-download/convert,
+  and a documented no-GPU fallback to the repo's lighter scripts (whisper/vosk/parakeet/sherpa).
+
+  ## Two decisions I'd like your call on
+
+  1. **Default languages with no config** (plan D4): I set the shipped *default config* to your
+  `spa→{es,en}` so your runs are unchanged, but the in-*code* fallback (someone with no config file)
+  to `eng→[en]`. Reasonable? Or pick a different bare default.
+  2. **Phasing**: OK to keep Phase 2 (the N-language refactor) as a separate follow-on, or do you
+  want it folded into one big task?
+
+  The full prompt is at `~/project/prompts/asr-flexible-config` if you want to edit it directly.
+  Tell me any changes, and say the word when you want task 377 to run.
+
+❯ 1. default languages - no translation, just transcription
+  2. true multilingual - I want the languages to be configurable from the .config file, too.
+  probably let the user set a list of languages for each stream
+
+  wrap the language refactor into the task, but leave the packaging out for now
+
+  also, I think we should rename it.  `asr` is too short.  how about `freesoft-asr`?  that will be
+  the .config directory, and we can rename the script, too
+
+● Good calls — those simplify and strengthen the design. Let me fold them in:
+
+  1. **Default = transcription only** (no NLLB load unless languages are configured) — cleaner and
+  lighter for newcomers.
+  2. **Per-stream language lists, config-driven** — each source gets its own `src_lang` +
+  `tgt_langs` list (so Remote→English, Local→Spanish, etc.); empty list = that stream is
+  transcription-only. Multilingual folds into the one task.
+  3. **Drop packaging** for now.
+  4. **Rename to `freesoft-asr`** — script, config dir, the app-name in the header bar, and all doc
+  references.
+
+  Let me rewrite the plan accordingly.
+
+● Now commit the revised prompt to the `~/project` repo (the task runner doesn't auto-commit prompt
+  edits):
+
+● Plan updated and re-committed (task 377 still pending). Here's where it landed:
+
+  ## Updated plan
+
+  - **Default = transcription only.** No config → no NLLB/ctranslate2 even loaded; just the Live
+  row. Translation is opt-in by configuring target languages.
+  - **Per-stream languages, config-driven.** Each `[[source]]` carries its own `src_lang` +
+  `tgt_langs` (a list) — so Remote can translate to English while Local goes to Spanish, and an
+  empty list means that stream is transcription-only. Globals exist as fallbacks. The multilingual
+  refactor (N targets, dynamic rows) is now folded into this one task, with a regression gate so
+  today's es/en output stays identical.
+  - **Rename to `freesoft-asr`**: the script (`git mv asr-tui.py → freesoft-asr`), the config dir
+  (`~/.config/freesoft-asr/`), the app-name in the header bar, and all README/INSTALL/doc
+  references.
+  - **Packaging dropped** from scope.
+
+  ## Two heads-ups
+
+  1. **The demo.gif will go stale.** The header bar in the recording says `asr-tui`, so after the
+  rename it shows the old name. The task flags this; you'd want to re-record (asciinema+agg are
+  ready on pony). Easy to do once the rename lands.
+
+  2. **Repo rename — your call.** I deliberately left renaming the *GitHub repo* (`asr` →
+  `freesoft-asr`) out of scope, since it ripples: the public URL changes (GitHub does redirect old
+  links), and pony's `~/asr` clone + the `asr.bak` symlinks would need their remote/paths sorted.
+  The script/config/branding rename works fine regardless of the repo name.
+
+  Want me to **include the GitHub repo rename** too (I'd add the clone/remote fix-up steps), or keep
+  the repo as `asr` for now?
+
+  And whenever you're ready, say the word and I'll run task 377 — or tell me anything else to adjust
+  in the prompt first.
+
+❯ keep the repo as asr for now
+  Q: can tgt_langs be specified without src_lang?  right now, our streams have no src_lang and two
+  tgt_langs, right?
+
+● Good question — it gets at a real constraint. Let me confirm the current state precisely and
+  answer it.
+
+  **Current state:** there's one *global* `src_lang = "spa_Latn"` hardcoded at module load (`:264`),
+  shared by all streams — and translation always produces two targets, es + en. So "no *per-stream*
+  src_lang, two tgt_langs" is right, with the caveat that there *is* a single global source language
+  (Spanish) under the hood; it's just not a per-stream setting today.
+
+  **The constraint:** the two halves of the pipeline differ here.
+  - **Voxtral (ASR → the `Live` row)** auto-detects the spoken language — it needs *no* `src_lang`.
+  Transcription-only mode genuinely needs nothing.
+  - **NLLB (the translator)** *must* be told the source language — it prepends a source-language
+  token to encode correctly. So to translate into `tgt_langs`, *something* has to know the source.
+  You can't meaningfully translate "from unknown."
+
+  **So can `tgt_langs` work without `src_lang`?** Only if we supply the source some other way. Three
+  ways to let the user specify just the targets:
+
+  1. **Auto-detect the source per sentence** (a lightweight `langdetect`/fasttext step on the
+  transcribed text → feed NLLB). Best fit for your reality — phone calls that are sometimes Spanish,
+  sometimes English, sometimes code-switched. A fixed `src_lang=spa_Latn` actually *mistranslates*
+  the English bits today. Cost: a small dependency + a few ms, and it can misfire on very short
+  fragments. Natural rule: skip translating into a target that equals the detected source.
+  2. **Use Voxtral's own detected language** if the realtime API exposes it — free and accurate, no
+  extra detector. Worth having the task check whether the `/v1/realtime` response carries a language
+  field.
+  3. **Require `src_lang`** (per-stream or global) whenever `tgt_langs` is set — simplest, but
+  forces declaring the source and breaks on code-switching.
+
+  **My recommendation:** make `src_lang` *optional* — if omitted, auto-detect (option 1), preferring
+  Voxtral's own detection (option 2) if it's available; fall back to a configurable `src_lang` only
+  when detection is uncertain. That makes your streams exactly what you described: **just
+  `tgt_langs`, no `src_lang`** — and it handles code-switching better than today.
+
+  Want me to bake that (optional `src_lang` + auto-detect) into the plan? It adds one dependency
+  (`langdetect` or fasttext) — fine? Meanwhile I'll mark the repo-rename decision as settled (keep
+  `asr`).
+
+● I've marked the repo decision in the plan (keeping `asr`). I'll commit that together with the
+  `src_lang` change once you confirm the auto-detect approach above — just let me know if option 1+2
+  (optional `src_lang`, auto-detect with a Voxtral-detection check) works for you and whether adding
+  `langdetect`/fasttext as a dependency is acceptable.
+
+❯ can you check if Voxtral's detected language is exposed?
+
+● Best place to start is how `asr-tui.py` parses the Voxtral realtime WS messages — that shows the
+  actual event schema, including any language field it's currently ignoring. Then I'll confirm
+  against the live endpoint if needed.
+
+● The code only ever extracts `delta` and `type` — it never looks at a language field, so the source
+  won't tell us. Let me read the full WS handshake/loop, then probe the live endpoint to see *all*
+  fields Voxtral actually sends.
+
+● The code ignores everything but `type`/`delta`, so I'll probe the live endpoint directly — feed it
+  real speech and dump the *full* message JSON to see if any field carries the language. Let me find
+  a usable audio fixture on pony first.
+
+● There's a Spanish audiobook fixture (`muerteenvenecia…mp3`) — ideal for testing language
+  detection. vLLM is up and `websockets` is available. Let me write a probe that feeds it real
+  Spanish speech and dumps the **full** message JSON, scanning for any language field.
+
+● Definitive answer: **no, Voxtral's realtime API exposes no language field.** I fed it 18 s of the
+  Spanish audiobook fixture and dumped every message — it transcribes correctly ("La labor había
+  tejido el tapiz novelesco titulado Maía…") but the schema is bare:
+
+  - `session.created` → `{type, id, created}`
+  - `transcription.delta` → `{type, delta}` (text only)
+  - `transcription.done` → `{type, text, usage}` (just token counts)
+
+  No `language` key anywhere, at any nesting. So **option 2 (free language from Voxtral) is off the
+  table** — confirmed empirically, not guessed.
+
+  Let me clean up the probe:
+
+● So to let your streams specify **only `tgt_langs`** (no `src_lang`), the source language has to
+  come from an external detector — there's no free signal from Voxtral. The good news is it fits the
+  existing architecture cleanly: detect **once per completed sentence** (at the
+  `transcription.done`/sentence boundary, exactly where NLLB translation already fires), not
+  per-delta — so it's reliable and cheap, and naturally handles your code-switched calls (each
+  sentence detected independently).
+
+  That leaves the dependency choice:
+
+  - **`fasttext` + `lid.176.ftz`** — 917 KB model, a C extension; accurate even on short sentences.
+  Best quality.
+  - **`py3langid`** — pure Python, zero download, self-contained; decent, slightly weaker on very
+  short text.
+  - **Require `src_lang`** when translating (no dep at all) — but then your streams *must* declare a
+  source, and it mistranslates code-switched segments.
+
+  Given your calls are bilingual/code-switched, I'd go **auto-detect per sentence, with
+  `py3langid`** (no model download, nothing to bundle, and per-*sentence* detection is accurate
+  enough — short-text weakness mostly bites on single words). `src_lang` then becomes an optional
+  *override/fallback* in the config rather than required. We can swap to fasttext later if accuracy
+  disappoints.
+
+  Want me to bake that into the plan — **`src_lang` optional, per-sentence auto-detect via
+  `py3langid`, with `src_lang` as an override**? Or do you prefer fasttext, or just requiring
+  `src_lang`?
+
+❯ well, we're doing all kinds of stuff with AI models.  why not add a fourth one, if it doesn't
+  impact performance?
+
+● Good instinct — and the cleanest answer is that the standard tool for this *is* a model:
+  **fastText `lid.176`**. It's a real ML classifier (176 languages), not a heuristic — and it's the
+  gold standard for language ID precisely because it's tiny and fast: a 917 KB compressed model,
+  CPU, **sub-millisecond per sentence**. We only run it at sentence boundaries (where we already
+  pause to translate), so it adds nothing perceptible to latency and zero GPU load. It also fixes
+  the exact weakness I flagged — it's far more accurate on short text than `py3langid`.
+
+  So your "fourth model" is the right call, and it's a featherweight one. Worth contrasting with the
+  *other* way to read "add a model":
+
+  - **fastText `lid.176`** (recommended) — 917 KB, CPU, ~100 µs/sentence. Genuinely a model,
+  genuinely free performance-wise.
+  - **A transformer LID** (e.g. XLM-R-based, ~280 M params) — *this* is the one that would hurt
+  performance: GPU/CPU contention with Voxtral + real latency, for no accuracy gain over fastText on
+  this task. Skip it — it violates your "if it doesn't impact performance" condition.
+  - **`lingua`** — even more accurate, but loads per-language models (heavier memory); overkill when
+  fastText already nails per-sentence detection.
+
+  So: `src_lang` becomes **optional**, auto-detected per sentence by fastText `lid.176`, with
+  `src_lang` available as an override/fallback when you want to pin it. Let me bake that into the
+  plan.
+
+● Now commit the plan updates:
+
+● Baked in and committed. The language-detection question is now fully resolved in the plan:
+
+  - **`src_lang` is optional.** When unset, fastText `lid.176` detects the source **per completed
+  sentence** (where translation already happens), so code-switched calls are handled
+  sentence-by-sentence. `src_lang` becomes an override to pin it. Targets equal to the detected
+  source are skipped.
+  - **Graceful degradation**: if fastText/the model is missing and no `src_lang` is set, it falls
+  back to a configured default with a stderr warning — same pattern as silero-vad.
+  - The empirical finding (Voxtral exposes no language field) is recorded right in the plan so
+  nobody re-checks it later.
+
+  That closes out all the open design decisions. **Task 377 `asr-flexible-config`** now fully
+  specifies:
+  - Config file (TOML, `~/.config/freesoft-asr/`), precedence, `--write-config`
+  - Default input = default-sink monitor; stdin via `--source -`; generic `--source` with `--dual`
+  as a preset
+  - Endpoint/model flags; **transcription-only default**
+  - Per-stream `tgt_langs` + optional auto-detected `src_lang` (fastText)
+  - Full multilingual refactor (N targets, dynamic rows) with an es/en regression gate
+  - Rename to `freesoft-asr` (repo stays `asr`); stale-demo.gif noted for re-recording
+
+  It's pending and won't run until you say so. Want me to kick off task 377, or would you like to
+  read the full prompt at `~/project/prompts/asr-flexible-config` first?
+
+❯ run task 377
+
+● On it. Let me follow the exact task-runner workflow — reading the runbook first so I get the
+  prepare → launch → set-agent-id → complete steps right.
+
+● Read the runbook. Following the exact steps. **Step 1 — prepare** (captures the wrapped prompt;
+  model on stderr):
+
+● Prepared (run_id=606, model=opus). Let me read the full wrapped prompt to pass it verbatim to the
+  Agent tool:
+
+● **Step 2 — launch the agent** (opus, background, verbatim prompt):
+
+● Launched (agentId `a62e5f24e502a5606`). **Step 3 — record the agent ID** (marks running, enables
+  `--tail`):
+
+● Task 377 is **running** (run 606, opus, background). Agent ID recorded so monitoring works.
+
+  It's a substantial refactor — config infrastructure, generic per-stream sources, the N-target
+  multilingual rewrite, fastText language detection, and the `freesoft-asr` rename — so it'll take a
+  while. I won't tail it (that would block); the harness will notify me automatically when it
+  finishes, at which point I'll run `--complete` (which records the result and auto-commits on
+  success) and report back what it did, including the manual pony-validation steps it leaves for
+  you.
+
+  A few things to expect in the result:
+  - All editing/committing happens on samsung in `~/asr`; **it won't push** — that stays your call.
+  - Live TUI validation needs the GPU/audio on pony, so the agent does headless checks only and will
+  hand you exact steps to verify live.
+  - The `freesoft-asr` rename means the committed `demo.gif` (which shows `asr-tui` in the header)
+  goes stale — the agent will flag it; we can re-record once you've validated.
+
+  Nothing more needed from you right now — I'll surface the outcome when it lands.
+
+● The agent finished — **TASK_RESULT: SUCCESS 16/16**. Following **Step 4 — complete** (records the
+  result, auto-commits on success, handles chains):
+
+● Recorded — task 377 COMPLETED 16/16, auto-commit swept 13 files across 3 repos, and no dependent
+  tasks were waiting (Phase 3 was dropped, so the chain ends here). Let me verify the `~/asr` state
+  and pull the manual validation steps from the report to relay to you.
+
+● Clean and as expected — `asr-tui.py` → `freesoft-asr` (89 KB), tree clean, 2 new commits ahead of
+  origin. Let me pull the manual validation steps from the report to relay:
+
+● Let me grab the actual manual pony-validation steps (the section content got skipped by my sed
+  range):
+
+● Task 377 is complete and recorded — **16/16 headless checks pass**, changes auto-committed, no
+  dependent tasks queued. `freesoft-asr` is now a config-driven tool.
+
+  ## What landed (in `~/asr`, 2 commits, **not pushed**)
+
+  - **TOML config** at `~/.config/freesoft-asr/config.toml` (stdlib `tomllib`): precedence defaults
+  < file < CLI; `--config`/`--write-config`. Endpoint/model are now flags.
+  - **Generic per-stream sources** — `--source TARGET[=LABEL]` + `[[source]]` tables (`-` stdin,
+  `monitor`, or a PipeWire node). Single unlabelled source drops the `[label]` prefix.
+  - **New default = transcription-only of the default sink monitor** — NLLB/transformers aren't even
+  imported unless a stream has target languages.
+  - **Per-stream multilingual** — `cur_es/cur_en` → a `cur_tr` dict; `translate_dual` →
+  `translate_multi` (N targets, one batch); one rendered row per target.
+  - **Per-sentence fastText `lid.176`** source detection with pinned-`src_lang` override and
+  graceful fallback.
+  - **`--dual` preserved as a preset** reproducing your spa→{es,en} two-RTP-source setup; the rename
+  done via `git mv` (history kept).
+
+  One honesty note: samsung has no GPU/models, so the translating-path tests used **stubs** — they
+  prove the *wiring*, not NLLB accuracy. That's what the live pony validation is for.
+
+  ## Your turn — manual pony validation
+
+  On pony as `cosine` (`export XDG_RUNTIME_DIR=/run/user/$(id -u)`), after `git -C ~/asr pull`:
+
+  1. **Default monitor:** play audio → `~/asr/freesoft-asr` → single `Live▸` row only, no "loading
+  NLLB…".
+  2. **`--dual` unchanged:** `~/asr/freesoft-asr --dual` → `[Remote]`/`[Local]` with Live/ES/EN as
+  before; header now reads `freesoft-asr`.
+  3. **3rd language:** `--write-config`, add the two `[[source]]` blocks (Local + `fra_Latn`), run →
+  Local shows ES+EN+FR.
+  4. **fastText detection:** install `fasttext-langdetect` in `mt-env` first; confirm code-switched
+  sentences translate from the right source (and that it falls back gracefully if absent).
+  5. **Config round-trip:** `--write-config --config /tmp/x.toml` then run with it.
+
+  ## Three follow-ups
+  - **Push** the two commits once you're happy (your call).
+  - **Add `fasttext-langdetect`** to pony's `mt-env` — otherwise detection silently uses
+  `default_src_lang`. I can do that on pony now if you want.
+  - **Re-record `demo.gif`** — its header still says `asr-tui`. The tooling's ready on pony whenever
+  you are.
+
+  Full report (config schema, all flags, gaps) is at `~/project/reports/asr-flexible-config.md`.
+  Want me to install `fasttext-langdetect` on pony while you line up a call to validate?
+
+❯ push it
+
+● Pushed — `origin/main` is at `63b531c`, both commits public and in sync. `freesoft-asr` is now
+  live on GitHub: config-driven, generic sources, per-stream multilingual, with the rename and
+  updated README/INSTALL.
+
+  To bring it up on pony: `git -C ~/asr pull`, then it's ready for the live validation steps.
+
+  Still open from my earlier offer: **want me to install `fasttext-langdetect` into pony's `mt-env`
+  now?** Without it, the per-sentence language detection silently falls back to `default_src_lang` —
+  so for your code-switched calls you'll want it in place before validating step 4. I can do that on
+  pony (I have sudo there) while you line up a call; just say go.
+
+❯ yes, install it
+
+❯ where's mt-env?  where's it stored?
+
+● Let me check the actual state on pony rather than rely on memory.
+
+● `mt-env` is on **pony** at `/home/cosine/asr/mt-env` — and it's a **real directory** (4.9 GB venv,
+  Python 3.12), *not* a symlink. Notably, the old `~/asr.bak` arrangement my notes described is gone
+  — `asr.bak` no longer exists, and the venvs now live as real dirs directly inside `~cosine/asr`
+  (they're gitignored via `*-env/`, so they sit alongside the clone without being tracked).
+
+  What's already in it: `ctranslate2`, `transformers`, `onnxruntime` ✓. Missing: `fasttext` /
+  `ftlangdetect` — that's exactly the `fasttext-langdetect` install for the language detection.
+
+  That `asr.bak` discrepancy means a memory note of mine is now stale and misleading (it says "don't
+  delete asr.bak — it holds the only copy of the venvs"). Let me fix it:
+
+● Let me confirm whether the *other* venvs/models are also real dirs now (so the memory update is
+  accurate):
+
+● Confirmed: `models`, `mt-env`, `vllm-env` are all **real dirs**, no `asr.bak` anywhere. The
+  symlink-into-`asr.bak` arrangement is fully gone. Updating the memory:
+
+● Fixed the stale note. To recap your question plainly:
+
+  **`mt-env` lives at `/home/cosine/asr/mt-env` on pony** — a real 4.9 GB venv directory sitting
+  (gitignored) inside the `~cosine/asr` clone. Since `/home/cosine` is mode 700, reaching it as
+  `claude` needs `sudo` (which I have on pony). It already has the translation/VAD deps; only
+  `fasttext`/`ftlangdetect` are missing.
+
+  So installing language detection = `pip install fasttext-langdetect` into that venv (per the
+  command INSTALL.md now lists). Want me to run it on pony now and verify the import? It's contained
+  to `mt-env` and won't touch anything else.
+
+❯ yes, install it on pony
+
+● Let me check exactly what the new code imports for detection, so I install the matching package:
+
+● The code prefers raw `fasttext` + a local model, but falls back to the `ftlangdetect` wrapper
+  which downloads its own model — that's the self-contained path INSTALL.md recommends. Installing
+  `fasttext-langdetect` into `mt-env` as cosine:
+
+● No `pip` console-script in that venv — use `python -m pip`:
+
+● `mt-env` has no `pip` at all — it was created without pip (likely `uv`-managed). Let me find the
+  right installer:
+
+● It's a `uv`-managed venv (`uv 0.11.11` at `/home/cosine/.local/bin/uv`). Installing with `uv pip
+  install` targeting that interpreter:
+
+● Installed cleanly — `fasttext 0.9.3` + `fasttext-langdetect 1.0.5` built and installed into
+  `mt-env`. Now verify the detection path works live (first call downloads the ~126 MB lid.176
+  model):
+
+● Quoting got mangled in the heredoc — let me rewrite without nested quotes/f-strings:
+
+● Let me see the actual error (stderr was suppressed):
+
+● The install succeeded but hit a real bug: **fasttext 0.9.3 is incompatible with NumPy 2.x** — its
+  `predict()` calls `np.array(probs, copy=False)`, which NumPy 2.0 turned into an error. This is
+  independent of my code; it'd bite anyone following INSTALL.md on a NumPy-2 env. Let me see the
+  exact lines and patch them (the documented `np.asarray` fix):
+
+● NumPy 2.4.6 in `mt-env`; three `copy=False` lines in fasttext (the one at :239 is what `predict()`
+  hits). Patching all three to `np.asarray(...)` per the NumPy 2 migration guidance, then
+  re-verifying:
+
+● Detection is now live and accurate: **es 0.99 / en 0.99 / fr 0.92** — exactly what
+  `freesoft-asr`'s fallback path uses.
+
+  So the install needed one fix beyond the package: `fasttext-langdetect` pulled `fasttext 0.9.3`,
+  which is incompatible with `mt-env`'s NumPy 2.4 (`np.array(..., copy=False)` is an error in NumPy
+  2). I patched the three offending lines to `np.asarray(...)` (the documented migration fix),
+  backed up the original, and verified. This contradicts what INSTALL.md currently claims
+  ("downloads its own model… nothing extra needed") — that's wrong on any NumPy-2 environment.
+
+  Let me record this gotcha so it's not re-discovered:
+
+● Language detection is fully working on pony now. Summary of the install:
+
+  - **Installed** `fasttext-langdetect` into `mt-env` via `uv pip install` (the venv has no pip —
+  it's uv-managed).
+  - **Patched** the fasttext × NumPy-2 incompatibility (3 lines → `np.asarray`), backup at
+  `FastText.py.bak-numpy2`.
+  - **Verified** live: es/en/fr detected at 0.99/0.99/0.92.
+
+  Two caveats worth your attention:
+
+  1. **The patch is fragile.** It lives in the venv's `fasttext` site-package, so it's lost if
+  fasttext is ever reinstalled or `mt-env` is recreated. For the *public* repo this matters more —
+  anyone on a NumPy-2 environment following INSTALL.md will hit the same crash, and INSTALL.md
+  currently says fasttext-langdetect "just works, nothing extra needed." I'd recommend fixing that
+  doc (note the NumPy-2 patch, or pin a numpy-2-compatible fasttext). **Want me to update INSTALL.md
+  and push it?**
+
+  2. **pony still needs the new code.** I only installed the dependency — the `freesoft-asr` script
+  isn't on pony until `git -C ~/asr pull` (right now `~cosine/asr` still has the old `asr-tui.py`).
+  That pull is the first step of your live validation.
+
+  I also corrected two stale memory notes I'd written (the `asr.bak` symlink claim — `asr.bak` is
+  gone, deps are real dirs now) and recorded the fasttext/NumPy-2 gotcha so it's not re-discovered.
+
+  So: pony's ready for you to `git -C ~/asr pull` and run the validation steps. Want the INSTALL.md
+  doc fix pushed in the meantime?
+
+❯ first, you can ssh into pony as cosine
+
+  please set the .config file so that when I run the program without --dual, it listens on
+  rtp_call_remote_source
+
+● Good to know — I'll use `ssh cosine@pony` directly. To set a correct config I need the new
+  `freesoft-asr` on pony first (it's still the old `asr-tui.py` until pulled) and I want to see the
+  exact config schema it emits. Let me pull and generate the default template to inspect:
+
+● The schema is clear: an active `[[source]]` overrides the monitor default, and global `tgt_langs =
+  []` keeps it transcription-only. I'll write the config = the documented template + one active
+  source pointing at `rtp_call_remote_source` (single unlabelled stream, transcription-only). Then
+  validate it:
+
+● Valid and resolved correctly — single source `rtp_call_remote_source`, transcription-only. Let me
+  do a brief smoke run to confirm `freesoft-asr` (no `--dual`) actually starts on it and stays
+  transcription-only (no NLLB load):
+
+● `freesoft-asr` (no `--dual`) now starts clean on `rtp_call_remote_source` and stays
+  **transcription-only** — note the absence of any "loading NLLB…" line (it loaded only Silero VAD,
+  then exited cleanly). The config is set. Cleaning up the temp template:
+
+● Done. On pony, `~/.config/freesoft-asr/config.toml` is set so that **`freesoft-asr` with no
+  `--dual` listens on `rtp_call_remote_source`** (single stream, transcription-only). Verified:
+
+  - Valid TOML; resolves to exactly one source = `rtp_call_remote_source`, inheriting the global
+  `tgt_langs = []`.
+  - 8 s smoke run started clean and exited cleanly with **no NLLB load** — confirming
+  transcription-only.
+
+  A couple of notes:
+  - **I pulled `~/asr` on pony** as part of this (it had to have the new `freesoft-asr` to
+  configure/test), so the new code is now live there — your validation step 1 is already done.
+  - **The config is the full commented template** plus the one active `[[source]]` block at the
+  bottom, so all the other knobs (endpoint, languages, pause timing, auto-recycle) are documented
+  inline for easy editing.
+  - **To add translation later**, set `tgt_langs` on that source (e.g. `tgt_langs = ["eng_Latn"]`
+  for English, or `["spa_Latn","eng_Latn"]` to match the `--dual` Remote stream).
+  - **`--dual` is unaffected** — it's a preset that expands to the two RTP sources, overriding the
+  config, so your existing dual-stream workflow still works exactly as before.
+
+  Want me to add a `tgt_langs` to that source now (e.g. English-only translation of the remote
+  Spanish), or leave it transcription-only?
+
+❯ add English to tgt_langs
+
+● Adding `tgt_langs = ["eng_Latn"]` to that source — which enables the translation path (NLLB +
+  per-sentence fastText detection on the Spanish remote audio). Rewriting the active block cleanly:
+
+● Set: `rtp_call_remote_source → ["eng_Latn"]`. Now a smoke test of the **full translation path** —
+  this is the first real run of NLLB + fastText detection together on pony (the headless tests used
+  stubs):
+
+● The full translation path initializes cleanly: **NLLB loads**, Silero VAD loads, and crucially
+  **no fastText-missing warning** — confirming the `fasttext-langdetect` install + NumPy-2 patch are
+  picked up by `freesoft-asr`'s detection path. Clean exit (rc=0), no errors.
+
+  So on pony, `freesoft-asr` (no `--dual`) is now configured to:
+  - **listen on `rtp_call_remote_source`** (the call's far end),
+  - **transcribe** it (the `Live` row, raw Voxtral),
+  - **translate to English** (`EN` row), with the source language **auto-detected per sentence** via
+  fastText.
+
+  Everything that can be verified without live audio checks out — all three models load and the
+  pipeline starts. The remaining confirmation (actual Spanish→English rows appearing) is one real
+  call away: on pony, `~/asr/freesoft-asr`, with samsung sending the remote stream. To add Spanish
+  back as a second row, append `"spa_Latn"` to that `tgt_langs`; to pin the source and skip
+  detection, set `src_lang = "spa_Latn"`.
+
+❯ update the install instructions like you suggested
+
+● Let me read the INSTALL.md fastText section to fix the inaccurate "nothing extra needed" claim:
+
+● Now commit the doc fix:
+
+● INSTALL.md updated and committed (`aa76aea`). The fastText section now:
+
+  - Documents the **NumPy 2.x crash** — `fasttext-langdetect` pulls `fasttext 0.9.3` whose
+  `predict()` does `np.array(..., copy=False)`, a hard error on NumPy ≥ 2.0; the install succeeds
+  but detection crashes on first use.
+  - Gives the **fix** (the `np.asarray` `sed` one-liner, written generically to find `FastText.py`
+  in the venv) plus a **verify** command (`detect(text='hola mundo')` → `es`).
+  - Warns it must be **re-applied after any fasttext reinstall** (the patch lives in the
+  site-package), or pin a NumPy-2-compatible fork.
+  - Also corrected the model-size note (the wrapper downloads ~126 MB on first `detect()`, not the
+  917 KB `.ftz`).
+
+  You're 1 commit ahead of `origin/main`. Want me to push it?
+
+❯ push it
+
+● Pushed — `origin/main` at `aa76aea`, in sync. The NumPy-2 fastText caveat is now documented in the
+  public INSTALL.md.
+
+  Quick recap of where things stand on the ASR work this session:
+  - `freesoft-asr` shipped: config-driven, generic sources, per-stream multilingual, fastText
+  detection, renamed — all public.
+  - pony is set up: code pulled, `fasttext-langdetect` installed + NumPy-2-patched, and
+  `~/.config/freesoft-asr/config.toml` configured so a no-`--dual` run listens on
+  `rtp_call_remote_source` and translates Spanish→English.
+  - All four models confirmed to load cleanly on pony.
+
+  The one thing left is the live confirmation on a real call — `~/asr/freesoft-asr` on pony with
+  samsung sending the remote stream — to watch the `Live`/`EN` rows actually populate. Everything's
+  in place for it whenever you make the call.
+
+❯ I'm thinking that rather than have a --dual flag with back in options (like the Pipewire names),
+  I'd like the switch to be `--profile dual` with the ability to list a number of profiles in the
+  .config file
+
+● That's a clean generalization — `--dual` is really just one named bundle of sources, so making it
+  `--profile <name>` with profiles defined in config is the right shape. Let me look at how the
+  just-landed code implements the `--dual` preset so my proposal is grounded in what actually
+  changes.
+
+● Let me see the exact resolution logic in `_build_sources()`:
+
+● Right — `--dual` is just `DUAL_PRESET` (two hardcoded RTP sources) bolted onto a flag, sitting at
+  the top of the precedence chain in `_build_sources()`. Promoting it to a named, config-defined
+  profile is clean. Here's the design I'd propose:
+
+  ## `--profile <name>`
+
+  **TOML** — profiles are named bundles; the top-level keys remain the "default" (no-profile)
+  behavior:
+
+  ```toml
+  # default (no --profile): listen on the remote source, translate to English
+  [[source]]
+  target    = "rtp_call_remote_source"
+  tgt_langs = ["eng_Latn"]
+
+  # named profiles
+  [profiles.dual]
+  [[profiles.dual.source]]
+  target = "rtp_call_remote_source"
+  label  = "Remote"
+  accent = "1;36"
+  tgt_langs = ["spa_Latn", "eng_Latn"]
+  [[profiles.dual.source]]
+  target = "rtp_call_me_source"
+  label  = "Local"
+  accent = "1;32"
+  tgt_langs = ["spa_Latn", "eng_Latn"]
+
+  [profiles.tv]
+  [[profiles.tv.source]]
+  target = "monitor"
+  tgt_langs = ["eng_Latn"]
+  ```
+
+  `freesoft-asr --profile dual` → the two RTP streams; `--profile tv` → monitor→English; no
+  `--profile` → the top-level `[[source]]`.
+
+  **Semantics I'd suggest:**
+  - A profile is a **named overlay**: it can define its own `[[...source]]` *and* override any
+  top-level key (e.g. `beam`, `host`, language defaults). Precedence: defaults < top-level config <
+  selected profile < CLI flags.
+  - **`dual` ships as a built-in profile** (the current `DUAL_PRESET`), so `--profile dual` works
+  with no config and your setup is preserved; a config `[profiles.dual]` overrides the built-in.
+  - Add **`--list-profiles`** (shows built-in + config profiles) and an optional `default_profile`
+  config key.
+
+  ## Two decisions for you
+
+  1. **Keep `--dual`?** Cleanest is to make `--dual` a thin deprecated **alias** for `--profile
+  dual` (so the demo, README, and any muscle memory keep working) while documenting `--profile dual`
+  as canonical. Or do you want `--dual` **removed** entirely?
+  2. **Profile = full overlay, or sources-only?** I lean full overlay (more useful — a profile could
+  also pin languages/beam/endpoint), but sources-only is simpler if you'd rather keep profiles
+  purely about *what to listen to*.
+
+  If that matches what you have in mind, I'll write it up as a task (like the last one) for your
+  review before running. Which way on the two decisions?
+
+❯ let's drop --dual; i'll just use `--profile dual`.  go full overlay.  write it up and then run it
+
+● Decisions locked: drop `--dual` entirely, profiles are full overlays. Writing the task spec now.
+
+● Task spec written. Creating the task:
+
+● Task 378 created. Now running it — **prepare**:
+
+● Launching the agent (opus, background, verbatim prompt):
+
+● Recording the agent ID (marks running, enables monitoring):
+
+● Task 378 `freesoft-asr-profiles` is **running** (run 607, opus, background). The spec captures
+  both your decisions — `--dual` removed entirely (canonical is `--profile dual`), and profiles are
+  **full overlays** (a `[profiles.<name>]` can set any setting plus its own sources), with:
+
+  - a built-in `dual` profile so `--profile dual` works with no config (byte-for-byte the old
+  behavior, with a regression gate),
+  - `--list-profiles` and an optional `default_profile` config key,
+  - precedence: defaults < top-level config < selected profile < CLI flags.
+
+  It edits/commits on samsung (won't push), updates README/INSTALL + the pipeline doc, and leaves
+  you manual pony validation steps. I'll get a notification when it finishes, then run `--complete`
+  and report back.
+
+  One thing to note for when it lands: your current pony config uses a top-level `[[source]]` (no
+  profile), so a no-arg run still listens on `rtp_call_remote_source` → English exactly as now —
+  unaffected by this change. You'd add a `[profiles.dual]` block (or just rely on the built-in) to
+  use `--profile dual`.
+
+❯ in the config, set the default color to cyan
+
+● "Default color" maps to the `accent` key on your default (no-profile) source — right now
+  `rtp_call_remote_source` has no `accent`, so it picks up an auto-assigned palette color. I'll pin
+  it to cyan (`1;36`, the bold cyan used for Remote in the dual setup). This is a pony
+  runtime-config edit, independent of the running task 378 and forward-compatible with it.
+
+● Done — the default (no-profile) source now has `accent = "1;36"` (cyan); valid TOML, resolves
+  correctly:
+
+  ```
+  source: rtp_call_remote_source | accent: 1;36 | tgt_langs: ['eng_Latn']
+  ```
+
+  One honest caveat to verify on your next live run: the accent colors a stream's **label/row
+  tags**. Because this source has no explicit `label`, it renders as a single unlabelled stream (the
+  `[label]` prefix is dropped) — the `Live`/`EN` row tags should still pick up the cyan, but if it
+  doesn't show the way you expect, the fix is to give the source a `label = "Remote"` (then
+  `[Remote]` shows in cyan), or we can look at the render path. I left it unlabelled per your
+  earlier single-stream setup.
+
+  (This is a pony runtime-config edit; task 378 — the `--profile` refactor — is still running in the
+  background and untouched. I'll report when it lands.)
+
+❯ the Live/EN row tags do *not* show in cyan
+
+● That confirms my caveat — and it's exactly the SOLO path. The `accent` is applied to a stream's
+  **label prefix** (`[Remote]`); a single *unlabelled* source renders in SOLO mode, which drops the
+  prefix entirely and doesn't color the bare `Live`/`EN` tags. So with no label, the `accent` key
+  has nothing to colorize — that's why cyan doesn't appear.
+
+  Two ways to get cyan, and they differ in whether you keep the prefix-less look:
+
+  1. **Config-only, immediate:** give the source a `label` — e.g. `label = "Remote"`. Then it's no
+  longer SOLO: `[Remote] Live/ES/EN` renders, and the whole prefix (tags included) picks up the cyan
+  accent. One-line change to your pony config, reversible. Trade-off: every line now carries the
+  `[Remote]` prefix.
+
+  2. **Prefix-less cyan (code change):** color the bare `Live`/`EN` row tags with the source's
+  accent even in the single-unlabelled SOLO case. This keeps the clean no-prefix look *and* gets you
+  cyan — but it's a change to `freesoft-asr`'s render code, and **task 378 is editing that exact
+  file right now**. Touching it would clobber the agent's work, so I'd make this small fix *after*
+  378 lands.
+
+  Which do you want — shall I add `label = "Remote"` to the config now (option 1), or hold for the
+  prefix-less render fix once task 378 finishes (option 2)? (If you want, I can do option 1 now as a
+  stopgap and still do option 2 afterward.)
+
+❯ we'll wait for task 378.  i think it's best to color with the source's accent in the SOLO case,
+  because I think that's the behavior people would expect.  otherwise the source's accent just get
+  silently dropped, right?
+
+● Agreed on both counts. Yes — right now a single unlabelled source's `accent` is **silently
+  dropped**: the render special-cases the SOLO label as "no color," so the `accent` key you set in
+  the config has no effect at all unless the source also has a label. That's an inconsistency —
+  every other source honors its accent; the lone-unlabelled one quietly ignores it. Coloring the
+  bare `Live`/`EN` tags with the source's accent in the SOLO case is the least-surprising behavior,
+  and it means a configured `accent` always does something.
+
+  So the plan:
+  1. **Wait for task 378** (the `--profile` refactor) to land — it's editing `freesoft-asr` now, and
+  it also touches the SOLO/single-source path (`IS_SOLO`, `_build_sources`), so doing this on the
+  post-378 code is the correct order anyway.
+  2. When 378 completes, I'll run `--complete`, then make this render fix: apply the source's accent
+  to the `Live`/`ES`/`EN` row tags (and the live region) even when there's no `[label]` prefix.
+  Plain-text Ctrl-W dumps are unaffected.
+  3. Then you can drop the `label`-workaround question entirely — your prefix-less single stream
+  will show in cyan as configured.
+
+  I'll fold that fix into the turn where 378's completion notification arrives. Nothing for you to
+  do until then.
+
+● Task 378 finished — **34/34**. Completing it:
+
+● Recorded (34/34, auto-committed). Now the SOLO-accent fix we discussed. Let me find the render
+  logic on the now-stable code:
+
+● I can see exactly why. Two render helpers drop the accent in single-stream mode:
+
+  - **Live region** `_pref` (line 1985): `if dual: <apply accent> else: pref = raw` — no color when
+  not dual.
+  - **History** `_htag` (line 2042): `if spk == SOLO: return raw, raw` — no color for SOLO.
+
+  And `ACCENT["(solo)"]` *does* hold your cyan (`1;36`), it's just never applied. Let me check the
+  one other tag spot (line 2124) before editing:
+
+● Line 2124 is `--plain` stderr output (no TUI color by design) — leave it. The fix is the two TUI
+  helpers. Making the edits:
+
+● Syntax + behavior check — extracting the two nested helpers and confirming the SOLO case now emits
+  the accent:
+
+● Verified: single-unlabelled source now wraps the bare `Live▸`/`EN` tags in the configured accent
+  (`\x1b[1;36m…\x1b[0m`) with no `[label]` prefix, while labelled/multi-stream rendering is
+  unchanged. Committing:
+
+● Both pieces are done. Summary:
+
+  **Task 378 — `--profile` refactor** (34/34 headless checks, committed):
+  - `--dual` **removed** (passing it now errors); canonical is `--profile dual`, backed by a
+  built-in `dual` profile so it works with no config (byte-for-byte the old behavior).
+  - `[profiles.<name>]` are **full overlays** — set any scalar + define their own sources;
+  precedence defaults < top-level config < profile < CLI.
+  - Added `--list-profiles` and a `default_profile` config key; unknown profile errors with the
+  available names.
+  - `~/asr` commit `5f91af7`; pipeline doc `~/project` commit `6d6b91c`.
+
+  **SOLO accent fix** (the one we deferred — committed `70242b7`, verified):
+  - A single unlabelled source now colors its `Live`/`EN` row tags with the configured `accent`,
+  without adding a `[label]` prefix. So your cyan will now actually show. Labelled/multi-stream
+  rendering unchanged.
+
+  You're **2 commits ahead** of `origin/main` on `~/asr` (`5f91af7` + `70242b7`), plus the doc
+  commit on `~/project`. Nothing pushed.
+
+  When you pull on pony (`git -C ~/asr pull`), you'll get both — your existing config (single
+  `rtp_call_remote_source`, English, cyan) will render the tags in cyan, and `--profile dual` /
+  `--list-profiles` become available. Your top-level `[[source]]` config is unaffected by the
+  `--profile` change (no profile selected → uses it as before).
+
+  Want me to **push** the `~/asr` commits? (The `~/project` doc commit was auto-committed by the
+  task runner and stays local.)
+
+❯ push
+
+● Pushed — `origin/main` at `70242b7`, in sync. Both commits are public:
+  - `5f91af7` — `--dual` → `--profile` overlays
+  - `70242b7` — single-unlabelled source honors its accent (your cyan fix)
+
+  To pick them up on pony: `git -C ~/asr pull`, then run `~/asr/freesoft-asr` — your configured
+  `rtp_call_remote_source` stream should now render its `Live`/`EN` tags in cyan, and `--profile
+  dual` / `--list-profiles` are available.
+
+  That wraps up everything queued this session: the demo GIF, the config-driven `freesoft-asr`
+  rewrite (with fastText detection installed + patched on pony), the `--profile` mechanism, and the
+  accent fix — all pushed.
+
+❯ ## Context Usage
+
+  **Model:** claude-opus-4-7[1m]
+  **Tokens:** 440.3k / 1m (44%)
+
+  ### Estimated usage by category
+
+  | Category | Tokens | Percentage |
+  |----------|--------|------------|
+  | System prompt | 2.7k | 0.3% |
+  | System tools | 7.2k | 0.7% |
+  | MCP tools (deferred) | 30.4k | 3.0% |
+  | System tools (deferred) | 19.2k | 1.9% |
+  | Custom agents | 157 | 0.0% |
+  | Memory files | 17.5k | 1.8% |
+  | Skills | 2.7k | 0.3% |
+  | Messages | 419.3k | 41.9% |
+  | Free space | 550.3k | 55.0% |
+
+  ### MCP Tools
+
+  | Tool | Server | Tokens |
+  |------|--------|--------|
+  | mcp__bash-mcp__execute_bash | bash-mcp | 154 |
+  | mcp__bash-mcp__set_cwd | bash-mcp | 149 |
+  | mcp__claude_ai_Google_Drive__authenticate | claude_ai_Google_Drive | 174 |
+  | mcp__claude_ai_Google_Drive__complete_authentication | claude_ai_Google_Drive | 227 |
+  | mcp__gdb__gdb_call_function | gdb | 340 |
+  | mcp__gdb__gdb_continue | gdb | 210 |
+  | mcp__gdb__gdb_delete_breakpoint | gdb | 147 |
+  | mcp__gdb__gdb_disable_breakpoint | gdb | 162 |
+  | mcp__gdb__gdb_enable_breakpoint | gdb | 135 |
+  | mcp__gdb__gdb_evaluate_expression | gdb | 158 |
+  | mcp__gdb__gdb_execute_command | gdb | 328 |
+  | mcp__gdb__gdb_get_backtrace | gdb | 204 |
+  | mcp__gdb__gdb_get_frame_info | gdb | 136 |
+  | mcp__gdb__gdb_get_registers | gdb | 60 |
+  | mcp__gdb__gdb_get_status | gdb | 56 |
+  | mcp__gdb__gdb_get_threads | gdb | 85 |
+  | mcp__gdb__gdb_get_variables | gdb | 168 |
+  | mcp__gdb__gdb_interrupt | gdb | 174 |
+  | mcp__gdb__gdb_list_breakpoints | gdb | 198 |
+  | mcp__gdb__gdb_next | gdb | 141 |
+  | mcp__gdb__gdb_select_frame | gdb | 235 |
+  | mcp__gdb__gdb_select_thread | gdb | 193 |
+  | mcp__gdb__gdb_set_breakpoint | gdb | 416 |
+  | mcp__gdb__gdb_start_session | gdb | 1.1k |
+  | mcp__gdb__gdb_step | gdb | 143 |
+  | mcp__gdb__gdb_step_instruction | gdb | 188 |
+  | mcp__gdb__gdb_stop_session | gdb | 61 |
+  | mcp__gdb2__gdb_call_function | gdb2 | 340 |
+  | mcp__gdb2__gdb_continue | gdb2 | 210 |
+  | mcp__gdb2__gdb_delete_breakpoint | gdb2 | 147 |
+  | mcp__gdb2__gdb_disable_breakpoint | gdb2 | 162 |
+  | mcp__gdb2__gdb_enable_breakpoint | gdb2 | 135 |
+  | mcp__gdb2__gdb_evaluate_expression | gdb2 | 158 |
+  | mcp__gdb2__gdb_execute_command | gdb2 | 328 |
+  | mcp__gdb2__gdb_get_backtrace | gdb2 | 204 |
+  | mcp__gdb2__gdb_get_frame_info | gdb2 | 136 |
+  | mcp__gdb2__gdb_get_registers | gdb2 | 60 |
+  | mcp__gdb2__gdb_get_status | gdb2 | 56 |
+  | mcp__gdb2__gdb_get_threads | gdb2 | 85 |
+  | mcp__gdb2__gdb_get_variables | gdb2 | 168 |
+  | mcp__gdb2__gdb_interrupt | gdb2 | 174 |
+  | mcp__gdb2__gdb_list_breakpoints | gdb2 | 198 |
+  | mcp__gdb2__gdb_next | gdb2 | 141 |
+  | mcp__gdb2__gdb_select_frame | gdb2 | 235 |
+  | mcp__gdb2__gdb_select_thread | gdb2 | 193 |
+  | mcp__gdb2__gdb_set_breakpoint | gdb2 | 417 |
+  | mcp__gdb2__gdb_start_session | gdb2 | 1.1k |
+  | mcp__gdb2__gdb_step | gdb2 | 143 |
+  | mcp__gdb2__gdb_step_instruction | gdb2 | 190 |
+  | mcp__gdb2__gdb_stop_session | gdb2 | 61 |
+  | mcp__gmail__batch_delete_emails | gmail | 188 |
+  | mcp__gmail__batch_modify_emails | gmail | 281 |
+  | mcp__gmail__create_filter | gmail | 629 |
+  | mcp__gmail__create_filter_from_template | gmail | 569 |
+  | mcp__gmail__create_label | gmail | 243 |
+  | mcp__gmail__delete_email | gmail | 124 |
+  | mcp__gmail__delete_filter | gmail | 133 |
+  | mcp__gmail__delete_label | gmail | 127 |
+  | mcp__gmail__download_attachment | gmail | 273 |
+  | mcp__gmail__download_email | gmail | 284 |
+  | mcp__gmail__draft_email | gmail | 522 |
+  | mcp__gmail__get_filter | gmail | 146 |
+  | mcp__gmail__get_inbox_with_threads | gmail | 271 |
+  | mcp__gmail__get_or_create_label | gmail | 281 |
+  | mcp__gmail__get_thread | gmail | 237 |
+  | mcp__gmail__list_email_labels | gmail | 108 |
+  | mcp__gmail__list_filters | gmail | 99 |
+  | mcp__gmail__list_inbox_threads | gmail | 212 |
+  | mcp__gmail__modify_email | gmail | 262 |
+  | mcp__gmail__modify_thread | gmail | 303 |
+  | mcp__gmail__read_email | gmail | 129 |
+  | mcp__gmail__reply_all | gmail | 350 |
+  | mcp__gmail__search_emails | gmail | 166 |
+  | mcp__gmail__send_email | gmail | 522 |
+  | mcp__gmail__update_label | gmail | 271 |
+  | mcp__playwright__browser_click | playwright | 342 |
+  | mcp__playwright__browser_close | playwright | 82 |
+  | mcp__playwright__browser_console_messages | playwright | 301 |
+  | mcp__playwright__browser_drag | playwright | 326 |
+  | mcp__playwright__browser_drop | playwright | 384 |
+  | mcp__playwright__browser_evaluate | playwright | 303 |
+  | mcp__playwright__browser_file_upload | playwright | 162 |
+  | mcp__playwright__browser_fill_form | playwright | 420 |
+  | mcp__playwright__browser_handle_dialog | playwright | 160 |
+  | mcp__playwright__browser_hover | playwright | 196 |
+  | mcp__playwright__browser_navigate | playwright | 116 |
+  | mcp__playwright__browser_navigate_back | playwright | 96 |
+  | mcp__playwright__browser_network_request | playwright | 326 |
+  | mcp__playwright__browser_network_requests | playwright | 303 |
+  | mcp__playwright__browser_press_key | playwright | 143 |
+  | mcp__playwright__browser_resize | playwright | 154 |
+  | mcp__playwright__browser_run_code_unsafe | playwright | 307 |
+  | mcp__playwright__browser_select_option | playwright | 267 |
+  | mcp__playwright__browser_snapshot | playwright | 315 |
+  | mcp__playwright__browser_tabs | playwright | 224 |
+  | mcp__playwright__browser_take_screenshot | playwright | 442 |
+  | mcp__playwright__browser_type | playwright | 336 |
+  | mcp__playwright__browser_wait_for | playwright | 184 |
+  | mcp__playwright-firefox__browser_click | playwright-firefox | 345 |
+  | mcp__playwright-firefox__browser_close | playwright-firefox | 85 |
+  | mcp__playwright-firefox__browser_console_messages | playwright-firefox | 304 |
+  | mcp__playwright-firefox__browser_drag | playwright-firefox | 329 |
+  | mcp__playwright-firefox__browser_drop | playwright-firefox | 388 |
+  | mcp__playwright-firefox__browser_evaluate | playwright-firefox | 306 |
+  | mcp__playwright-firefox__browser_file_upload | playwright-firefox | 165 |
+  | mcp__playwright-firefox__browser_fill_form | playwright-firefox | 424 |
+  | mcp__playwright-firefox__browser_handle_dialog | playwright-firefox | 163 |
+  | mcp__playwright-firefox__browser_hover | playwright-firefox | 199 |
+  | mcp__playwright-firefox__browser_navigate | playwright-firefox | 119 |
+  | mcp__playwright-firefox__browser_navigate_back | playwright-firefox | 99 |
+  | mcp__playwright-firefox__browser_network_request | playwright-firefox | 329 |
+  | mcp__playwright-firefox__browser_network_requests | playwright-firefox | 306 |
+  | mcp__playwright-firefox__browser_press_key | playwright-firefox | 146 |
+  | mcp__playwright-firefox__browser_resize | playwright-firefox | 157 |
+  | mcp__playwright-firefox__browser_run_code_unsafe | playwright-firefox | 311 |
+  | mcp__playwright-firefox__browser_select_option | playwright-firefox | 270 |
+  | mcp__playwright-firefox__browser_snapshot | playwright-firefox | 318 |
+  | mcp__playwright-firefox__browser_tabs | playwright-firefox | 227 |
+  | mcp__playwright-firefox__browser_take_screenshot | playwright-firefox | 446 |
+  | mcp__playwright-firefox__browser_type | playwright-firefox | 339 |
+  | mcp__playwright-firefox__browser_wait_for | playwright-firefox | 187 |
+  | mcp__ssh__checkConnectivity | ssh | 102 |
+  | mcp__ssh__downloadFile | ssh | 160 |
+  | mcp__ssh__getHostInfo | ssh | 99 |
+  | mcp__ssh__listKnownHosts | ssh | 100 |
+  | mcp__ssh__runCommandBatch | ssh | 149 |
+  | mcp__ssh__runRemoteCommand | ssh | 195 |
+  | mcp__ssh__uploadFile | ssh | 157 |
+
+  ### Custom Agents
+
+  | Agent Type | Source | Tokens |
+  |------------|--------|--------|
+  | synth-only | User | 157 |
+
+  ### Memory Files
+
+  | Type | Path | Tokens |
+  |------|------|--------|
+  | Project | /home/claude/CLAUDE.md | 12.9k |
+  | AutoMem | /home/claude/.claude/projects/-home-claude/memory/MEMORY.md | 4.6k |
+
+  ### Skills
+
+  | Skill | Source | Tokens |
+  |-------|--------|--------|
+  | singular-dev-cycle | User | ~60 |
+  | end | User | ~70 |
+  | task-orchestrator | User | ~60 |
+  | lightrag | User | ~240 |
+  | wall-clock-attribution-table | User | ~190 |
+  | c200-power | User | ~180 |
+  | c200-1-benchmark-prep | User | ~120 |
+  | perf-profile | User | ~50 |
+  | bbb-install | User | ~50 |
+  | parallel-bba-debug | User | ~180 |
+  | bbb-session-debug | User | ~220 |
+  | instruction-count-plot | User | ~70 |
+  | update-multithreading-plan | User | ~50 |
+  | update-config | Built-in | ~240 |
+  | keybindings-help | Built-in | ~80 |
+  | verify | Built-in | ~90 |
+  | code-review | Built-in | ~80 |
+  | fewer-permission-prompts | Built-in | ~60 |
+  | loop | Built-in | ~110 |
+  | schedule | Built-in | ~130 |
+  | claude-api | Built-in | ~250 |
+  | run | Built-in | ~120 |
+  | init | Built-in | ~20 |
+  | review | Built-in | < 20 |
+  | security-review | Built-in | ~30 |
+
+
+
+❯ why don't you write up a blog post on freesoft.org describing the asr program?  i'd like to
+  include the animation, following by a wordpress <--more-->, then the bulk of the post
+
+● A blog post is an outward-facing publish, so I'll write it, stage it as a **draft** on
+  freesoft.org, and show you the content + draft link for review before anything goes live. First
+  let me read the website's posting procedure.
+
+● The workflow is: draft in Markdown, iterate with you until you're happy, *then* convert to HTML
+  and publish. So this turn I'll write the draft and show it — nothing goes live until you approve.
+  Let me check a couple of facts first (license, and how the converter handles `<!--more-->`):
+
+● Both confirmed: no `LICENSE` file (worth flagging — I'll note it), and `md2html.py` passes
+  `<!--more-->` through cleanly. Writing the draft:
+
+● Draft written to `~/asr/blog-freesoft-asr.md`. Here it is for review — structured exactly as you
+  asked: title, a one-line hook, the animation, `<!--more-->`, then the body.
+
+  ---
+
+  **freesoft-asr: real-time speech transcription and translation in a terminal**
+
+  > Here is a phone call being transcribed *and* translated as it happens, live, in a terminal
+  window. No cloud service, no web app — just a text UI watching the words scroll by in two
+  languages at once.
+  >
+  > **[ animation ]**
+  >
+  > `<!--more-->`
+  >
+  > **What you're looking at** — the recording is a call to an automated bilingual hotline; two
+  streams (`[Remote]` cyan = far end, `[Local]` green = my mic), each shown as raw transcription
+  (`Live`), cleaned Spanish (`ES`), and English (`EN`). Walks through the "Quiero hablar con un
+  humano / I want to speak to a human" moment.
+  >
+  > **How it works** — the cascade: Voxtral (GPU, streaming speech→text, any language) → fastText
+  `lid.176` per-sentence language ID (handles code-switching) → NLLB-200 (CPU translation, one row
+  per target). Plus the whole-sentence "marker-MT" trick and the VAD session-recycle for flat
+  latency.
+  >
+  > **Built to be flexible** — TOML config; bare `freesoft-asr` transcribes whatever's playing;
+  `--profile dual` and named profiles; per-stream languages; transcription-only by default (no
+  translation models loaded unless asked); any audio source. Phone-call plumbing described
+  generically (no hostnames/IPs).
+  >
+  > **Try it** — links to github.com/BrentBaccala/asr, notes the GPU requirement, points at
+  INSTALL.md and `--write-config`.
+
+  ---
+
+  Four things to decide before I convert + publish:
+
+  1. **The animation still shows `asr-tui`** in its header bar (it predates the rename). On a post
+  titled *freesoft-asr*, that's a visible mismatch. Want me to **re-record the demo** on pony first
+  (the tooling's installed), or ship this GIF as-is?
+  2. **No `LICENSE` file** in the repo — the post invites people to use the code, but with no
+  license it's technically "all rights reserved." Worth adding one (MIT?) before promoting it
+  publicly. Want me to add a LICENSE?
+  3. **Voice/attribution** — I wrote it first-person ("I built…"); it'd post under the Claude author
+  on your soapbox. Keep that voice, or adjust?
+  4. **Publish or draft?** — I'd recommend I create it as a **draft** (or a future-dated/unpublished
+  post) so you can eyeball the live rendering before it's public. Your call on publishing live vs.
+  draft.
+
+  Tell me how you want those, and I'll handle the GIF upload to WordPress media, the HTML
+  conversion, and the post.
+
+❯ 1. do you still have the text dump used to generate the gif?  can we just edit it to change the
+  name?
+  2. put MIT license on it
+  3. first-person is fine
+  4. don't draft it just yet, until you've answered my questions
+
+  in the first line - "No cloud service, no web app — just a text UI", also hype that its done with
+  all freely available models
+
+● Good answers. Let me work through them.
+
+  **On the GIF (#1):** the source `~/demo.cast` should still be on pony — editing the text and
+  re-rendering is the right call (avoids another live call). But there's a width subtlety I need to
+  check: `asr-tui` → `freesoft-asr` is 5 chars longer, and the header is padded to exactly 90
+  columns, so I'll likely need to trim the trailing `───` padding to match or the line wraps. Let me
+  fetch the cast and assess:
+
+● The header is exactly 90 columns. Let me see its full structure (especially any trailing `─`
+  padding I can trim to absorb the 5 extra characters):
+
+● The header is program-padded to exactly 90 columns with the rightmost field already clipped, so
+  adding 5 characters (`asr-tui`→`freesoft-asr`) risks pushing it to 95 and wrapping. Rather than
+  predict, let me just do the naive replace, re-render, and look at a frame — empirical is fastest:
+
+● The naive rename worked cleanly — the header now reads **`freesoft-asr`**, no wrap, body fully
+  intact. The only effect is the rightmost `done` counter clipped off the right edge (negligible for
+  a demo). So **no re-record needed** — we can regenerate the GIF from the edited cast. Let me
+  confirm the end frame (the `[Local]` section) and pull the full GIF:
+
+● End frame is clean too — header renamed, `[Local]` lines intact. The regenerated GIF is good, no
+  re-record needed. Now doing all three: swap in the corrected GIF, add the MIT license, and update
+  the blog's first line. Let me handle the file ops:
+
+● Now the blog first-line edit (hyping the freely-available models):
+
+● Now a `## License` section in the README. Let me see its tail:
+
+● Committing the corrected GIF and the license (separate commits; the blog draft stays a local
+  artifact until it's published):
+
+● Clean — 2 commits ahead (GIF + license), blog draft intentionally uncommitted. Cleaning up the
+  render staging:
+
+● All four questions handled:
+
+  1. **GIF fixed by editing the cast** — yes, `~/demo.cast` was still on pony. I replaced
+  `asr-tui`→`freesoft-asr` in it and re-rendered with agg (no re-record / no new call needed).
+  Verified the mid and end frames: header now reads **`freesoft-asr`**, layout fully intact; the
+  only effect is the trailing `done` counter clipping off the right edge (negligible). New
+  `demo.gif` committed (`284ac8b`).
+  2. **MIT license** — `LICENSE` added (© 2026 Brent Baccala) + a `## License` section in the
+  README. Committed (`9668604`).
+  3. **First-person** — kept as-is.
+  4. **Not published** — held, per your instruction.
+
+  The blog's opening line now hypes the open models:
+
+  > Here is a phone call being transcribed *and* translated as it happens, live, in a terminal
+  window. **No cloud service, no web app, no API keys — just a terminal and a handful of freely
+  available, open models running on my own hardware**, watching the words scroll by in two languages
+  at once.
+
+  Two things ahead of you now:
+  - **Repo:** 2 commits ahead of `origin/main` (`284ac8b` GIF, `9668604` license), not pushed. Push
+  them?
+  - **Blog:** ready when you give the word. On publish I'll upload the corrected `demo.gif` to
+  WordPress media, convert the Markdown→HTML (`md2html.py`, which preserves `<!--more-->`), `wp post
+  create`, invalidate CloudFront, and do the live-render visual check. **Publish live, or create it
+  unpublished/draft first** so you can eyeball the rendered page before it's public?
+
+❯ make "running on my own hardware" more specific - "running on my RTX 3090"
+
+● Updated:
+
+  > …no API keys — just a terminal and a handful of freely available, open models **running on my
+  RTX 3090**, watching the words scroll by in two languages at once.
+
+  That makes the body's later "developed on an RTX 3090" line consistent with the hook too. The
+  draft's ready whenever you want it published.
+
+  So, still open:
+  - **Push** the 2 repo commits (`284ac8b` GIF, `9668604` MIT license)?
+  - **Publish the blog** — live, or unpublished/draft first for a visual check?
+
+❯ push it, then publish live
+
+● On it — push first, then publish. Let me push and inspect the Markdown converter (need to confirm
+  it handles the image and `<!--more-->`):
+
+● Pushed — `origin/main` synced. The converter handles `<!--more-->` and `## ` headings, but **not**
+  image syntax (`![]()` would become a stray link), so I'll embed the GIF as a raw `<img>` block.
+  First, upload the GIF to WordPress media and get its URL:
+
+● No attachment ID came back — let me debug the upload (check SSH, the file, and the import stderr):
+
+● Permissions issue on the uploads dir. Let me check its ownership:
+
+● The uploads dir is owned by `www-data`, but `wp-cli` runs as `wordpress` — hence the failed move.
+  The web server writes uploads as `www-data`, so I'll import as `www-data` (with a writable cache
+  dir), falling back to direct placement if needed:
+
+● Media uploaded: attachment 628, URL
+  `https://www.freesoft.org/blogs/soapbox/wp-content/uploads/2026/05/demo.gif`. Now build the post
+  HTML — swap the image markdown for a centered `<img>` block, convert, and sanity-check the output:
+
+● The HTML is mostly right, but I need to check the **lists** — `md2html.py` has no list support, so
+  my `-` bullets and `1.` numbered list would collapse into run-on paragraphs. Let me verify and fix
+  the converter (it explicitly invites adaptation):
+
+● Two real problems: the lists collapsed to run-on paragraphs, **and** the `` ``` `` code fences
+  broke inline-code pairing (line 35 shows reversed `</code>…<code>` tags). `md2html.py` was written
+  for a math post — no list or fenced-code support. Let me see exactly what structures my post uses,
+  then teach the converter:
+
+● Backticks in the echo broke the shell — let me use Python to inventory:
+
+● One fenced block (`freesoft-asr`), two bullet lists, one numbered list — and inline backticks
+  balance once the fence is consumed. I'll teach `md2html.py` to handle fenced code + lists. Three
+  edits:
+
+● Now the three edits:
+
+● Now re-convert and verify lists, code block, and the previously-broken inline code:
+
+● `<ul>×2, <ol>×1, <li>×9, <pre>×1` — lists and code block now correct, and the profile line renders
+  properly. The one "reversed" match is likely a false positive (two *adjacent* inline-code spans
+  legitimately produce `</code>…<code>`). Let me confirm:
+
+● That's a false positive — `<code>INSTALL.md</code> … <code>freesoft-asr --write-config</code>` are
+  two *separate* correct inline-code spans with text between them. So the HTML is clean: 4 sections,
+  2 bullet lists, 1 numbered list, the code block, the `<!--more-->`, and the centered GIF, all
+  correct.
+
+  Publishing now — upload HTML, create the post live, invalidate CloudFront:
+
+● Post created live — **ID 629**, slug `freesoft-asr`. Invalidating CloudFront, cleaning up staging,
+  and doing the text-level check:
+
+● Published and CloudFront invalidation is in progress. Let me give it a moment to propagate, then
+  do the text check (the CLAUDE.md verify step — all four `<h2>` headings should be present):
+
+● Right, foreground `sleep` is blocked. The invalidation's had a bit of time — let me just check
+  now:
+
+● Text rendering is clean: HTTP 200, all four section headings present, the demo GIF embedded with
+  the right URL, and the `<!--more-->` split worked (`more-629` anchor present). Now the visual
+  check (CLAUDE.md says don't skip it):
+
+● Page loads with the right title. Let me screenshot it to verify layout:
+
+● Let me locate and view the screenshot:
+
+● The full-page shot confirms overall structure (intro, centered GIF block, the four sections,
+  lists, code block, sidebar) with no collapse — but it's too zoomed to verify details. Let me grab
+  a readable viewport shot of the top (GIF + intro + first section):
+
+● Title, byline, and the intro (with the "RTX 3090" hook) all render cleanly. Let me scroll to
+  confirm the GIF displays and the lists render properly:
+
+● The GIF renders perfectly — and crucially the header shows **`freesoft-asr`** (the rename worked),
+  with the cyan `[Remote]` lines and the green `[Local]` live region. The new post is already at the
+  top of the POSTS sidebar. Let me verify one list + the code block render properly, then close the
+  browser:
+
+● The numbered list renders properly (1/2/3 with bold lead-ins, the Voxtral link, italic quotes) —
+  no run-on collapse. The post is fully verified. Closing the browser and cleaning up the local
+  screenshots:
+
+● 🎉 Published and verified live: **https://www.freesoft.org/blogs/soapbox/freesoft-asr/**
+
+  Everything checks out on the rendered page:
+  - **Title + byline** ("MAY 22, 2026 BY CLAUDE @ FREESOFT.ORG") and the intro with the "running on
+  my RTX 3090" hook.
+  - **The animation displays correctly** — and its header reads **`freesoft-asr`** (the edited-cast
+  rename worked), with cyan `[Remote]` lines and the green `[Local]` live region.
+  - **`<!--more-->` split** is in place (excerpt ends at the GIF; `more-629` anchor present).
+  - All four sections, both bullet lists, the numbered list, and the `freesoft-asr` code block
+  render as proper HTML — no run-on collapse. Links, bold, italic, and inline code all good.
+  - The post is already at the top of the sidebar's POSTS list.
+
+  Along the way I also:
+  - Pushed the two repo commits (GIF rename + MIT license) — done earlier.
+  - Uploaded the GIF to WP media (attachment 628) as `www-data` (the uploads dir is
+  `www-data`-owned, so `wp-cli` as `wordpress` couldn't write it).
+  - **Enhanced `~/website/md2html.py`** to handle fenced code blocks and ordered/unordered lists —
+  it previously only did headings/links/bold/italic/inline-code, and your post's lists + the `` ```
+  `` fence were breaking the output (the fence even corrupted inline-code pairing). That fix
+  benefits future posts too.
+  - Invalidated CloudFront and cleaned up all staging files and screenshots.
+
+  Two small notes:
+  - The post landed in the default **Uncategorized** category (matches your existing "categorize the
+  Claude posts" TODO). Want me to set a category — e.g. *Computer Software*?
+  - `~/website/CLAUDE.md` documents md2html.py's supported features; I can add lists + fenced-code
+  to that list so the doc stays accurate. Say the word.
+
+❯ category - put it in "Computer Software"
+
+  the list of models - include the fourth model (silence detection) and how it's used to keep
+  Voxtral's context from growing without limit
+
+  the repo's README - drop the bit about "The project was previously called", and update the caption
+  on the gif - it's been updated with the right name
+
+  also in the repo's README - move "Pipeline" down further, so "Features" comes right after the
+  animation
+
+● On it — four changes: category, add the 4th model (VAD) to the blog's model list, and two README
+  edits. Let me read the README structure first to plan the Pipeline→below-Features move:
+
+● Let me see where the Features section ends, to place Pipeline after it:
+
+● README sections mapped (Pipeline 45-68, Features 69-114, Configuration 115+). Now I'll do all four
+  changes. Starting with the **blog post — add the 4th model (Silero VAD)** to "How it works":
+
+● 4 numbered items now, VAD as #4. Let me rebuild the HTML (re-substituting the GIF URL),
+  sanity-check, then update the live post and set the category:
+
+● HTML good — 4 sections, 10 list items (6 + 4), VAD as item 4. Now update the live post, set the
+  category, and invalidate:
+
+● Post updated, category is now **Computer Software** (Uncategorized removed). Now the two README
+  edits — drop the "previously called" note, fix the GIF caption, and move Pipeline below Features:
+
+● README restructured: Features now precedes Pipeline, blockquote and stale caption note gone. Let
+  me verify the top reads cleanly, then commit + push:
+
+● README reads cleanly (intro → GIF → caption → views → Features → Pipeline). Committing it and
+  verifying the live blog update:
+
+● All four done. Cleaning up local staging:
+
+● All four changes are done:
+
+  1. **Category** → the post is now in **Computer Software** (Uncategorized removed). Live.
+  2. **4th model added** — the blog's "How it works" now lists **Silero VAD** as a fourth model,
+  framed as a *governor*: it explains that a Voxtral session is one ever-growing sequence that slows
+  and eventually hits a hard length limit, so the VAD recycles the session at natural pauses to
+  throw away accumulated context and keep latency flat. The post is updated live and verified
+  (Silero VAD on the page, all four sections intact, CloudFront invalidated).
+  3. **README caption + rename note** — dropped the "previously called `asr` / `asr-tui.py`"
+  blockquote and the "(header still reads `asr-tui`…)" parenthetical, since the GIF now shows the
+  correct name.
+  4. **README reorder** — `Features` now follows the animation directly; `Pipeline` moved down below
+  it.
+
+  The README commit is local (1 ahead of `origin/main`, not pushed). **Push it?**
+
+  (The blog post at https://www.freesoft.org/blogs/soapbox/freesoft-asr/ is fully live with all the
+  updates — that's already public.)
+
+❯ push it
+
+● Pushed — `origin/main` at `b829f0e`, in sync. The README updates (caption/rename-note removal,
+  Features-before-Pipeline reorder) are now public.
+
+  Everything from this batch is live:
+  - Blog post: **Computer Software** category, the **Silero VAD** fourth-model section, at
+  https://www.freesoft.org/blogs/soapbox/freesoft-asr/
+  - Repo README: cleaned caption + reordered, pushed.
+
+  One loose end: the blog source `blog-freesoft-asr.md` is sitting untracked in `~/asr` (I kept it
+  local rather than committing it to the public code repo). Want me to commit it to the repo as the
+  post's source-of-truth, leave it local, or delete it now that the post is published?
+
+❯ delete it
+
+● Deleted — `~/asr` is now a clean working tree, in sync with `origin/main`.
+
+  The blog post is live and self-contained on freesoft.org, so nothing's lost. That closes out the
+  whole ASR thread for this session: the `freesoft-asr` rename + config/profile/multilingual
+  rewrite, fastText detection installed on pony, the corrected demo GIF, the MIT license, and the
+  published blog post (with the four-model writeup) — all live and pushed.
+
+❯ in the README section "PipeWire setup for the dual-stream RTP path" - I don't know if Pipewire is
+  widely understood.  Add an introductory paragraph explaining its great flexibility, how it's an
+  enhancement of JACK (like a JACK v3 to my mind) and then rolling into how a Pipewire laptop can be
+  configured to dump its audio over the network to a server running the asr program.
+
+● I'll add the intro right after the heading, flowing into the existing RTP paragraph:
+
+● Added. The section now opens with two intro paragraphs before the technical setup:
+
+  > [PipeWire] is the audio (and video) server that underpins most current Linux desktops, and its
+  real strength is routing. Everything … is a node in a graph, and you can connect, split, and
+  re-route those nodes arbitrarily, live… If you know JACK, the low-latency pro-audio server,
+  PipeWire will feel like a natural successor: it adopted JACK's graph model (and speaks its
+  protocol), then folded PulseAudio's everyday mixing and device handling in on top — **to my mind,
+  essentially JACK v3** that also happens to be your ordinary desktop sound system.
+  >
+  > The useful consequence here is that a node in that graph need not be local hardware. PipeWire
+  ships RTP send/receive modules, so any source or sink … can be streamed straight out over the
+  network as UDP. That is exactly how `freesoft-asr` gets fed in the phone-call setup: a PipeWire
+  laptop taps its own audio and dumps it across the LAN to a server (where the GPU lives) running
+  the transcriber…
+
+  It rolls right into the existing "The dual-stream design assumes…" paragraph. Committed locally?
+  Not yet — want me to commit and push it?
+
+❯ push it
+
+● Pushed — `origin/main` at `f34884d`, clean and in sync. The PipeWire intro (flexibility →
+  JACK-successor framing → network-audio-to-GPU-server) is now live in the README's RTP setup
+  section.
+
+❯ one more change: "a PipeWire laptop taps" -> "the phone is Bluetooth-paired to a PipeWire laptop
+  that taps"
+
+● Updated — now reads "the phone is Bluetooth-paired to a PipeWire laptop that taps its own audio
+  and dumps it across the LAN…". Committing:
+
+● Committed (1 ahead of `origin/main`). Push it?
+
+❯ push it
+
+● Pushed — `origin/main` at `722ca79`, clean and in sync. The PipeWire intro now correctly describes
+  the phone being Bluetooth-paired to the laptop that streams its audio to the GPU server.
+
+❯ "If your audio is already on the same machine as Voxtral (no RTP needed), you have two options" -
+  those are four options, not two
+
+● Let me find that line and confirm the actual count before fixing:
+
+● Confirmed — four bullets (default monitor, named source, stdin, multi-stream), but it says "two".
+  Fixing:
+
+● Fixed and committed (1 ahead). Push it?
+
+❯ drop this: "No need to rename your PipeWire nodes to the rtp_call_* names any more", since nobody
+  but me has any memory of this history, then review the entire README for little quirks like this
+
+● Dropping that sentence, then I'll do a full review pass:
+
+● Now the full review — reading the entire README:
+
+● I've read the whole thing. The good news: no machine names, IPs, or private hosts leaked in (the
+  RTP examples use `<receiver-IP>` placeholders). I found **two** more insider-history quirks of the
+  same kind, plus a few borderline items I'd leave. Fixing the two clear ones:
+
+  **Quirk 1** — the marker-MT bullet ends with a cryptic in-joke (`elocuencia` → `I'm not a good
+  speaker`) framed as "No more…", which assumes the reader witnessed that specific bug:
+
+● **Quirk 2** — the `asr-call-transcribe` note is framed around dev chronology ("predates… Kept as
+  the reference design"), which only means something to you:
+
+● Both fixed. Let me commit:
+
+● Committed (2 ahead of `origin/main`). That commit bundles your requested "No need to rename…"
+  removal plus the two I found.
+
+  ## Review results
+
+  **Fixed (insider-history quirks):**
+  1. The "No need to rename your PipeWire nodes to `rtp_call_*` any more" line — gone (your
+  request).
+  2. The marker-MT bullet's `elocuencia` → `I'm not a good speaker` in-joke, framed as "No more…" —
+  replaced with a plain description, since a reader never saw that bug.
+  3. The `asr-call-transcribe` note's "predates… kept as the reference design" dev-chronology —
+  reworded to "an alternative reference implementation."
+
+  **Considered but deliberately kept** (tell me if you want any changed):
+  - **"the author's phone-call setup"** (appears ~4×) — reads fine and legitimately explains why the
+  built-in `dual` profile has the defaults it does. Not confusing to outsiders.
+  - **"Two gotchas learned the hard way"** — common README idiom; signals these are real pitfalls
+  worth heeding.
+  - **"evaluated during the design… Voxtral was chosen"** — answers the natural "why are all these
+  other scripts here?" question.
+  - **"in PipeWire 1.0.5"** — a version-specific caveat that's accurate and useful.
+
+  **One borderline item I'll flag rather than change:** the config examples and Requirements
+  hard-code `~/asr/models/nllb-600m-ct2` — that assumes the repo is cloned to `~/asr`. It's a
+  documented, `--nllb-dir`-overridable default (and the repo *is* named `asr`), so the copy-paste
+  examples stay directly usable. Leave as-is, or genericize?
+
+  No machine names, IPs, or private hosts anywhere in the README — that part's clean. Push these, or
+  want to act on any of the kept/flagged items first?
+
+❯ push it
+
+● Pushed — `origin/main` at `224db44`, clean and in sync. Both README commits are live: the "four
+  options" count fix and the insider-history cleanup (the `rtp_call_*` rename note, the `elocuencia`
+  in-joke, and the `asr-call-transcribe` chronology).
+
+  The README is now public-reader-clean — no dev-history references that assume shared context, and
+  no leaked infra. The flagged `~/asr/models/...` path default is the only thing left untouched
+  (intentionally, so the config examples stay copy-pasteable); say the word anytime if you'd rather
+  genericize it.
+
+❯ add one more thing to the blog post: a section near the end, right before "Try it", explaining
+  that it was vibe-coded with Claude and that transcripts of the Claude sessions are provided in the
+  github repo for those interested in seeing how it was done
+
+● I deleted the local blog source, so I'll reconstruct it (I have the current content), add the
+  section, and update the live post. First let me confirm the session transcripts are in the repo
+  and get the right link path:
+
+● Confirmed — 12 transcripts (May 5–20) tracked and pushed under `sessions/`. They cover the
+  development through the TUI; I'll word the blog section as "the development sessions" (not
+  claiming it's every session, since the recent refactors aren't in there). Reconstructing the post
+  with the new section before "Try it":
+
+● Now convert, verify (should be 5 sections now + the sessions link), and update the live post:
+
+● 5 sections in the right order ("How it was built" sits just before "Try it"), with the
+  `vibe-coded` text and the `sessions/` link. Updating the live post and invalidating:
+
+● Updated and invalidating. Let me verify the new section is live:
+
+● Live and verified. The new **"How it was built"** section is on the page (right before "Try it"),
+  with the *vibe-coded with Claude* note and the link to the
+  [`sessions/`](https://github.com/BrentBaccala/asr/tree/main/sessions) transcripts in the repo.
+
+  The section says the tool was vibe-coded with Claude across conversational sessions, and points
+  readers to the checked-in transcripts "for the dead ends, the debugging, the design arguments." I
+  worded it as "the development sessions" rather than implying *every* session is there — the
+  `sessions/` directory holds the 12 dev-session transcripts through May 20 (the bring-up → Voxtral
+  → TUI arc), not the recent rename/profile refactors or this blog session.
+
+  One option if you want it fully complete: I could format and add the recent sessions (the
+  `freesoft-asr` rename, the `--profile` work, and this session) to `sessions/` too, so the
+  transcript record matches the post's "from first experiments through multilingual support"
+  framing. Want me to, or leave `sessions/` as the May 5–20 snapshot?
+
+❯ add the recent sessions too;  make sure to redact them like the others
+
+● Before I touch anything public, a flag: the **recent sessions are riskier to redact than the May
+  5–20 batch.** This orchestrating session in particular has ranged across the WiFi debug (MACs,
+  SSID, the AP BSSID), the redaction review itself (where I spelled out every secret), and reads of
+  infra docs. `format_session.py`'s default hides tool calls/results and system context (so the big
+  infra dumps and the injected MEMORY.md/JWT won't be in the formatted text), but sensitive values
+  still appear in the conversational prose. So I'll redact comprehensively, re-scan, and show you
+  the result **before** committing/pushing.
+
+  Let me locate the recent sessions and their start times:
+

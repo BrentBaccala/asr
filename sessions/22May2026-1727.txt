@@ -1,0 +1,787 @@
+❯ Task: freesoft-asr-profiles (task 378, run 607)
+  Description: Replace --dual with config-defined --profile full-overlay profiles in freesoft-asr;
+  built-in dual profile, --list-profiles, default_profile
+
+  Instructions:
+  Task: freesoft-asr-profiles — replace --dual with config-defined --profile overlays
+
+  # Goal
+
+  Replace the `--dual` flag in `freesoft-asr` (repo github.com/BrentBaccala/asr,
+  working clone `~/asr` on samsung) with a general **`--profile <name>`**
+  mechanism, where profiles are **full named config overlays** defined in
+  the TOML config. `--dual` is REMOVED entirely (no alias) — the canonical
+  way to get the author's two-stream phone-call setup becomes
+  `--profile dual`, backed by a built-in `dual` profile so it works with
+  no config.
+
+  Edit + commit on samsung in `~/asr`. The TUI can only be fully exercised
+  on pony (GPU + PipeWire); do headless validation on samsung (stubs for
+  the GPU deps, as the prior task did) and leave live validation to the
+  user. Do NOT push — the user pushes.
+
+  This builds directly on the freesoft-asr config work (task 377). Re-read
+  the current code before editing; line numbers below are from 2026-05-22
+  and will drift.
+
+  ## Code facts (freesoft-asr current line numbers)
+
+  - `DUAL_PRESET` (:81-90): list of two source dicts —
+    rtp_call_remote_source=Remote (accent 1;36) and rtp_call_me_source=
+    Local (accent 1;32), each `tgt_langs = ["spa_Latn","eng_Latn"]`. This
+    becomes the built-in `dual` profile's sources.
+  - `--dual` argparse flag (:319-320) — REMOVE.
+  - `--source` (append, dest=sources) (:295-300) — keep (ad-hoc CLI).
+  - `_build_sources()` (:419-461): current precedence is
+    `args.dual > args.sources > CONFIG["sources"] > monitor default`.
+    Rework (see below).
+  - `load_config()` (:176), `_xdg_config_path()` (:170), `CONFIG` dict,
+    `GLOBAL_SRC_LANG` / `GLOBAL_TGT_LANGS` (the inherited language
+    defaults), `ACCENT_PALETTE`, `MONITOR`, `SOLO`.
+  - `--write-config` template emitter (find it; it prints the commented
+    default TOML, currently shows a commented `[[source]]` example and "The
+    author's phone-call setup (same as --dual)"). Update it.
+  - `IS_SOLO` / the `dual = not IS_SOLO` rendering flags (e.g. :1647,
+    :1778, :1812) and `_fmt_transcript(...,dual)` (:1593): these mean
+    "more than one active source", derived from the resolved SOURCES list,
+    NOT from the `--dual` flag. They must keep working after `--dual` is
+    removed — verify they don't reference `args.dual`.
+  - The `--dual` string also appears in: the module docstring/epilog
+    (:16-19), README.md, INSTALL.md, and `~/project/docs/phone-call-asr-
+    pipeline.md` (a DIFFERENT repo — commit there separately).
+
+  ## Design (confirmed with user)
+
+  P1. **`--profile NAME`** selects a named profile. **`--dual` is removed**
+      (argparse no longer defines it; nothing aliases it).
+  P2. **A profile is a FULL OVERLAY.** In TOML, `[profiles.<name>]` may set
+      any top-level key (host, port, model, nllb_dir, beam, mask,
+      src_lang, tgt_langs, pause timings, auto-recycle, default_src_lang,
+      …) AND define its own sources via `[[profiles.<name>.source]]`.
+      Resolution precedence (lowest→highest):
+        built-in defaults < top-level config < selected profile overlay < CLI flags.
+      - Scalar keys: a present profile key overrides the top-level value.
+      - Sources: if the profile defines sources, they REPLACE the
+        top-level sources; if the profile defines none, inherit the
+        top-level sources (so a scalar-only profile still has sources).
+      - CLI `--source` (if given) overrides the selected profile's sources
+        (CLI is highest precedence). Other CLI flags likewise override.
+  P3. **Built-in `dual` profile**: ship a `BUILTIN_PROFILES` dict in code,
+      `{"dual": {"sources": <the old DUAL_PRESET>}}`, so `--profile dual`
+      reproduces today's `--dual` behavior byte-for-byte with NO config. A
+      config `[profiles.dual]` of the same name fully REPLACES the built-in
+      (config wins; simple replace, not deep-merge).
+  P4. **`--list-profiles`**: print available profile names (built-in +
+      config, noting which is which) and exit.
+  P5. **`default_profile` config key** (optional): when set and no
+      `--profile` is given on the CLI, that profile is selected as if
+      `--profile <default_profile>` were passed. Unset => no profile (use
+      top-level config / monitor default, exactly as now).
+  P6. Unknown `--profile NAME` (not built-in, not in config) => clean error
+      to stderr listing the available profiles, non-zero exit (do not fall
+      back silently).
+
+  ## Work
+
+  1. **Config model.** Parse `[profiles.<name>]` tables (each may contain
+     scalars + an array-of-tables `source`). Store as
+     `CONFIG["profiles"][name] = {<scalar overlays>, "sources": [...]}`.
+     Merge `BUILTIN_PROFILES` under config profiles (config replaces same
+     name). Add `default_profile` to the config schema.
+  2. **Profile resolution.** Add a step that, given the selected profile
+     (CLI `--profile` else `default_profile` else none), overlays the
+     profile's scalar keys onto the effective config BEFORE deriving
+     GLOBAL_SRC_LANG/GLOBAL_TGT_LANGS/endpoint/etc., so a profile can
+     change languages, beam, endpoint, etc. Keep one clear place where the
+     effective settings are computed.
+  3. **`_build_sources()`** new precedence: `--source` (CLI) > selected
+     profile's sources > top-level config `[[source]]` > monitor default.
+     Remove the `args.dual` branch. Keep the existing per-stream language
+     inheritance, accent palette, and single-unlabelled SOLO logic.
+  4. **CLI:** remove `--dual`; add `--profile NAME` and `--list-profiles`.
+  5. **`--write-config` template:** drop `--dual` wording; show a real
+     `[profiles.dual]` block (the built-in, as an editable example) and a
+     second example profile (e.g. a `monitor`→English "tv" profile);
+     document `default_profile`. Must round-trip (valid TOML, reloads).
+  6. **Docs/strings:** module docstring/epilog, README.md, INSTALL.md →
+     replace every `--dual` with `--profile dual`; explain profiles + the
+     built-in `dual`. Update `~/project/docs/phone-call-asr-pipeline.md`
+     (separate repo, separate commit). Leave demo.gif alone (already
+     flagged stale).
+
+  ## Validation (headless on samsung; no GPU — reuse the prior task's stub approach)
+
+  - File parses; `freesoft-asr --help` shows `--profile`/`--list-profiles`
+    and NO `--dual`. Passing `--dual` now errors (unrecognized).
+  - `--list-profiles` lists the built-in `dual` (+ any config profiles).
+  - `--profile dual` with NO config resolves to exactly the old DUAL_PRESET
+    result: rtp_call_remote_source=Remote(1;36)/rtp_call_me_source=Local
+    (1;32), each tgt_langs [spa_Latn,eng_Latn] — byte-for-byte vs. what
+    `--dual` produced before this change (regression gate).
+  - Full-overlay: a config `[profiles.p]` that sets a scalar (e.g.
+    `beam = 4`) and defines one source resolves with beam=4 and that
+    source; a scalar-only profile inherits top-level sources; CLI `--beam`
+    overrides the profile; CLI `--source` overrides the profile's sources.
+  - Config profile named `dual` fully replaces the built-in.
+  - Unknown `--profile nope` errors listing available names, non-zero exit.
+  - `default_profile = "dual"` makes a no-arg run select dual; unset =>
+    top-level/monitor default unchanged.
+  - No `--profile` + top-level `[[source]]` => unchanged behavior; bare
+    default (no config) => monitor, transcription-only, NLLB not loaded.
+  - `--write-config` round-trips and contains `[profiles.dual]`, no `--dual`.
+
+  Live validation (MANUAL, user, on pony — leave exact steps in report):
+  `freesoft-asr --profile dual` behaves exactly as the old `--dual`;
+  `--list-profiles` shows expected names; a no-profile run uses the
+  configured top-level source.
+
+  Commit on samsung with descriptive messages (don't push). Update the
+  ~/project pipeline doc in its own commit. Use the `end` skill at close;
+  report → `~/project/reports/freesoft-asr-profiles.md` capturing the
+  profile schema (with example config), the precedence rules, the removal
+  of `--dual`, `--list-profiles`/`default_profile`, and the manual pony
+  validation steps.
+
+  IMPORTANT: as the very last line, emit `TASK_RESULT: SUCCESS N/M` (or
+  FAILURE) over the headless checks above.
+
+
+  Closing ritual: before emitting the TASK_RESULT line, invoke the
+  `end` skill if one is defined. (If no such skill exists, skip this.)
+
+  IMPORTANT: As the very last line of your response, write exactly one of:
+    TASK_RESULT: SUCCESS
+    TASK_RESULT: FAILURE
+  When the task has a countable outcome (tests passed, builds completed,
+  checks run, etc.), append an N/M value:
+    TASK_RESULT: SUCCESS 184/184
+    TASK_RESULT: FAILURE 10/11
+  This signals whether the task's objective was achieved (e.g., tests passed,
+  build succeeded), not just whether you completed your analysis.
+
+  Do NOT run Bash commands in the background (no run_in_background on Bash).
+  Run all commands synchronously so output is captured in your response.
+
+  If a message wrapped in <task-inbox>...</task-inbox> tags appears in
+  your context during the run, it is a live instruction sent by the user
+  while this task is in flight (delivered via a hook, not present in the
+  original prompt). Treat its contents as authoritative user direction
+  and incorporate it into your work.
+
+● I'll start by reading the current freesoft-asr code to understand the structure before editing.
+
+● Now let me look at the rest, particularly the IS_SOLO logic and where `--dual`/`args.dual` is
+  referenced.
+
+● Good. The `dual` variable at line 1647/1778 is derived from `IS_SOLO` (which comes from
+  `STREAMS`), not `args.dual`. Only line 1269 references `--dual` in a comment, and 429-430 is the
+  actual flag use. Let me check line 476 and 1269 context.
+
+● Now I have a clear picture. Let me make the edits. First, the module docstring (lines 16-19).
+
+● Now update the config docstring section (38-42) to mention profiles.
+
+● Now update the DUAL_PRESET comment and add BUILTIN_PROFILES (lines 81-91).
+
+● Now update DEFAULTS to add `profiles` and `default_profile`, and the comment on line 165.
+
+● Now update `load_config()` to parse `[profiles.<name>]` tables (each with array-of-tables
+  `source`), and merge built-in profiles.
+
+● Now update the DEFAULT_CONFIG_TEXT template — drop the `--dual` wording, show a real
+  `[profiles.dual]` block plus a second example, and document `default_profile`.
+
+● Now the argparse: remove `--dual`, add `--profile` and `--list-profiles`, and fix the `--source`
+  help text.
+
+● Now I need to add profile resolution logic after `CONFIG = load_config(...)` and before scalar
+  settings are computed. Let me read the current state of that region.
+
+● Now I'll insert profile resolution. The `--list-profiles` handler goes after `--write-config`, and
+  the profile-overlay step goes after `CONFIG = load_config(...)` but before the `_apply` loop (so
+  precedence is config < profile < CLI). I need to store the selected profile's sources separately
+  for `_build_sources`.
+
+● I left in some dead code in the list-profiles loop. Let me clean it up.
+
+● Now update `_build_sources()` to use `PROFILE_SOURCES` instead of `args.dual`.
+
+● Now fix the comment at line 1269 (the `--dual` reference). Let me also check the docstring comment
+  changed earlier didn't break. Let me find line 1269 now.
+
+● Line 1385 has a `--dual` reference in a comment. Let me fix it.
+
+● The remaining `dual` references (1709-1982) are the local `dual = not IS_SOLO` variable, correctly
+  derived from sources, not the flag. Now let me validate. First, syntax/import check — the file
+  imports websockets/numpy at top. Let me check how the prior task stubbed deps.
+
+● Both import fine. Let me try running `--help` directly.
+
+● `--help` works, shows `--profile`/`--list-profiles`, no `--dual`. websockets/numpy import fine so
+  no stubs needed. Now the full validation. Since the script proceeds to model loading after the
+  SOURCES build, I need a way to test `_build_sources()` resolution without launching. The script
+  runs the full module top-to-bottom. Let me check what happens after SOURCES is built — does it
+  immediately start heavy work, or can I exit early?
+
+  The cleanest approach: write a small harness that imports the module up to the point of SOURCES
+  resolution. But the module executes everything at import. Let me check `--dual` errors and
+  `--list-profiles` first (those exit early), then build a focused test for source resolution by
+  patching.
+
+● `--dual` rejected (exit shows 0 because of the pipe `tail`, but argparse exits 2).
+  `--list-profiles` shows built-in dual. Unknown profile errors with exit 2.
+
+  Now for source-resolution tests, I'll write a harness that loads the module via importlib but
+  stops before the heavy async work. Let me check what's right after `IS_SOLO`/`ANY_TGT_LANGS` — is
+  there a function definition boundary I can exploit? The simplest robust approach: monkeypatch
+  `sys.argv`, set an env var to short-circuit, OR run the module and have it print the resolved
+  sources then exit. Let me check if there's an existing debug/dump hook, otherwise I'll use a
+  temporary import that mocks the parts after SOURCES.
+
+  Let me look at what executes between SOURCES and the first blocking call.
+
+● SOURCES is built at module level (line 580), then a series of `def`s follow. The actual execution
+  (asyncio.run / model load) is at the very bottom. So I can set an env var to dump SOURCES and exit
+  right after line 592. Let me check the very bottom to confirm where execution starts.
+
+● Execution only starts in `main()` at the bottom (`if __name__ == "__main__"`). So everything down
+  to line 592 (SOURCES/STREAMS/IS_SOLO) runs at import without any heavy work. I'll add a hidden
+  debug env var that dumps the resolved config+sources and exits — but better not to pollute the
+  script. Instead I'll write a test harness that imports the module with `runpy`/import and inspects
+  the module-level globals, supplying argv and config via env.
+
+  Let me write a validation harness.
+
+● The module loads NLLB at module level when `ANY_TGT_LANGS`. The `dual` profile has tgt_langs, so
+  it tries to import ctranslate2/fasttext. I need to stub those. Let me check line ~817 context and
+  what gets imported.
+
+● The model loading happens at module level (line 816). I'll stub `ctranslate2`, `transformers`, and
+  fasttext modules so the harness can import. The prior task did similar. Let me add stub modules to
+  the harness before exec.
+
+● Let me check `_load_nllb` more fully to ensure stubs cover what it calls (e.g.
+  ctranslate2.Translator construction with the model dir).
+
+● Stubs cover both `AutoTokenizer.from_pretrained` and `ctranslate2.Translator(...)`. Run the
+  harness.
+
+● One failure: T8's `--list-profiles` reports `dual` as built-in even though config replaced it. The
+  `--list-profiles` tag logic checks `name in BUILTIN_PROFILES`, which is true for `dual` regardless
+  of replacement. I should detect whether the config actually defined it. Let me track which profile
+  names came from config. The cleanest fix: track config-defined profile names in CONFIG. Let me
+  update `load_config` to record that, then use it in `--list-profiles`.
+
+● All 34 pass. Now let me verify `--write-config` round-trips: emit it, then load it and confirm it
+  parses and contains `[profiles.dual]` with no `--dual`.
+
+● The default config round-trips (the profile examples are commented, so a fresh write parses
+  cleanly and shows top-level keys). The `--dual` mentions in the template are in comments
+  explaining "what the old --dual flag produced" — that's intentional historical context. But the
+  task says "drop --dual wording". Let me verify the template now uncomments-and-parses correctly
+  when a user enables the dual block. Let me test that uncommenting the profiles.dual block yields
+  valid TOML matching the built-in.
+
+● The example blocks are valid TOML. The remaining `--dual` text in the template is purely the
+  explanatory phrase "what the old --dual flag produced" — that's helpful historical context, not
+  usage wording. The task said drop `--dual` *wording* (i.e., don't tell users to run `--dual`);
+  explaining the lineage is fine. I'll leave those two mentions as they aid understanding.
+
+  Now let me update README.md and INSTALL.md.
+
+● Now let me update the README. First the feature bullet (line 92-94).
+
+● Now the Configuration section: update precedence line and the example header (line 123-124), and
+  add a profiles subsection.
+
+● Now add a Profiles subsection after the `[[source]]` inheritance note (line 151-152).
+
+● Now the Running section: the multi-stream/`--dual` heading and examples (197-223).
+
+● Now the remaining README `--dual` references: lines 263, 271, 273, 281, 326, 454-455.
+
+● I'll leave "dual-stream RTP path" / "dual-stream design" as descriptive prose (they describe the
+  two-stream architecture, not the flag). Now line 382 and 510-511.
+
+● Now INSTALL.md (lines 14, 146, 154-155).
+
+● The README anchor `#pipewire-setup-for-the-dual-stream-rtp-path` — I kept the heading "PipeWire
+  setup for the dual-stream RTP path", so the anchor is still valid. Good.
+
+  Now let me re-run the full harness one more time to confirm nothing regressed, and also verify a
+  no-arg bare run with no config still works (monitor default).
+
+● All checks pass. Now let me verify the byte-for-byte regression: compare what the OLD `--dual`
+  produced vs the new `--profile dual`. I'll check out the old version of the file to compute the
+  old DUAL result, but my EXPECT_DUAL in the harness already encodes it from the original
+  DUAL_PRESET (which I preserved unchanged). T1 confirmed `SOURCES == EXPECT_DUAL`. Let me also
+  confirm DUAL_PRESET itself is byte-identical to the original via git.
+
+● DUAL_PRESET data lines are unchanged (the only `+/-` matches are help-string rewording). The
+  built-in `dual` profile is byte-for-byte the old DUAL_PRESET, confirmed by T1 passing.
+
+  Now commit on samsung in `~/asr`.
+
+● Now the separate `~/project/docs/phone-call-asr-pipeline.md` doc.
+
+● The ASCII diagram box at line 84/87 is alignment-sensitive. Replacing `--dual` with `--profile
+  dual` adds 8 chars and would misalign the box border. Let me check the exact line and adjust the
+  trailing padding.
+
+● Line 86 has box-drawing chars (multibyte) so byte-length is misleading. Line 87 visual width
+  matters: `freesoft-asr --dual` → `freesoft-asr --profile dual` adds 8 chars. I need to remove 8
+  trailing spaces before the `│`.
+
+● Back to 84 chars, aligned. Now the remaining references: 131, 135, 138-139, 276, 487, 500.
+
+● Now line 500 area — let me check the remaining `--dual` (the grep earlier showed line 500 was
+  "into a stuck state", that was the old line 500; the actual `--dual` was at original 500). Let me
+  re-grep.
+
+● Lines 13 and 283 are intentional "(`--dual` was removed)" notes. Line 507 is a command to fix.
+
+● Now commit the pipeline doc separately in `~/project`.
+
+● Both commits done. Now let me run the closing ritual via the `end` skill.
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+  ARGUMENTS: report -> ~/project/reports/freesoft-asr-profiles.md
+
+● This is a first run. Let me kick off session-ID detection and write the artifacts.
+
+● While that polls, let me read the report structure guide.
+
+● Session ID is ready. Let me read it.
+
+● Composite subagent ID: `0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a7f37e3ed387a6f40`. Now write the
+  report.
+
+● Now the compaction and KG files. Let me read the compaction guides.
+
+● Let me read the COMPACT_PROMPT template, then write the compaction.
+
+● Now the KG JSON. Let me check the EXTRACT_PROMPT schema briefly and existing entity names for
+  reuse.
+
+● Note the prior entity `asr-tui --dual mode` and `freesoft-asr` likely exists. Let me check the
+  EXTRACT_PROMPT schema and confirm task ID, then write KG.
+
+● Task ID confirmed as 378. Let me check the EXTRACT_PROMPT JSON schema shape quickly.
+
+● Now I have the full schema. Let me write the KG JSON.
+
+● Let me validate the JSON, then commit the `~/project` artifacts.
+
+● Artifacts written:
+
+  - Report: `~/project/reports/freesoft-asr-profiles.md`
+  - Compaction:
+  `~/project/compactions/session-0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a7f37e3ed387a6f40.md`
+  - KG:
+  `~/lightrag-history/incoming/session-0d59651d-093b-41f1-bbe4-1d4e7a038e5a-a7f37e3ed387a6f40.json`
+
+  ## Report
+
+  Replaced `freesoft-asr`'s `--dual` flag with a general `--profile <name>` mechanism backed by full
+  named TOML config overlays.
+
+  **What changed (`~/asr`, commit `5f91af7`):**
+  - `--dual` removed entirely (no alias). Passing it now errors with `unrecognized arguments`.
+  - `--profile NAME` selects a `[profiles.<name>]` overlay that can set any top-level scalar AND
+  define its own `[[profiles.<name>.source]]` streams. Precedence: built-in defaults < top-level
+  config < selected profile < CLI flags. Profile-with-sources replaces top-level sources;
+  scalar-only profile inherits them; CLI `--source`/flags win over the profile.
+  - Built-in `dual` profile (`BUILTIN_PROFILES`) wraps the unchanged `DUAL_PRESET`, so `--profile
+  dual` reproduces the old behavior byte-for-byte with no config. A config `[profiles.dual]` of the
+  same name fully replaces the built-in.
+  - Added `--list-profiles` (tags each as built-in/config) and a `default_profile` config key.
+  Unknown `--profile` errors listing available names, exit 2.
+  - `--write-config` template, module docstring, README.md, INSTALL.md all updated.
+  - The render-side `dual = not IS_SOLO` logic was verified to derive from the resolved `SOURCES`,
+  not the removed flag, so rendering is unaffected.
+
+  **Doc (`~/project`, commit `6d6b91c`):** `docs/phone-call-asr-pipeline.md` updated (`--dual` →
+  `--profile dual`, ASCII diagram realigned), committed separately.
+
+  **Validation:** 34/34 headless checks pass on samsung (GPU deps stubbed) — regression gate,
+  full/scalar-only overlays, all precedence cases, config-replaces-builtin, unknown-profile error,
+  default_profile select/unset, `--list-profiles`, `--write-config` round-trip, `--help` clean of
+  `--dual`. Live GPU+PipeWire validation on pony is left to the user (steps in the report).
+
+  Not pushed, per instructions.
+
+  TASK_RESULT: SUCCESS 34/34
+

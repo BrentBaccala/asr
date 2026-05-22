@@ -516,6 +516,10 @@ two-source plumbing.
 Setup commands for recreating any of these venvs and downloading the
 models they need are in **[INSTALL.md](INSTALL.md#recreating-the-alternative-venvs-and-models)**.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ---
 
 *This repository is developed with the assistance of an AI agent

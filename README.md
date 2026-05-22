@@ -9,17 +9,11 @@ languages all come from a TOML file (and/or CLI flags), so it works for
 anything from "transcribe whatever's playing on this machine" to
 multi-channel multilingual phone-call transcription.
 
-> The project was previously called `asr` / `asr-tui.py`; the script is
-> now `freesoft-asr` and the config lives under `~/.config/freesoft-asr/`.
-> The git repo is still named `asr`.
-
 ![freesoft-asr transcribing a bilingual phone call in real time](demo.gif)
 
 *Above: a live call to an automated bilingual hotline. `[Remote]` (cyan)
 is the far end, `[Local]` (green) is the near end; each shows the raw
-Voxtral transcription plus inline Spanish and English translation. (The
-header bar in this recording still reads `asr-tui` — it predates the
-rename and will be refreshed.)*
+Voxtral transcription plus inline Spanish and English translation.*
 
 Each stream renders a **Live** row (raw Voxtral output, any language,
 possibly code-switched) plus **one row per configured target language**
@@ -41,30 +35,6 @@ below. Sentence-level *marker-MT* (NLLB receives the whole accumulated
 Spanish with `[1] [2] [3]` markers between visual chunks) keeps the
 per-chunk translations coherent and aligned, rather than fragmented
 into context-free pieces.
-
-## Pipeline
-
-```
-audio (S16LE 16 kHz mono)
-   → Voxtral-Mini-4B-Realtime-2602    (vLLM /v1/realtime WS, GPU)   ─┐
-                                                                      │ raw text deltas
-   ← cur_live (raw, possibly code-switched) ← ← ← ← ← ← ← ← ← ← ← ← ←┘
-   → fastText lid.176 once per sentence → detected source language
-                                          (skipped if src_lang pinned)
-   → NLLB-200-distilled-600M int8     (CTranslate2, CPU, batched)
-                                       target_prefix=[[tgt1],[tgt2],…]
-   → live preview: cur_tr[tgt] (masked tail), one per target
-   → marker-MT at sentence boundaries → chunk-aligned per-target backfill
-                                       into the scrolling history pane
-```
-
-(The fastText + NLLB stages run only for streams that have target
-languages; a transcription-only stream stops after the Voxtral row.)
-
-The cascade (rather than direct speech-to-text-translation) is
-deliberate: it keeps NLLB entirely on CPU so all the GPU goes to
-Voxtral, and the raw `Live` text stays visible alongside the cleaned
-ES/EN.
 
 ## Features
 
@@ -111,6 +81,30 @@ ES/EN.
   crashes the EngineCore around 22 minutes of continuous audio per
   session.
 - **`--plain`** headless mode for logging and validation.
+
+## Pipeline
+
+```
+audio (S16LE 16 kHz mono)
+   → Voxtral-Mini-4B-Realtime-2602    (vLLM /v1/realtime WS, GPU)   ─┐
+                                                                      │ raw text deltas
+   ← cur_live (raw, possibly code-switched) ← ← ← ← ← ← ← ← ← ← ← ← ←┘
+   → fastText lid.176 once per sentence → detected source language
+                                          (skipped if src_lang pinned)
+   → NLLB-200-distilled-600M int8     (CTranslate2, CPU, batched)
+                                       target_prefix=[[tgt1],[tgt2],…]
+   → live preview: cur_tr[tgt] (masked tail), one per target
+   → marker-MT at sentence boundaries → chunk-aligned per-target backfill
+                                       into the scrolling history pane
+```
+
+(The fastText + NLLB stages run only for streams that have target
+languages; a transcription-only stream stops after the Voxtral row.)
+
+The cascade (rather than direct speech-to-text-translation) is
+deliberate: it keeps NLLB entirely on CPU so all the GPU goes to
+Voxtral, and the raw `Live` text stays visible alongside the cleaned
+ES/EN.
 
 ## Configuration
 

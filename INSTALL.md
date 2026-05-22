@@ -1,9 +1,13 @@
 # Installation
 
-Runtime setup for `asr-tui.py` on a Linux host with PipeWire and a
+Runtime setup for `freesoft-asr` on a Linux host with PipeWire and a
 CUDA GPU. Assumes the repo is already cloned to `~/asr`. What follows
-is the venvs and the NLLB model file — none of which are shipped in
+is the venvs and the model files — none of which are shipped in
 the repo (too large to track).
+
+> Translation models are only needed if you actually translate. A bare
+> `freesoft-asr` (transcription-only of the default sink monitor) needs
+> just the vLLM Voxtral endpoint — not NLLB or fastText.
 
 ## Prerequisites
 
@@ -17,13 +21,13 @@ the repo (too large to track).
 
 ## The two required venvs
 
-`asr-tui.py` needs two Python venvs at fixed paths (the script
+`freesoft-asr` needs two Python venvs at fixed paths (the script
 shebangs and the systemd unit's `ExecStart` reference them
 absolutely):
 
 | Venv | Role | Size |
 |---|---|---|
-| `~/asr/mt-env` | `asr-tui.py`'s interpreter — NLLB translation, WS client, TUI | ~5 GB |
+| `~/asr/mt-env` | `freesoft-asr`'s interpreter — NLLB translation, WS client, TUI | ~5 GB |
 | `~/asr/vllm-env` | vLLM serving Voxtral on `/v1/realtime` | ~7 GB |
 
 ### `mt-env`
@@ -31,8 +35,14 @@ absolutely):
 ```bash
 uv venv --python 3.12 ~/asr/mt-env
 ~/.local/bin/uv pip install --python ~/asr/mt-env/bin/python \
-    transformers ctranslate2 websockets silero-vad onnxruntime numpy torch
+    transformers ctranslate2 websockets silero-vad onnxruntime numpy torch \
+    fasttext-langdetect
 ```
+
+`fasttext-langdetect` (or `fasttext-wheel` + a local `lid.176.ftz`)
+provides the per-sentence source-language detection. It's optional: if
+absent, translation falls back to `default_src_lang` with a warning, and
+transcription-only runs don't use it at all.
 
 ### `vllm-env`
 
@@ -44,11 +54,12 @@ uv venv --python 3.12 ~/asr/vllm-env
 vLLM brings ~200 transitive dependencies; install takes several
 minutes on a fresh cache.
 
-## The NLLB model
+## The NLLB model (only if you translate)
 
-`asr-tui.py` expects an int8-quantised CTranslate2 conversion of
-NLLB-200-distilled-600M at `~/asr/models/nllb-600m-ct2/`. Convert
-inside `mt-env` (which has `ct2-transformers-converter`):
+`freesoft-asr` expects an int8-quantised CTranslate2 conversion of
+NLLB-200-distilled-600M at `~/asr/models/nllb-600m-ct2/` (or wherever
+`nllb_dir` / `--nllb-dir` points). Convert inside `mt-env` (which has
+`ct2-transformers-converter`):
 
 ```bash
 ~/asr/mt-env/bin/ct2-transformers-converter \
@@ -58,7 +69,20 @@ inside `mt-env` (which has `ct2-transformers-converter`):
 ```
 
 Downloads ~1.2 GB from HuggingFace, produces a ~600 MB CT2 directory.
-Takes ~5 minutes.
+Takes ~5 minutes. Skip this entirely for transcription-only use.
+
+## The fastText language-id model (optional)
+
+Per-sentence source-language detection uses fastText `lid.176`. The
+`fasttext-langdetect` wrapper downloads its own model on first use, so
+nothing extra is needed there. If you instead use raw `fasttext-wheel`,
+fetch the ~917 KB model and point `FASTTEXT_LID_MODEL` at it (or drop it
+at `~/asr/models/lid.176.ftz`):
+
+```bash
+curl -L -o ~/asr/models/lid.176.ftz \
+    https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+```
 
 ## vLLM as a systemd user service
 
@@ -89,7 +113,7 @@ systemctl --user enable voxtral       # also start at user-session boot
 ```
 
 The unit auto-restarts on crash (handles the
-`--max-model-len` assertion if `asr-tui`'s VAD-driven recycle ever
+`--max-model-len` assertion if `freesoft-asr`'s VAD-driven recycle ever
 misses one), and exposes `PATH=~/asr/vllm-env/bin:...` so the
 PIECEWISE cudagraph compile pass can find `ninja`.
 
@@ -99,20 +123,22 @@ hand in a terminal — `cat ~/asr/systemd/voxtral.service` has it.
 ## First run
 
 ```bash
-~/asr/asr-tui.py --dual         # if PipeWire RTP sources are set up
-# or single-stream:
+~/asr/freesoft-asr                  # transcribe the default sink monitor
+~/asr/freesoft-asr --dual           # if PipeWire RTP sources are set up
+# or single-stream from stdin:
 pw-record --target <your-source> --format=s16 --rate=16000 \
-          --channels=1 - | ~/asr/asr-tui.py
+          --channels=1 - | ~/asr/freesoft-asr --source -
 ```
 
-`asr-tui.py --help` documents the CLI knobs with current defaults.
-The PipeWire setup for the `--dual` RTP sources is in
+`freesoft-asr --help` documents the CLI knobs with current defaults, and
+`freesoft-asr --write-config` emits a commented starter config. The
+PipeWire setup for the `--dual` RTP sources is in
 [README.md](README.md#pipewire-setup-for-the-dual-stream-rtp-path).
 
 ## Recreating the alternative venvs and models
 
 The other `stream-*.py` scripts in the repo aren't required for
-`asr-tui.py`. They're kept as reference implementations of different
+`freesoft-asr`. They're kept as reference implementations of different
 ASR engines and latency/quality trade-offs (see the table in
 [README.md](README.md#alternative-streaming-scripts-in-this-repo-for-reference)).
 Their venvs aren't shipped either — recreate them only if you want

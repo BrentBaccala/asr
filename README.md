@@ -1,26 +1,40 @@
-# asr — live streaming speech recognition with inline translation
+# freesoft-asr — live streaming speech recognition with inline translation
 
-A terminal UI (`asr-tui.py`) that transcribes audio in real time using
-**Voxtral-Mini-4B-Realtime** (served by vLLM, GPU) and translates the
-transcription into **Spanish and English** with
-**NLLB-200-distilled-600M** (CTranslate2 int8, CPU). Designed for live
-two-channel phone-call transcription with separately-labelled
-`[Remote]` and `[Local]` streams, but the single-stream path works with
-any local or piped audio source.
+A terminal UI (`freesoft-asr`) that transcribes audio in real time using
+**Voxtral-Mini-4B-Realtime** (served by vLLM, GPU) and, optionally,
+translates each completed sentence into one or more configured target
+languages with **NLLB-200-distilled-600M** (CTranslate2 int8, CPU). It
+is **config-file driven**: sources, endpoint, model, and per-stream
+languages all come from a TOML file (and/or CLI flags), so it works for
+anything from "transcribe whatever's playing on this machine" to
+multi-channel multilingual phone-call transcription.
 
-![asr-tui transcribing a bilingual phone call in real time](demo.gif)
+> The project was previously called `asr` / `asr-tui.py`; the script is
+> now `freesoft-asr` and the config lives under `~/.config/freesoft-asr/`.
+> The git repo is still named `asr`.
+
+![freesoft-asr transcribing a bilingual phone call in real time](demo.gif)
 
 *Above: a live call to an automated bilingual hotline. `[Remote]` (cyan)
 is the far end, `[Local]` (green) is the near end; each shows the raw
-Voxtral transcription plus inline Spanish and English translation.*
+Voxtral transcription plus inline Spanish and English translation. (The
+header bar in this recording still reads `asr-tui` — it predates the
+rename and will be refreshed.)*
 
-Three views per channel render in the live panel:
+Each stream renders a **Live** row (raw Voxtral output, any language,
+possibly code-switched) plus **one row per configured target language**
+(NLLB translation, masked-tail live preview):
 
 ```
 [Remote] Live ▸  raw Voxtral output (any language; possibly code-switched)
-         ES   ▸  NLLB-cleaned Spanish translation (masked-tail live preview)
-         EN   ▸  NLLB English translation         (masked-tail live preview)
+         ES   ▸  NLLB Spanish translation (masked-tail live preview)
+         EN   ▸  NLLB English translation (masked-tail live preview)
 ```
+
+A stream with **no** target languages is transcription-only and renders
+just the Live row. With **no config and no flags**, that is the default:
+a single stream capturing the default sink monitor, transcription only —
+NLLB is not even loaded.
 
 Finalized sentences interleave into a scrolling speaker-tagged history
 below. Sentence-level *marker-MT* (NLLB receives the whole accumulated
@@ -35,12 +49,17 @@ audio (S16LE 16 kHz mono)
    → Voxtral-Mini-4B-Realtime-2602    (vLLM /v1/realtime WS, GPU)   ─┐
                                                                       │ raw text deltas
    ← cur_live (raw, possibly code-switched) ← ← ← ← ← ← ← ← ← ← ← ← ←┘
+   → fastText lid.176 once per sentence → detected source language
+                                          (skipped if src_lang pinned)
    → NLLB-200-distilled-600M int8     (CTranslate2, CPU, batched)
-                                       target_prefix=[[spa],[eng]]
-   → live preview: cur_es, cur_en (masked tail)
-   → marker-MT at sentence boundaries → chunk-aligned ES/EN backfill
+                                       target_prefix=[[tgt1],[tgt2],…]
+   → live preview: cur_tr[tgt] (masked tail), one per target
+   → marker-MT at sentence boundaries → chunk-aligned per-target backfill
                                        into the scrolling history pane
 ```
+
+(The fastText + NLLB stages run only for streams that have target
+languages; a transcription-only stream stops after the Voxtral row.)
 
 The cascade (rather than direct speech-to-text-translation) is
 deliberate: it keeps NLLB entirely on CPU so all the GPU goes to
@@ -49,14 +68,30 @@ ES/EN.
 
 ## Features
 
-- **Three-line live region per stream**; interleaved speaker-tagged
-  history.
+- **Config-file driven** — a TOML file (default
+  `~/.config/freesoft-asr/config.toml`) sets the endpoint, model,
+  sources, and per-stream languages. CLI flags override the file;
+  `freesoft-asr --write-config` emits a fully-commented starter config.
+- **Generic, per-stream sources** — each source picks an audio target
+  (`-` stdin, `monitor` default-sink monitor, or a PipeWire node name),
+  a label/colour, an optional `src_lang`, and a list of target languages.
+- **Per-stream multilingual translation** — translate one stream into
+  any number of languages; the live region and history grow one row per
+  target. Default = transcription-only (no NLLB load) until you ask for
+  targets.
+- **Per-sentence source-language auto-detection** (fastText lid.176) —
+  each completed sentence's language is detected once and fed to NLLB,
+  so code-switched calls translate correctly. Pin `src_lang` to disable.
+- **Live region per stream** (Live + one row per target); interleaved
+  speaker-tagged history.
 - **Whole-sentence marker-MT** — chunks become visible as they're
   spoken (`⋯` placeholder), then backfill with proper chunk-aligned
   translation when the sentence completes. No more `elocuencia` →
   `I'm not a good speaker` from context-free fragments.
-- **Dual-stream concurrent transcription** (`--dual`) — two
-  independent vLLM sessions, separately auto-recycled per stream.
+- **Multi-stream concurrent transcription** — independent vLLM sessions
+  per source, separately auto-recycled. `--dual` is a built-in preset
+  expanding to the author's two RTP phone-call sources (Remote + Local,
+  each Spanish→{Spanish,English}).
 - **Scrollback** — mouse wheel + ↑/↓/PgUp/PgDn/Home/End on the
   history pane. Live region keeps updating regardless.
 - **Ctrl-L** clears the history and recycles the WS sessions (frees
@@ -73,60 +108,133 @@ ES/EN.
   session.
 - **`--plain`** headless mode for logging and validation.
 
-## Running
+## Configuration
 
-### Single-stream (any audio source piped to stdin)
+`freesoft-asr` reads a TOML file at
+`$XDG_CONFIG_HOME/freesoft-asr/config.toml` (default
+`~/.config/freesoft-asr/config.toml`). Precedence is **built-in defaults
+< config file < CLI flags**. Generate a fully-commented starter file:
 
 ```bash
-your_audio_source | ./asr-tui.py
+freesoft-asr --write-config          # writes to the standard path
+freesoft-asr --write-config --config ./my.toml
+```
+
+Every key mirrors a CLI flag (snake_case). Example config expressing the
+author's phone-call setup (the same as `--dual`) plus a third target on
+one stream:
+
+```toml
+host  = "127.0.0.1"
+port  = 8000
+model = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+nllb_dir = "~/asr/models/nllb-600m-ct2"
+
+# Fallback source language used only if fastText is unavailable AND no
+# src_lang is pinned. Otherwise the source language is auto-detected
+# per sentence.
+default_src_lang = "eng_Latn"
+
+[[source]]
+target    = "rtp_call_remote_source"
+label     = "Remote"
+accent    = "1;36"                  # cyan
+tgt_langs = ["spa_Latn", "eng_Latn"]
+
+[[source]]
+target    = "rtp_call_me_source"
+label     = "Local"
+accent    = "1;32"                  # green
+tgt_langs = ["spa_Latn", "eng_Latn", "fra_Latn"]
+```
+
+A `[[source]]` inherits the global `src_lang` / `tgt_langs` unless it
+overrides them. An empty `tgt_langs` makes a stream transcription-only.
+
+## Running
+
+### Default — transcribe whatever's playing (transcription only)
+
+```bash
+freesoft-asr
+```
+
+With no config and no flags this captures the **default sink's monitor**
+(via `pw-record -P stream.capture.sink=true`) and shows just the Live
+row — no translation, NLLB not loaded.
+
+### Single-stream from stdin (any audio source)
+
+```bash
+your_audio_source | freesoft-asr --source -
 ```
 
 The audio must be **S16LE mono at 16 kHz**. With PipeWire:
 
 ```bash
 pw-record --target <your-source> --format=s16 --rate=16000 \
-          --channels=1 - | ./asr-tui.py
+          --channels=1 - | freesoft-asr --source -
 ```
 
 With ALSA / arecord:
 
 ```bash
-arecord -f S16_LE -r 16000 -c 1 -D <your-device> | ./asr-tui.py
+arecord -f S16_LE -r 16000 -c 1 -D <your-device> | freesoft-asr --source -
 ```
 
 From a file:
 
 ```bash
-sox input.wav -t raw -r 16000 -c 1 -b 16 -e signed-integer - | ./asr-tui.py
+sox input.wav -t raw -r 16000 -c 1 -b 16 -e signed-integer - | freesoft-asr --source -
 ```
 
-### Dual-stream
+Add translation with `--tgt-lang` (repeatable):
 
 ```bash
-./asr-tui.py --dual
+your_audio_source | freesoft-asr --source - --tgt-lang eng_Latn --tgt-lang fra_Latn
 ```
 
-This spawns its own `pw-record` subprocesses targeting the PipeWire
-sources **`rtp_call_remote_source`** and **`rtp_call_me_source`**, and
-opens two independent Voxtral WS sessions concurrently. The source
-names are hard-wired in the script's `DUAL_SOURCES` constant (near
-the top); you can either configure PipeWire to expose your sources
-under those names (see below), or edit the constant for your setup.
+### Multi-stream and the `--dual` preset
+
+Repeat `--source TARGET[=LABEL]` for several streams:
+
+```bash
+freesoft-asr --source 'rtp_call_remote_source=Remote' \
+             --source 'rtp_call_me_source=Local' \
+             --tgt-lang spa_Latn --tgt-lang eng_Latn
+```
+
+`--dual` is a built-in preset for exactly the author's phone-call setup —
+the PipeWire sources **`rtp_call_remote_source`** (Remote, cyan) and
+**`rtp_call_me_source`** (Local, green), each translating into Spanish +
+English:
+
+```bash
+freesoft-asr --dual
+```
+
+Either configure PipeWire to expose your sources under those names (see
+below), or use `--source` / a `[[source]]` config with your own names.
 
 ### Headless / `--plain`
 
 ```bash
-./asr-tui.py [--dual] --plain
+freesoft-asr [--dual] --plain
 ```
 
-Skips the alt-screen TUI and prints `[spk] Live/ES/EN` triples on
-stdout per finalized chunk. Useful for piping into a logger.
+Skips the alt-screen TUI and prints `[spk] Live` + one row per target
+language on stdout per finalized chunk. Useful for piping into a logger.
 
 ### CLI knobs
 
-Run `./asr-tui.py --help` for the full list with current defaults.
+Run `freesoft-asr --help` for the full list with current defaults.
 Highlights:
 
+- `--config PATH` / `--write-config` — point at / generate a config file.
+- `--source TARGET[=LABEL]` — add an audio source (repeatable).
+- `--tgt-lang CODE` / `--src-lang CODE` / `--no-translate` — global
+  language controls (per-stream control lives in the config).
+- `--host` / `--port` / `--model` / `--nllb-dir` — endpoint + models.
 - `--pause-ms` / `--sentence-close-ms` — two-tier pause behaviour
   (short pause flushes a visual chunk; long pause closes the sentence
   and triggers marker-MT).
@@ -141,15 +249,20 @@ Highlights:
 ## Requirements
 
 - **vLLM serving Voxtral-Mini-4B-Realtime** on
-  `127.0.0.1:8000/v1/realtime` (host/port configurable at the top of
-  `asr-tui.py`).
+  `127.0.0.1:8000/v1/realtime` (host/port set via config or
+  `--host`/`--port`).
 - An **NLLB-200-distilled-600M int8 CTranslate2** model at
-  `./models/nllb-600m-ct2/`.
+  `~/asr/models/nllb-600m-ct2/` (or `--nllb-dir`) — **only needed if you
+  translate**. Transcription-only runs don't load it.
+- **fastText lid.176** (`fasttext-wheel` or `fasttext-langdetect`) for
+  per-sentence source-language detection — only needed if you translate
+  *and* don't pin `src_lang`. Degrades to `default_src_lang` with a
+  warning if missing.
 - A **CUDA GPU** with ≥ 16 GB VRAM (Voxtral weights + KV cache at
   `--max-model-len 16384`).
-- **PipeWire** (Linux) for the `--dual` audio capture; single-stream
-  mode works with any audio source piped to stdin (PipeWire, ALSA,
-  sox, ffmpeg, etc.).
+- **PipeWire** (Linux) for the `monitor` / named-source / `--dual` audio
+  capture; the `--source -` stdin path works with any audio source
+  (PipeWire, ALSA, sox, ffmpeg, etc.).
 
 End-to-end setup — venvs, model conversion, the optional vLLM systemd
 unit, and recreating the alternative venvs for the reference scripts
@@ -161,11 +274,11 @@ The dual-stream design assumes the two audio channels arrive as
 **RTP streams** from a sender host — e.g. a desktop with a phone
 paired over Bluetooth that taps the analog sink monitor (remote-party
 voice) and the analog mic capture (local voice), shipping each as a
-UDP RTP stream to the receiver running `asr-tui.py`. This makes the
+UDP RTP stream to the receiver running `freesoft-asr`. This makes the
 transcribing machine independent of where the audio source actually
 lives (and lets you run the GPU on a separate, more powerful host).
 
-### On the receiver (the machine running `asr-tui.py --dual`)
+### On the receiver (the machine running `freesoft-asr --dual`)
 
 Drop this into
 `~/.config/pipewire/pipewire.conf.d/91-rtp-call-stream-source.conf`:
@@ -210,7 +323,7 @@ context.modules = [
 
 Then restart PipeWire (`systemctl --user restart pipewire wireplumber
 pipewire-pulse`) or log out and back in. Verify with `pw-cli ls Node |
-grep rtp_call_` — both sources should appear. `asr-tui.py --dual`
+grep rtp_call_` — both sources should appear. `freesoft-asr --dual`
 will then find them by name and start streaming.
 
 `pw-record`'s own resampler converts 48 kHz stereo down to 16 kHz
@@ -306,23 +419,21 @@ sender-side action.
 If your audio is already on the same machine as Voxtral (no RTP
 needed), you have two options:
 
-- **Single-stream mode** — pipe your audio in on stdin:
-  ```bash
-  pw-record --target <your-source-or-monitor> --format=s16 \
-            --rate=16000 --channels=1 - | ./asr-tui.py
-  ```
-  The 3-line `Live`/`ES`/`EN` TUI works the same; you just have one
-  stream instead of two.
-- **Dual-stream mode with local sources** — either configure PipeWire
-  to expose your two sources under the canonical names
-  (`rtp_call_remote_source` and `rtp_call_me_source`), or edit
-  `DUAL_SOURCES` in `asr-tui.py` to point at your local source names.
+- **Default monitor** — just run `freesoft-asr` (no args) to transcribe
+  the default sink's monitor.
+- **A named PipeWire source** — `freesoft-asr --source <node-name>` (or
+  `--source <node-name>=Label`), optionally with `--tgt-lang`.
+- **stdin** — `pw-record --target <src> --format=s16 --rate=16000
+  --channels=1 - | freesoft-asr --source -`.
+- **Multi-stream with local sources** — repeat `--source` for each, or
+  list them as `[[source]]` tables in the config. No need to rename your
+  PipeWire nodes to the `rtp_call_*` names any more.
 
 ## Alternative streaming scripts (in this repo for reference)
 
 The repo also contains several standalone `stream-*.py` scripts that
 explore different ASR engines and latency/quality trade-offs. They
-were evaluated during the design of `asr-tui.py`; Voxtral was chosen
+were evaluated during the design of `freesoft-asr`; Voxtral was chosen
 for the final TUI. Each is self-contained — reads raw 16-bit-LE mono
 16 kHz PCM on stdin and prints transcripts on stdout.
 
@@ -341,7 +452,7 @@ for the final TUI. Each is self-contained — reads raw 16-bit-LE mono
 | `stream-cacheaware.py` | NeMo fastconformer | true cache-aware English streaming |
 
 `asr-call-transcribe` is a faster-whisper dual-stream transcriber
-that predates `asr-tui.py --dual`. Same `rtp_call_remote_source` /
+that predates `freesoft-asr --dual`. Same `rtp_call_remote_source` /
 `rtp_call_me_source` audio-input architecture but with whisper
 instead of Voxtral + NLLB. Kept as the reference design for the
 two-source plumbing.

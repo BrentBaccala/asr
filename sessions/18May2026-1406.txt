@@ -1,0 +1,198 @@
+❯ you're a task orchestrator.  run task 370.  when it's done, run task 371
+
+● Task 370 (`parallel-bba-serial-lset-physical-erase`) is launched and running in the background as
+  agent `a6e704e77fcdbf41a` (opus, run 600).
+
+  This is a build+test-heavy task (singular-dev-cycle: out-of-tree build × main+TSan, serial
+  regression, parallel correctness at T=2/T=4, TSan races, output-equivalence), so it'll take a
+  while. I'll get a completion notification — when it lands I'll `--complete` it, and task 371
+  (`parallel-bba-serial-lset-physical-erase-profile`) will become ready since it depends on 370.
+  I'll then run 371 automatically per your instruction.
+
+  Nothing more to do until the notification arrives.
+
+● Task 370 completed successfully (knob committed as `2a13a6be3`, all gates green). Task 371 is now
+  ready. Launching it per your instruction.
+
+● Both tasks are now handled:
+
+  - **Task 370** (`parallel-bba-serial-lset-physical-erase`) — ✅ completed, committed as `2a13a6be3`
+  on `parallel-bba`. All build/test gates green; knob `SINGULAR_BENCH_SERIAL_LSET_ERASE` proven
+  active at T=1 with byte-identical output, parallel mode TSan-clean vs baseline.
+  - **Task 371** (`parallel-bba-serial-lset-physical-erase-profile`) — 🔄 launched in background
+  (agent `a95e17fb727c0cea5`, opus, run 601). This is the c200-1 perf-matrix profile task; it'll
+  power up c200-1, run the 4-config matrix, produce the findings report via the `end` skill, and
+  power c200-1 back down.
+
+  I'll get a completion notification when 371 finishes and will `--complete` it then. Nothing more
+  to do until then.
+
+● Both tasks are complete.
+
+  **Task 370 — `parallel-bba-serial-lset-physical-erase`** ✅
+  Added `SINGULAR_BENCH_SERIAL_LSET_ERASE` knob, committed `2a13a6be3` on `parallel-bba`. All gates
+  green; default `tombstone` is a true no-op, `physical` proven active at T=1 with byte-identical
+  output, parallel mode TSan-clean vs baseline.
+
+  **Task 371 — `parallel-bba-serial-lset-physical-erase-profile`** ✅ (4/4)
+  Report at `~/project/reports/parallel-bba-serial-lset-physical-erase-profile.md`. Headline result
+  (medians, byte-identical output):
+
+  | Config | Wall | IPC |
+  |---|---:|---:|
+  | tombstone+off | 22.66 s | 1.13 |
+  | tombstone+everypop | 16.99 s | 1.47 |
+  | **physical** | **13.98 s** | **1.67** |
+  | next-opt | 10.45 s | 1.73 |
+
+  Serial physical erase beats tombstone+everypop by **−3.01 s** and closes 46% of the task-369 gap
+  to next-opt (residual +3.53 s = irreducible container/layout overhead). **Recommendation: switch
+  the serial default to `physical`**, superseding task 369's rec #1.
+
+  Two process notes worth flagging:
+
+  1. **c200-1 was left powered ON.** It was already up (2 h uptime) before task 371 started, so the
+  agent reasonably skipped the power-down step (the prompt premised it on this task bringing the
+  host up). But c200-1 is now drawing wall power and idle — say the word if you want me to run
+  `c200-power` to shut it down.
+  2. The agent hit a gap in the `end` skill's subagent session-ID poller (its `find -maxdepth 2`
+  doesn't reach the subagent JSONL path) and worked around it. Minor, but it'll recur for every
+  task-runner subagent that invokes `end` — worth a fix to the skill at some point.
+
+  No further tasks became ready. Want me to power down c200-1?
+
+❯ run task 372
+
+● Different task — desk-research on streaming Spanish ASR (general-purpose agent, no dependencies).
+  Preparing and launching.
+
+● Task 372 (`es-streaming-asr-research`) launched in the background — agent `addca368308235ebc`
+  (opus, run 602). Desk-research only: models-landscape sweep, IPA→Spanish P2G analysis, path-B
+  word-boundary feasibility, data/licensing re-verification, single-3090 training numbers, and a
+  contrarian section, delivered as a findings report at
+  `~/project/reports/es-streaming-asr-research.md` via the `end` skill.
+
+  I'll `--complete` it when the completion notification arrives.
+
+● Task 372 (`es-streaming-asr-research`) completed successfully. Report at
+  `~/project/reports/es-streaming-asr-research.md`.
+
+  **Verdict: the "B-first" plan should change.** The research found an off-the-shelf model the prior
+  session missed (it postdates that search and lives in the vLLM/transformers world, not
+  NVIDIA/icefall):
+
+  **`mistralai/Voxtral-Mini-4B-Realtime-2602`** (Mistral, Feb 2026) — natively streaming,
+  multilingual incl. Spanish, **grapheme/text output**, Apache-2.0, configurable 80 ms–2.4 s delay
+  (480 ms sweet spot), **3.31 % FLEURS-es WER at 480 ms**. Fits a single 3090 (~8 GB BF16; the cited
+  "~35 GB" is a vLLM KV-cache reservation artifact, not a model floor). This likely makes the whole
+  A–D build unnecessary.
+
+  Supporting points:
+  - Confirmed on pony: bookbot vocab is exactly 37 tokens, no word-boundary token (path B really
+  does need to add one), and it emits Castilian θ → a seseo train/test mismatch for Latin-American
+  conversational Spanish the prior analysis missed.
+  - Path B's tensor surgery is sound but stacked errors (P2G ~3–8% + boundary error + Castilian
+  mismatch) push effective telephone-band WER into double digits — worse than Voxtral.
+  - No large free telephone-band conversational Spanish corpus exists (re-confirmed). Fisher remains
+  paid LDC.
+
+  **Ranked rec:** (1) Voxtral, zero training; (2) hybrid no-train fallback; (3) corrected path C
+  (skip IPA); reject A, demote B; D feasible but pointless.
+
+  **Decisive cheap experiment:** run Voxtral on a 30–60 s real telephone-band Spanish clip on pony
+  at delay=480 ms vs the buffered-whisper baseline (~1–2 h, no training). Blocker flagged: there's
+  no telephone-Spanish test fixture on pony yet — that must be created first, and it blocks
+  validating *any* path.
+
+  No dependent tasks became ready. Two recurring process notes from this batch worth acting on at
+  some point:
+
+  - The `end` skill's subagent session-ID poller keeps failing in this account (wrong search root —
+  it looks under `~/project/sessions/subagents/` but the jsonl is under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`). Hit by tasks 370, 371, and 372. Each agent
+  worked around it manually, but it's a real bug in the skill.
+  - c200-1 is still powered on (from the task 371 note earlier).
+
+  Want me to fix the `end`-skill poller, power down c200-1, or both?
+
+❯ fix the end-skill poller
+
+● Confirmed the bug. The real-time subagent JSONL lives at
+  `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl` (depth 4 under
+  `~/.claude/projects/`). The poller's first `find` caps at `-maxdepth 2` so it never reaches it,
+  and its second `find` targets `~/project/sessions/subagents/` — which is only populated by the
+  task-runner's `--complete` *backup hardlink*, created **after** the subagent exits, so it doesn't
+  exist yet while `end` runs inside the subagent. Hence the timeout. The path-translation `case` is
+  also wrong for the real layout (parent dir is *above* `subagents/`, not below).
+
+  Fixing the poller, the path translation, the re-run verification, and the docs:
+
+● Now the re-run verification (Step 1 of Re-run procedure) has the same wrong path assumption:
+
+● Let me sanity-check the corrected path translation against the real on-disk layout:
+
+● All three path shapes translate correctly and `-maxdepth 4` reaches the live subagent JSONL.
+  Committing:
+
+● Fixed and committed (`e8f92d1` in `~/project`).
+
+  **What was wrong:** the `end` skill's session-ID poller searched `~/.claude/projects/` only to
+  `-maxdepth 2` and otherwise relied on `~/project/sessions/subagents/`. But Claude Code writes the
+  *live* subagent JSONL to `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl` (depth
+  4), and the `~/project/sessions/subagents/` copy is a backup hardlink that `task_runner.py
+  --complete` only creates *after* the subagent exits — so during an `end` run inside a subagent,
+  neither location matched the marker. Poller timed out → fallback to parent UUID → multiple
+  subagents collapsing into one compaction filename. That's what bit tasks 370, 371, and 372.
+
+  **The fix:**
+  - First `find` bumped to `-maxdepth 4` so it reaches the live subagent JSONL.
+  - Path-translation `case` gained a distinct arm for the live layout
+  (`<parent>/subagents/agent-*.jsonl`, parent *above* `subagents/`) vs the backup layout
+  (`subagents/<parent>/agent-*.jsonl`, parent *below*). The backup `find` is kept as a harmless
+  post-`--complete` re-run fallback.
+  - Re-run Step 1 verification now checks both live and backup paths.
+  - Docs rewritten to explain the real-time-vs-backup distinction so the next person doesn't
+  reintroduce the `maxdepth 2` assumption.
+
+  Verified all three path shapes (live subagent, backup hardlink, top-level) translate to the
+  correct composite/UUID against the actual on-disk layout, and that `-maxdepth 4` reaches the live
+  file.
+
+  Still outstanding from earlier: **c200-1 is powered on** (left up by task 371 since it was already
+  running). Want me to shut it down via `c200-power`?
+
+❯ you're a task orchestrator.  run task 373.  when it's done, run task 374
+
+● Same pattern: 373 (implementation) → 374 (profile, depends on 373). Launching 373.
+
+● Task 373 (`parallel-bba-sevflat-single-deletion-record`) launched in the background — agent
+  `a36eeb62559d23c5f` (opus, run 603). This is a substantial structural refactor (collapse the two
+  deletion records into one atomic `sev_flat_` sentinel, delete `LObject.deleted`, strip
+  `writable_set` of deletion) with the full singular-dev-cycle gate set including the critical TSan
+  atomic-discipline check — it'll take a while.
+
+  The `end`-skill poller fix I committed earlier (`e8f92d1`) is now in place, so this run's closing
+  ritual should derive its own composite session ID correctly instead of timing out.
+
+  I'll `--complete` 373 when the notification arrives, then 374 (`...-profile`) becomes ready and
+  I'll run it per your instruction.
+
+❯ run task 375 in parallel with the other two
+
+● Task 375 is independent desk research (general-purpose, no deps, no GPU/c200-1/Singular conflict
+  with 373/374) — safe to run concurrently. Launching it now alongside the running 373.
+
+● Both now running concurrently:
+
+  - **373** `parallel-bba-sevflat-single-deletion-record` — running (agent `a36eeb...`, opus) — the
+  Singular refactor + singular-dev-cycle gates
+  - **375** `es-en-streaming-translation-research` — running (agent `ad2516...`, opus) — independent
+  desk research, no resource overlap with 373
+  - **374** `...-profile` — pending, blocked on 373 (will run after 373 completes, per your earlier
+  instruction)
+
+  No conflict between 373 and 375 (375 is web research + seconds-scale pony inspection only; 373 is
+  Singular-parallel-bba build/test on samsung). I'll get separate completion notifications. When
+  **373** finishes I'll `--complete` it and launch **374**; when **375** finishes I'll `--complete`
+  it (nothing chained off it). Both `end`-skill closing rituals will use the fixed poller.
+

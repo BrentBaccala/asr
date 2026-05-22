@@ -1,0 +1,2261 @@
+❯ load the compaction from yesterday about voice recognition on pony
+
+● Found it — `session-7f9f7657-af04-4fda-a75e-a351c6e52ad0.md` (May 5, 18:22) is the only May-5
+  compaction that mentions voice/whisper/speech. Loading it now.
+
+● Loaded. Yesterday's compaction (May 5, 18:22 — `session-7f9f7657-af04-4fda-a75e-a351c6e52ad0.md`)
+  covers the **phone-call → pony ASR pipeline** design session. Quick recap:
+
+  **Goal:** route [REDACTED-DEVICE] call audio to pony for speakerphone playback + real-time
+  bilingual (ES/EN) transcription on its RTX 3090.
+
+  **State at session end:**
+  - Audio stack (PipeWire/WirePlumber/bluez/mpv) up on pony; `cosine` owns `/dev/snd/*`, claude's
+  pipewire is masked persistently to stop login-respawn from stealing the device.
+  - `~/asr-env/` venv with `huggingface_hub` only.
+  - Overnight `download-models.timer` scheduled `Wed 2026-05-06 04:00 EDT` for:
+  faster-whisper-large-v3, opus-mt-es-en, canary-1b-flash, canary-1b-v2 (~12 GB). Pony TZ switched
+  UTC → America/New_York; claude linger re-enabled.
+  - Findings doc: `~/project/docs/phone-asr-pipeline-design.md`.
+
+  **Blockers:**
+  - **No antenna** on pony's BCM20702 BT (combo card, bare reverse-SMA). Single biggest hardware
+  block.
+  - **BT speaker-only call audio doesn't exist** structurally (A2DP can't carry calls;
+  HFP/HSP/LE-Unicast all bidirectional).
+  - **Android 15 + Moto blocks all 3rd-party call-audio capture** — `AudioPlaybackCapture` excludes
+  call audio. Live Caption is the one untested silver lining.
+
+  **Pending:** antenna purchase, 3.5mm mic for pony pink jack, test Live Caption on the Moto,
+  pip-install runtime deps (`faster-whisper ctranslate2 transformers sentencepiece sacremoses torch
+  nemo_toolkit[asr]`), write WirePlumber HFP→analog rule under cosine, write `asr-transcribe.py`,
+  A/B the four models.
+
+  Today is 2026-05-06 — the overnight download should have fired ~04:00 EDT. Want me to ssh pony and
+  check `~/download-models.log`?
+
+❯ i tested Live Caption on the phone and I couldn't get it to do anything
+
+● That tracks — Live Caption on non-Pixel Android is hit-or-miss, and Moto's build of Android 15 is
+  one of the spottier ones. A 30-second checklist before giving up:
+
+  1. **Settings → Sound & vibration → Live Caption** (or **Settings → Accessibility → Live
+  Caption**). Toggle on. First time, it has to download the on-device speech model — needs wifi and
+  a few minutes.
+  2. **Inside that screen, "Live Caption in calls"** is a *separate* toggle and ships off by
+  default. The main toggle handles media; the calls toggle is what you actually need.
+  3. **Volume rocker shortcut**: press volume up/down, then tap the little speech-bubble icon under
+  the slider. If that icon doesn't appear at all during a call, Live Caption isn't enabled on the
+  call audio stream on this device — that's the most common Moto failure mode.
+  4. **Language**: only English is supported by default; Spanish requires manually downloading the
+  ES speech model from inside the Live Caption settings, and on some Moto builds that option
+  silently isn't there.
+
+  If none of (1)–(3) light up the captions during an actual call, Live Caption-on-calls is genuinely
+  not implemented on your Moto build — Motorola is known to ship Android 15 with Google's
+  accessibility plumbing partially gutted.
+
+  If it's a no-go, the pipeline reverts to the original plan (phone → pony via BT-HFP, or 3.5mm
+  splitter into pony's pink jack), which means the antenna is back to being the critical blocker.
+  Has it arrived? Want me to check this morning's download log on pony in the meantime?
+
+❯ waiting for the antenna.  let's start testing it out, though.  I've got a USB microphone attached
+  to pony and the models have downloaded
+
+● Let me check pony's current state — models, mic, runtime deps, audio ownership.
+
+● Status check is good news:
+
+  - **Models**: all 4 downloaded clean overnight (16 GB total cache, finished 05:05 EDT)
+  - **Mic**: Blue Snowball USB (card 2, `hw:Snowball,0`) — solid choice, cardioid USB condenser
+  - **Runtime deps**: nothing installed yet. `~/asr-env/` only has `huggingface_hub`. Need
+  `faster-whisper` (~200 MB) and for canary, `torch` + `nemo_toolkit[asr]` (~3-4 GB).
+  - **cosine's pipewire isn't reachable from my ssh** (no X11/dbus session under sudo) — that's a
+  routing thing, not a problem for first tests since claude is in the `audio` group and can hit ALSA
+  directly via `arecord`.
+
+  Proposed first test: skip pipewire entirely for now, record a few seconds with `arecord` straight
+  from the Snowball, run it through faster-whisper offline, see if transcription works at all. Then
+  iterate to streaming and to canary. This sidesteps the cosine-vs-claude audio-ownership question
+  for the smoke test.
+
+  Kicking off the install + a 5-second mic test in parallel.
+
+● Both worked. Mic captured 5 sec @ 16kHz mono (matches expected 160044 bytes), and faster-whisper
+  installed with the full stack (ctranslate2, av, onnxruntime, tokenizers — no torch needed;
+  ctranslate2 has its own CUDA backend).
+
+  Let me run faster-whisper on that test recording to confirm GPU + model load. The recording was
+  likely silent (you didn't know it was happening), but this'll prove the stack works end-to-end
+  before we do a real speech test.
+
+● Model loaded fine (8 s — large-v3 weights into VRAM), but ctranslate2 can't find
+  `libcublas.so.12`. Pony has the GPU driver but maybe not the user-space CUDA libs. Let me check.
+
+● Pony has only the NVIDIA driver — no CUDA toolkit, no cuBLAS, no cuDNN. ctranslate2 needs
+  cuBLAS+cuDNN. Cleanest fix is the pip wheels (~1.3 GB, scoped to the venv).
+
+● pip is still downloading (1.3 GB at ~3 MB/s). Let me wait for it.
+
+❯ [Request interrupted by user]
+
+❯ what's cuBLAS+cuDNN?
+
+● Quick definitions:
+
+  - **cuBLAS** — NVIDIA's CUDA BLAS library. BLAS = Basic Linear Algebra Subprograms (matrix
+  multiply, vector add, dot product, etc.). It's the GPU-side equivalent of Intel MKL or OpenBLAS —
+  every framework that does heavy linear algebra on NVIDIA GPUs eventually calls into cuBLAS for the
+  inner loops.
+
+  - **cuDNN** — NVIDIA's CUDA Deep Neural Network library. Hand-tuned GPU kernels for the operations
+  specific to neural nets: 2D/3D convolutions, attention, RNN cells, batch normalization, softmax,
+  etc. Things that *could* be expressed as a pile of cuBLAS calls but are dramatically faster as
+  fused kernels.
+
+  They're closed-source NVIDIA libraries, shipped as `.so` files. Anything that runs a neural net on
+  an NVIDIA GPU — PyTorch, TensorFlow, ONNX Runtime, ctranslate2, NeMo, llama.cpp's CUDA backend —
+  links against them at runtime.
+
+  The reason we hit this: pony has the **driver** installed (the kernel module that actually talks
+  to the GPU), but the **userspace libraries** are a separate install. The driver alone is enough
+  for `nvidia-smi` to print stats, but not enough to run a model. NVIDIA distributes them three
+  ways: the CUDA toolkit (system-wide), Conda packages, or pip wheels (`nvidia-cublas-cu12`,
+  `nvidia-cudnn-cu12`) that drop the .so files into a venv's site-packages. We picked the pip route
+  because it stays scoped to `~/asr-env/` instead of touching /usr/local.
+
+❯ i tend to think we might want them system-wide
+
+● Reasonable instinct on a multi-user inference host — pony will host more GPU work than just this
+  pipeline (canary needs torch + NeMo, possibly llama.cpp/vllm later, cosine may want them too
+  without recreating a venv). System-wide pays for itself.
+
+  Trade-offs:
+
+  - **Pros system-wide**: shared across users (claude + cosine + future), survives venv rebuilds,
+  one canonical CUDA version on the box.
+  - **Cons system-wide**: needs sudo (have it on pony — passwordless), couples versions across all
+  GPU users, and cuDNN specifically usually means adding NVIDIA's apt repo since Ubuntu universe
+  doesn't ship it.
+
+  Two install routes:
+  1. **Ubuntu universe** — `apt install libcublas12 nvidia-cuda-toolkit`. cuBLAS only. cuDNN not
+  available this way → still need pip wheel for cuDNN.
+  2. **NVIDIA's CUDA apt repo** — adds keyring, then `apt install libcublas-12-X libcudnn9-cuda-12`.
+  Both libs from one source, what NVIDIA officially supports, but adds a third-party repo.
+
+  Recommend option 2 (NVIDIA repo) — it's the supported path and covers both libs. Want me to kill
+  the in-flight pip install and switch? Need your OK before adding the third-party repo, since
+  that's a sudo + persistent-system-state change beyond just installing a package.
+
+❯ go ahead
+
+● ssh is dropping (exit 255 = ssh connection failure). Let me retry.
+
+● NVIDIA has a native `ubuntu2604` repo. Adding the keyring + previewing packages first.
+
+● Keyring landed but cache is empty — NVIDIA's 2604 repo may be a stub. Let me check what it
+  actually contains.
+
+● The 2604 repo is fresh — only ships CUDA 13.x packages. ctranslate2 4.7.1 needs CUDA 12
+  (`libcublas.so.12`), so the 2604 NVIDIA repo doesn't fit cleanly. Let me see what Ubuntu's own
+  universe ships, and what the 2404 NVIDIA repo has.
+
+● Better news — **Ubuntu universe has both libs already**, no third-party repo needed. NVIDIA's 2604
+  only ships CUDA 13 (newer than ctranslate2 supports), but Ubuntu multiverse has:
+  - `libcublas12` 12.4.5.8 — what ctranslate2 needs
+  - `nvidia-cudnn` 9.0.0 — the cuDNN install-script wrapper
+
+  One catch: `nvidia-cudnn` depends on `nvidia-cuda-dev` (CUDA dev toolkit, ~3-4 GB). The
+  nvidia-cudnn package is a downloader-script that pulls the actual cuDNN .deb from NVIDIA at
+  install time, and it needs the dev toolkit for symlink/header targets.
+
+  Let me check the install size before pulling the trigger.
+
+● Install size on Ubuntu universe path: **1.8 GB download → ~5-7 GB on disk**. The reason it's that
+  big: `nvidia-cudnn` is a downloader-script that depends on the full CUDA dev toolkit
+  (`nvidia-cuda-dev`), so we end up pulling the whole CUDA 12.4 dev suite — cublas, cufft, cusparse,
+  cusolver, curand, nppi*, nvjpeg, thrust, cub, headers, etc. — not just cublas + cudnn.
+
+  Three paths:
+
+  1. **Ubuntu universe apt** (1.8 GB / ~5-7 GB disk) — full CUDA 12.4 dev toolkit, apt-tracked,
+  system-wide. Future GPU work on pony (nvcc, building llama.cpp, etc.) needs this anyway.
+  2. **NVIDIA standalone cuDNN .deb + Ubuntu libcublas12** (~700 MB / ~1.5 GB disk) — minimal
+  system-wide, but cuDNN .deb is hand-installed (still apt-trackable, just not from Ubuntu's repo).
+  3. **Pip wheels in the venv** (1.3 GB, scoped to `~/asr-env`) — what we already started; defeats
+  the system-wide goal but simplest.
+
+  Recommend (1) — pony is going to need nvcc and the full toolkit eventually for any GPU
+  build-from-source work, so paying the disk cost once is cheaper than installing piecemeal later.
+  Pony has 96 GB free.
+
+  Your call?
+
+❯ go with option 1
+
+● Kicking off the install. The `nvidia-cudnn` downloader-script has a license-acceptance debconf
+  prompt — I'll preseed it to auto-accept, then run with `DEBIAN_FRONTEND=noninteractive`. Logging
+  to `/tmp/cuda-install.log` so we can tail progress.
+
+● Install running. Setting up a progress monitor.
+
+● Install is downloading 1.8 GB at pony's ~3 MB/s wifi rate, then extracting + running the cuDNN
+  downloader script. Estimate 15-25 min total. Monitor will surface milestones as packages set up.
+  I'll report back when it's done; in the meantime the Snowball mic capture worked, so we know the
+  audio side is fine for testing.
+
+❯ did you clean up any partial downloads in the venv?
+
+● Good catch — let me check.
+
+● Venv is clean — pip never reached extraction. But pip's HTTP cache has 680 MB of the partial
+  download. Purging.
+
+● Cleaned — 710 MB of partial wheels gone. Pip cache now 1.7 MB (just metadata). Venv site-packages
+  was already untouched (kill came before extraction). The cuda apt install is still chugging along
+  in the background.
+
+❯ what is ctranslate2?
+
+● CTranslate2 is a C++ inference engine for Transformer models, originally from the OpenNMT project
+  (Systran's open-source MT lineage). It specializes in **fast, memory-efficient inference** — does
+  its own quantization (int8, int8_float16, float16), graph optimization, and batching, with both
+  CPU and CUDA backends. It competes with PyTorch for the inference half of a model's life: same
+  model weights, but typically 2-4× faster and with smaller memory footprint, especially on CPU.
+
+  It's used here because:
+
+  - **`faster-whisper` is a thin Python wrapper around CTranslate2** that runs OpenAI's Whisper
+  through it instead of PyTorch. The model we downloaded (`Systran/faster-whisper-large-v3`) is just
+  OpenAI's whisper-large-v3 weights pre-converted to CTranslate2's format.
+  - It supports a useful set of model families for our pipeline: Whisper, MarianMT (the
+  `opus-mt-es-en` translator we downloaded), NLLB, M2M-100, plus various LLMs.
+  - It uses **cuBLAS + cuDNN** for the heavy ops on GPU — that's why our missing-CUDA-libs error
+  came from `ctranslate2` rather than from `faster_whisper` itself. CTranslate2 4.x is built against
+  CUDA 12 specifically, which is why we couldn't use NVIDIA's 2604 repo (CUDA 13 only).
+
+  Compare to NeMo (which Canary uses): NeMo runs on PyTorch, with its own optimization stack on top.
+  So our pipeline ends up with two GPU runtimes side by side — CTranslate2 for Whisper+Marian,
+  PyTorch+NeMo for Canary.
+
+❯ what's Canary?
+
+● NVIDIA Canary is a family of **multilingual speech models** released by NVIDIA starting Feb 2024,
+  with `canary-1b-flash` (Mar 2025) and `canary-1b-v2` (Aug 2025) as the variants we downloaded. The
+  thing that makes it interesting for our use case: it's a **single model that does both ASR and
+  translation in one pass** — speak Spanish, get English text directly out, no separate translation
+  hop.
+
+  Architecture and stack:
+
+  - **1 billion parameters**, FastConformer encoder + Transformer decoder, encoder-decoder design.
+  - Distributed via NVIDIA's **NeMo** toolkit — their PyTorch-based speech/NLP framework. So Canary
+  needs `torch` + `nemo_toolkit[asr]` to run, ~3-4 GB of pip deps. (Compare to faster-whisper's
+  CTranslate2 stack, which only needs ctranslate2's CUDA libs.)
+  - Permissive license (CC-BY-4.0), so usable in personal projects.
+  - `canary-1b-flash` is the low-latency / streaming-optimized variant — what you want for live
+  transcription.
+  - `canary-1b-v2` (the newest) bumped language coverage from 4 (en/es/fr/de) to 25.
+
+  Why we downloaded both Canary and faster-whisper:
+
+  | Path | Stack | How it handles ES→EN |
+  |---|---|---|
+  | **faster-whisper-large-v3 + opus-mt-es-en** | CTranslate2 (cuBLAS, cuDNN) | Two hops: Whisper
+  transcribes Spanish → MarianMT translates to English |
+  | **canary-1b-flash / -v2** | NeMo (PyTorch) | Single pass: takes Spanish audio, emits English
+  text |
+
+  At benchmark time, Canary-flash topped the HF Open ASR Leaderboard for its size. Whisper-large-v3
+  is also strong but English-only good (multilingual-decent). The plan is to A/B both on real call
+  audio and pick whichever sounds best on your specific calls — code-switching English/Spanish,
+  accent, telephony bandwidth (8 kHz narrowband if it's PSTN, 16 kHz if HD Voice / VoLTE).
+
+❯ are we ready to run canary or does it need more downloads?
+
+● Not quite — Canary needs more downloads. Status:
+
+  | Component | Status |
+  |---|---|
+  | Model weights (`canary-1b-flash`, `canary-1b-v2`) | ✓ Downloaded overnight, in HF cache |
+  | System CUDA libs (`libcublas12`, `libcudnn9`) | In progress (apt install running) |
+  | **`torch` (PyTorch with CUDA backend)** | **Missing** |
+  | **`nemo_toolkit[asr]`** | **Missing** |
+
+  Once CUDA finishes, Canary needs:
+
+  ```
+  ~/asr-env/bin/pip install nemo_toolkit[asr]
+  ```
+
+  That pulls in roughly 5-6 GB: torch (~2.5 GB, with its own bundled CUDA libs that duplicate the
+  system ones — annoying but not fixable cheaply), plus NeMo's heavy deps (lightning, transformers,
+  omegaconf, hydra-core, librosa, soundfile, sentencepiece, youtokentome, etc.).
+
+  One concern worth flagging: **the venv is on Python 3.14**, and NeMo's last released wheels (as of
+  late 2025) targeted 3.10-3.12. There's a real chance NeMo doesn't have a 3.14-compatible wheel and
+  we'll need to either:
+  1. Source-install (slow, may fail on bleeding-edge dep versions)
+  2. Make a second venv with `python3.12 -m venv ~/asr-env-canary` and run Canary out of that
+
+  We'll find out when we run pip — won't know for sure without trying. Faster-whisper, by contrast,
+  *did* install cleanly on 3.14 (the wheels we got are pure ctranslate2 + tokenizers, both
+  well-supported).
+
+  Suggest: get faster-whisper working end-to-end first (it's the simpler stack, almost there now),
+  then tackle Canary as a separate pass. Sound good?
+
+❯ we need the CUDA libraries for canary, too?
+
+● Good question, and honestly: **no, not for Canary specifically**.
+
+  PyTorch wheels from pytorch.org bundle their own CUDA libraries inside `site-packages/torch/lib/`
+  — `libcublas.so.12`, `libcudnn.so.9`, `libcufft.so.11`, etc., all included. PyTorch loads them via
+  its own dlopen logic and ignores the system ones. So Canary would run on a box with zero system
+  CUDA libs as long as the NVIDIA *driver* is present (which it is — that's what `nvidia-smi`
+  prints).
+
+  The system-wide install benefits:
+
+  - **ctranslate2 (faster-whisper path)** — does *not* bundle CUDA, looks it up on the system loader
+  path. This is why our smoke test failed.
+  - Future GPU build-from-source work on pony (compiling llama.cpp, vllm, custom CUDA kernels,
+  anything using `nvcc`).
+
+  So if we only cared about Canary we'd be skipping this apt install entirely. But the
+  faster-whisper path was the one we picked first because it's lighter-weight (CTranslate2 stack vs
+  PyTorch+NeMo stack), and pony is going to need full CUDA eventually for other GPU work, so it's
+  worth doing once.
+
+  Side effect of doing it system-wide: torch's bundled libs duplicate the system ones (~2 GB of
+  redundancy living inside the venv). Annoying but harmless — torch always uses its bundles, so they
+  don't fight.
+
+❯ and ollama doesn't need the cuda libraries, or what?
+
+● Right, ollama is the same pattern as PyTorch — **bundles its own CUDA runtime**, doesn't touch
+  system libs.
+
+  When you `curl -fsSL https://ollama.com/install.sh | sh`, the installer drops the CUDA libraries
+  alongside the ollama binary in `/usr/local/lib/ollama/cuda_v12/` (or `cuda_v11/` for older GPUs).
+  Ollama's Go runtime detects the GPU at startup, dlopen's the bundled `.so` files, and never looks
+  at the system loader path. That's why ollama has worked fine on pony all along despite no system
+  CUDA install — and why our local-inference setup with qwen3.6 on pony has been running happily.
+
+  The "self-contained CUDA" pattern is the modern norm for shipped ML binaries. ctranslate2 is the
+  unusual one — it deliberately depends on system libs to keep the wheel small (a torch wheel is ~2
+  GB; the ctranslate2 wheel is ~50 MB precisely because it doesn't bundle CUDA).
+
+  Quick taxonomy of what's on pony:
+
+  | Tool | CUDA approach |
+  |---|---|
+  | ollama | Bundled in `/usr/local/lib/ollama/cuda_v12/` |
+  | PyTorch (about to install for Canary) | Bundled in `site-packages/torch/lib/` |
+  | ctranslate2 (faster-whisper) | **System libs required** ← our reason for the apt install |
+  | Future: llama.cpp built from source | System libs needed for nvcc compile |
+  | Future: vllm | Bundled (it's torch-based) |
+
+● Download done — 1.96 GB in 9 min (~3.6 MB/s, better than expected). Now in the unpacking +
+  dpkg-setup phase, plus the cuDNN downloader-script will fetch actual cuDNN binaries from NVIDIA
+  (~600 MB more). Probably 5-10 min until it's fully set up.
+
+● `libcublas12` is set up — that half is done. `nvidia-cudnn` is now in its setup phase, which is
+  when the install-script actually fetches cuDNN from NVIDIA (~600 MB). Almost there.
+
+● cuDNN fetched and installed cleanly (nvidia-cuda-toolkit setting up after means nvidia-cudnn
+  finished). nvcc is now available too. Final ldconfig check coming.
+
+❯ while we're waiting, what kinds of models are available to do stem-splitting on music audio files?
+
+● Active landscape, with a clear winner-or-two:
+
+  | Model | SDR (MUSDB18) | Stack | Notes |
+  |---|---|---|---|
+  | **Demucs / HTDemucs** | ~9-10 dB | PyTorch | The default open-source choice. Hybrid
+  time+spectral. `pip install demucs`, one-line CLI. 4-stem (vocals/drums/bass/other) or 6-stem
+  variant adds guitar+piano. MIT licensed. |
+  | **BS-RoFormer / Mel-RoFormer** | ~10-11 dB | PyTorch | Current state-of-the-art (2024). From the
+  `music-source-separation-training` repo (ZFTurbo). Higher compute than Demucs but the best quality
+  you can get open. |
+  | **MDX-Net family** (UVR-MDX, KUIELAB) | ~9 dB | ONNX/PyTorch | Came out of Sony's Music Demixing
+  Challenges. Strong on vocals specifically. Usually used through Ultimate Vocal Remover (UVR) GUI.
+  |
+  | **SCNet** (Bytedance, 2023) | ~9-10 dB | PyTorch | Sparse compression net; competitive with
+  HTDemucs. |
+  | **Spleeter** (Deezer, 2019) | ~6-7 dB | TensorFlow | The OG. Outdated quality-wise but still
+  works; people use it because the install is easy. |
+  | **Open-Unmix (UMX)** | ~6 dB | PyTorch | Reference baseline, mostly historical. |
+
+  **Wrappers worth knowing:**
+  - **Ultimate Vocal Remover (UVR)** — Windows GUI that bundles Demucs + MDX-Net + RoFormers behind
+  a model picker. Community standard among music producers.
+  - **demucs CLI** — `demucs song.mp3` and you get four WAVs. Simplest path on Linux.
+
+  **SDR** is signal-to-distortion ratio in dB on the standard MUSDB18 benchmark. The difference
+  between 9 dB and 10 dB is noticeable but not dramatic; the difference between Spleeter (~6.5) and
+  Demucs (~9.5) is dramatic.
+
+  **For pony**, with the 3090 already there: `pip install demucs` is probably the right starting
+  point. It auto-downloads weights, runs ~5× realtime on the 3090, and the 6-stem variant is useful
+  if you want piano isolated. If quality matters more than convenience and you're willing to clone a
+  repo + download checkpoints by hand, BS-RoFormer is the better answer.
+
+  What's the use case — karaoke/instrumentals, isolated practice tracks for the keyboard,
+  sample-pulling, something else? That changes which model is actually right.
+
+❯ isolated practice tracks
+
+● For piano practice tracks specifically, you want **HTDemucs 6-stem** (`htdemucs_6s`) — it splits
+  into vocals/drums/bass/guitar/**piano**/other. The 4-stem variant lumps piano into "other" with
+  strings, brass, etc., which is useless for your case.
+
+  The killer-feature workflow for practice: demucs has a `--two-stems STEM` mode that produces *just
+  two files* — the named stem isolated, and everything-else-minus-that-stem. So:
+
+  ```
+  demucs --model htdemucs_6s --two-stems piano song.mp3
+  ```
+
+  …gives you `piano.wav` (to learn the part by ear) and `no_piano.wav` (music-minus-piano backing
+  track to play along with). Exactly the pair a pianist wants.
+
+  **Quality reality check:** The 6-stem model is meaningfully *worse* than the 4-stem on its
+  individual categories. Piano in particular is hard to separate cleanly because (a) it shares
+  harmonic territory with vocals, (b) training data labeled "piano" is sparser than "vocals".
+  Expect:
+  - **Strong-piano genres** (Elton John, Billy Joel, Alicia Keys, jazz piano trios, Joni Mitchell) —
+  works well.
+  - **Textural/pad piano** in dense pop/rock mixes — bleed-through, residual ghost notes, sometimes
+  the model just gives up and routes piano to "other".
+  - **Solo piano works** — don't separate, just use the recording.
+
+  **For your usecase, two practical alternatives worth considering:**
+
+  1. **Moises.ai** (~$5/mo) and **LALAL.AI** (per-track credits) are commercial cloud services that
+  run RoFormer-class models with proprietary fine-tunes. Quality is genuinely better than open
+  htdemucs_6s for piano specifically — they invested in dedicated piano-separation training data. If
+  practice-track quality is the priority and quantity is moderate, the cost is honestly competitive
+  with paying for compute and your own time setting it up.
+
+  2. **Local quality maximum** — clone `ZFTurbo/Music-Source-Separation-Training`, download a 6-stem
+  RoFormer checkpoint trained for it. Better than htdemucs_6s but more setup friction. The 3090 will
+  eat it for breakfast.
+
+  Default I'd suggest: try `demucs --model htdemucs_6s --two-stems piano` on a few songs you
+  actually want to practice, see if the quality is good enough. If it's mediocre on textural pieces
+  but fine on the keyboardy ones, that's normal and probably acceptable for practice. If it's bad
+  across the board, jump to RoFormer or Moises.
+
+  Want me to set up demucs on pony alongside the ASR stack? It's small (~50 MB for the model) and
+  reuses the same torch install we'll be doing for Canary.
+
+❯ what's the monitor that's been running for almost half an hour?
+
+● That's the cuda apt install monitor I set up — task `bkt9rpea3`, watching `/tmp/cuda-install.log`
+  on pony and waiting for the `apt-get` process to exit before emitting a final done-marker. It
+  surfaces only milestone events (Setting-up of key packages, errors, the final marker) so the chat
+  doesn't get spammed by every package's progress.
+
+  The install is still running — we've seen libcublas12, nvidia-cudnn, and nvidia-cuda-toolkit all
+  set up, but no done-marker yet, which means apt is still in trigger-processing (ldconfig, man-db,
+  ca-certificates regen, etc.). Let me check directly.
+
+● Ah — the install actually **finished** already. Both libs are installed and visible to `ldconfig`
+  at `/usr/lib/x86_64-linux-gnu/`. The monitor has a self-referential bug: its `pgrep -f "apt-get
+  install -y libcublas"` is matching the monitor's own bash command (which contains that string
+  inside its quoted body), so the until-loop never exits. Classic shell footgun. Let me stop it.
+
+● Monitor killed. Now let's actually validate what we set out to do — re-run faster-whisper on that
+  earlier test capture, and confirm CUDA + cuBLAS + cuDNN all resolve.
+
+● It works end-to-end on GPU. Big win:
+
+  - **Model load**: 6.5s (large-v3 weights into VRAM via cuBLAS+cuDNN)
+  - **Inference**: 0.6s on 5 sec of audio → **~8× realtime on the 3090**
+
+  The output "Thank you for watching." in Norwegian (p=0.36) is the classic Whisper hallucination on
+  silence — Whisper was trained on a lot of YouTube and that phrase fills its head when there's no
+  real speech. Setting `vad_filter=True` would suppress it on silent input. So the stack works; the
+  input was just empty.
+
+  Time for a real test. Want to record yourself saying something, then we transcribe? Suggested:
+
+  ```
+  ssh claude@pony 'arecord -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 -d 10 /tmp/speech.wav'
+  ```
+
+  10 seconds, mono, 16 kHz (Whisper's native sample rate). Say a sentence in English, then a
+  sentence in Spanish if you want to test code-switching detection. I'll run faster-whisper on it
+  after — both with `language=None` (auto-detect) and explicitly `language="es"` for the Spanish
+  bit, and we can pipe it through the opus-mt-es-en translator too.
+
+  Or if you'd rather skip the manual record step and have me start something more interactive (e.g.
+  a streaming transcriber that emits text live as you speak), say the word and I'll set that up
+  instead. The streaming path is more work — bigger payoff but harder to get right with VAD +
+  chunking.
+
+❯ how about ~baccala/out.pcm?
+
+● Tilde didn't expand inside single quotes. Retry.
+
+❯ [Request interrupted by user]
+
+❯ it's locally here on samsung.  Signed 16 bit Little Endian, Rate 8000 Hz, Mono
+
+● Got it — 8 kHz mono S16_LE is classic PSTN narrowband, so this is phone-call audio. Whisper
+  handles arbitrary input rates internally (resamples to 16 kHz) so the 8 kHz won't be a problem,
+  but quality will reflect what 8 kHz can carry.
+
+  Let me check the file, wrap it in a WAV header, and ship it to pony for transcription.
+
+● 5.8 seconds of phone audio. Wrapping it in a WAV header and shipping to pony.
+
+● Transcribing.
+
+● That's the ITPi Training BBB dial-in IVR prompt — exactly the kind of phone-call audio you want
+  this pipeline working on. 5.8 sec of 8 kHz narrowband telephony audio transcribed cleanly:
+
+  > **"Welcome to ITPi Training. Please enter your conference PIN number followed by the pound
+  sign."**
+
+  - Detected language: English, p=0.94 (high confidence)
+  - Inference: 0.89s on 5.8s of audio → **6.5× realtime on the 3090**
+  - VAD filter on, no hallucinations
+  - 8 kHz narrowband held up fine — Whisper internally upsamples to 16 kHz, and the voice prompt is
+  clean studio-quality telephony so there's no real challenge there.
+
+  The pipeline is now proven end-to-end on file input: audio → faster-whisper → text. Half the goal.
+
+  Possible next steps, in increasing complexity:
+
+  1. **Try a longer / harder sample** — got any saved call recordings with actual conversation,
+  accents, or Spanish bits to test the harder cases?
+  2. **Add the ES→EN translation hop** with opus-mt-es-en. Small (~300 MB on disk, <100 MB to
+  pip-install transformers + sentencepiece). Validates the bilingual side of the pipeline.
+  3. **Streaming transcription** from the Snowball mic — proper VAD-driven chunking so text appears
+  as you speak. Bigger payoff but more code to get right.
+  4. **Canary path** — install torch + nemo_toolkit[asr] (~5-6 GB, may hit the Python 3.14 wall),
+  run the same audio through canary-1b-flash for an A/B comparison.
+
+  What sounds most useful?
+
+❯ let's move on to #3
+
+● Plan: pipe `arecord` from the Snowball into a Python script on pony that runs Silero VAD
+  frame-by-frame, accumulates each speech utterance, and runs faster-whisper when silence is
+  detected. Text appears with ~500-700 ms latency after each utterance ends.
+
+  Two pieces:
+  1. Install `silero-vad` (small ONNX model + python wrapper, ~50 MB)
+  2. Write `~/asr-stream.py` on pony
+
+● While the install finishes — usage will be:
+
+  ```bash
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr-env/bin/python ~/asr-stream.py'
+  ```
+
+  Speak into the Snowball, pause for ~500 ms between utterances, and each utterance will appear as
+  one line:
+
+  ```
+  loading silero-vad...
+  loading faster-whisper-large-v3...
+  ready, listening...
+  [en | 2.3s in / 0.4s asr] hello world this is a test
+  [es | 1.8s in / 0.3s asr] hola cómo estás
+  ```
+
+  The first column is detected language, the second is utterance duration in seconds, the third is
+  GPU inference time. ^C to stop.
+
+● silero-vad 6.2.1 installed clean (no torch dep — the new versions made torch optional). Let me
+  smoke-test the script before handing it to you. Quick run with EOF on stdin to confirm models
+  load.
+
+● Smoke test passed — both models load clean, script exits on EOF. Ready for your live test:
+
+  ```bash
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr-env/bin/python ~/asr-stream.py'
+  ```
+
+  Loading takes ~10 sec, then `ready, listening...` prints to stderr. Speak into the Snowball (pause
+  ~500 ms between thoughts so VAD knows where utterances end), and each utterance will print as one
+  line. Mix English + Spanish if you want to see code-switching. ^C to stop.
+
+❯ it seems to be working.  any way to make it respond without waiting to detect the end of an
+  uterance?
+
+● Yes — but it's a trade-off, because Whisper is fundamentally an **offline model**: it expects a
+  complete 30-second chunk and re-encodes from scratch every time, so it has no native concept of
+  "partial transcription." There are three real options:
+
+  **1. Just lower the VAD silence threshold.** Smallest change — drop `min_silence_duration_ms` from
+  500 to 200. Snappier perceived response between utterances, but still emits one chunk at a time.
+  Doesn't actually emit text mid-utterance.
+
+  **2. Sliding-window streaming (the standard Whisper-streaming trick).** Every ~1 sec while speech
+  is ongoing, re-transcribe the audio collected so far, and emit text. Catch: each re-transcription
+  may *change* what was said earlier as more context arrives — Whisper's decoder is non-causal. The
+  polished version of this is **Local Agreement-2** (Macháček et al., 2023): only commit text that
+  two consecutive transcriptions agree on; the unstable tail gets reprinted each cycle. Result: text
+  appears within 1-2 sec of being spoken, occasionally back-corrects. There's a `whisper_streaming`
+  package or I can write it inline (~100 lines). Encoder pass on 5-10 sec audio takes ~150-300 ms on
+  the 3090 — fits in a 1 sec loop.
+
+  **3. Switch to a streaming-native model.** Whisper wasn't designed for this; **NVIDIA
+  Parakeet-TDT** and similar RNN-T models *were*. They emit tokens per audio frame with ~200 ms
+  latency, no re-transcription needed. Catch: Parakeet-TDT-0.6b-v2 (the model we abandoned
+  mid-download yesterday because of the multilingual requirement) is **English-only**. Multilingual
+  streaming-native ASR exists but is mostly behind cloud APIs (AssemblyAI, Riva). Canary's streaming
+  variant exists but is heavier.
+
+  **Practical recommendation for your use case:**
+
+  - **For phone-call transcription** (your actual goal): #2 with Local Agreement is the right
+  answer. Sub-second perceived latency, multilingual, runs locally. The text occasionally
+  back-corrects, but for a transcript-of-a-phone-call this is fine — you're reading after the fact
+  anyway.
+  - **If you want bleeding-edge live captioning** with no back-correction at all: #3 with Parakeet
+  (English) is the snappiest.
+  - **Quick try-first**: #1 (just shorten the silence threshold) takes 30 seconds. Tells you if your
+  bottleneck is actually the VAD wait or the inference time.
+
+  Want me to implement the Local Agreement version? It'd replace `~/asr-stream.py` with a slightly
+  more involved version. About 30-40 min of work to get clean.
+
+❯ what about the newer parakeet?
+
+● Good question and I want to be careful not to make up model names — let me check HF directly for
+  what's actually current in the Parakeet line.
+
+● Several new ones since the compaction was written. Top candidates:
+
+  - `parakeet-tdt-0.6b-v3` — newest TDT (Apr 2026), 406k downloads (4× v2), the current main release
+  - `multitalker-parakeet-streaming-0.6b-v1` — streaming + multitalker (Jan 2026) — sounds *very*
+  relevant for phone calls
+  - `parakeet_realtime_eou_120m-v1` — small streaming model (Dec 2025)
+
+  Let me get language and streaming details from the model cards.
+
+● Big news from this lookup — three relevant variants since yesterday's compaction:
+
+  | Model | Streaming | Languages | Special | Size | Released |
+  |---|---|---|---|---|---|
+  | **`parakeet-tdt-0.6b-v3`** | No (offline) | **25 incl. en/es/fr/de/it/pt/ru…** | Replaces v2
+  entirely; CC-BY-4.0 | 0.6 B | Apr 2026 |
+  | **`multitalker-parakeet-streaming-0.6b-v1`** | **Yes** | (need to verify; trained on
+  multilingual data) | **Speaker diarization built in**; trained on Fisher / SWBD / AMI (telephone
+  corpora) | 0.6 B | Jan 2026 |
+  | **`parakeet_realtime_eou_120m-v1`** | **Yes** | English only | **80-160 ms latency**, auto
+  end-of-utterance via `<EOU>` token | 120 M | Dec 2025 |
+
+  The headline: **`parakeet-tdt-0.6b-v3` is multilingual now** (25 languages including Spanish).
+  That alone changes the model picture from yesterday's compaction — Parakeet was English-only when
+  we wrote off the original Parakeet plan.
+
+  For your specific question about not waiting for end-of-utterance, the relevant one is
+  **`multitalker-parakeet-streaming-0.6b-v1`**. It's purpose-built for the phone-call use case:
+
+  - **Streaming output** (~1 sec input buffer, per the diarization config in the README)
+  - **Speaker diarization included** — so the transcript can tell you "who said what" instead of one
+  undifferentiated stream. For a phone call (you + remote), this is a real-time `[YOU] hello /
+  [REMOTE] hi there` flow.
+  - Trained heavily on **telephone speech corpora** (Fisher, Switchboard, AMI) — domain-matched to
+  your use case.
+  - License: NVIDIA Open Model License (slightly more restrictive than CC-BY but still permissive
+  for personal use).
+
+  **Catch:** to run any Parakeet model we need to install **torch + nemo_toolkit[asr]** (~5-6 GB),
+  which is the same install we deferred earlier for Canary, with the same Python 3.14 risk hanging
+  over it.
+
+  **My take:** if you're going through the NeMo install anyway (for Canary), you might as well
+  install once and try multiple models against the same call audio. Concrete sequence:
+  1. `pip install nemo_toolkit[asr]` — see if 3.14 wheels exist
+  2. If yes: download v3 + multitalker-streaming + canary-flash, run all three on `out.wav` for an
+  A/B
+  3. Pick whichever works best on real audio and rebuild the streaming script around it
+
+  Want me to start the NeMo install? It's 5-6 GB at pony's 3 MB/s = ~30-40 min.
+
+❯ what's the shell that you're still running in background?
+
+● That'll be the silero-vad install poller (`bwpb1co7b`) — same bug as before, its `pgrep -f
+  "asr-env/bin/pip install"` matches its own bash command.
+
+● Empty output confirms it's stuck — never reached the `echo "done"`. Killing.
+
+● Killed. Lesson learned twice now — when polling for a remote process via `pgrep -f`, the pattern
+  shouldn't be a substring of the polling shell's own command. Will use `pgrep -fa` and `grep -v $$`
+  or a different match anchor next time.
+
+❯ write up that "lesson learned" into a blurb for ~/CLAUDE.md
+
+● Added as `### Polling for completion: don't pgrep -f your own pattern` under the existing
+  **Long-Running Commands** section, right after the Stream watchdog subsection. ~30 lines, same
+  density as the surrounding content. Covers:
+
+  - The bug (pgrep -f self-matches)
+  - Why it bit twice this session (so future-me has the concrete reference)
+  - Three fixes in order of preference (outcome polling > absolute-path anchor > avoid the `$$`
+  trick)
+  - A note that the same gotcha applies to Monitor exit conditions and `Bash run_in_background:true`
+  polls
+
+  Want me to commit it?
+
+❯ yes commit it
+
+● Committed as `be6f786` on master.
+
+❯ what's "Silero VAD"?
+
+● **VAD = Voice Activity Detection** — the task of deciding "is there speech here?" frame-by-frame
+  on a stream of audio. **Silero VAD** is the small neural network that does this, from a research
+  group called Silero. It's effectively the de facto open-source standard since ~2021, having
+  displaced the older WebRTC VAD in most modern speech pipelines.
+
+  What's special about it:
+
+  - **Tiny.** ~2 MB ONNX model. Loads in under a second on CPU. Inference is ~5 ms per frame on a
+  single core.
+  - **Multilingual & noise-robust.** Trained on a diverse multilingual dataset of speech vs
+  non-speech (music, traffic, fan noise, silence, etc.). Generalizes well; rarely false-triggers on
+  background sound the way WebRTC VAD does.
+  - **Streaming-native API.** `VADIterator` takes one frame at a time and emits `{'start': ms}` /
+  `{'end': ms}` events as utterances begin and end. No batching required.
+  - **Strict frame size.** Requires exactly 512 samples per frame at 16 kHz (or 256 at 8 kHz, etc.,
+  always a power-of-2 ratio). That's what the `VAD_FRAME_SAMPLES = 512` and `BYTES_PER_FRAME = 1024`
+  constants in our streaming script enforce.
+
+  Why we needed it: Whisper itself doesn't know where utterances begin or end — give it a 60-minute
+  file and it'll still try to transcribe the whole thing as one giant sequence. To stream from a
+  live mic you have to chunk the audio into "utterances" yourself, and a learned VAD is dramatically
+  better at that than rule-based silence detection. Silero is also what `faster_whisper`'s
+  `vad_filter=True` calls internally to suppress hallucinations on silent input — that's the same
+  model we re-used in `~/asr-stream.py` directly via `silero-vad`.
+
+  Tunable parameters in our setup:
+
+  - `threshold=0.5` — default speech-probability threshold. Lower = catches whispers but more
+  false-triggers on noise.
+  - `min_silence_duration_ms=500` — silence required before declaring "end of utterance." This is
+  the parameter you'd lower for snappier perceived response.
+  - `speech_pad_ms=200` — include 200 ms of audio before/after detected speech, to avoid clipping
+  the first/last consonant.
+
+  Compare to the alternatives we didn't use:
+  - **WebRTC VAD** — signal-processing rules, no ML. Faster than Silero but markedly less accurate;
+  triggers on noise.
+  - **pyannote/voice-activity-detection** — bigger model (~30 MB), more accurate, but overkill for
+  our case and pulls torch.
+
+❯ does canary also need VAD?
+
+● Yes — for the same architectural reason Whisper does. Canary (`canary-1b-flash`, `canary-1b-v2`)
+  is also an **offline encoder-decoder model**, designed for 30-second chunks. Same constraints:
+
+  - Encoder ingests log-mel features over a window, not per-frame
+  - It hallucinates on silence (less famously than Whisper but yes)
+  - It has no concept of "utterance starts here / ends here" — that has to be supplied externally
+  - For a continuous mic stream you need *something* to chunk it into utterances
+
+  NeMo's tooling assumes this and ships VAD helpers. The standard pattern is identical to what we
+  already have: Silero VAD finds the speech boundaries, then each detected utterance gets fed to the
+  Canary model. So the streaming script architecture for Canary would mirror `~/asr-stream.py`
+  almost exactly — only the model loading and inference call change.
+
+  The exception, and the reason you might pick a different model entirely, is the
+  **streaming-native** Parakeet variants:
+
+  - **`parakeet_realtime_eou_120m-v1`** is the cleanest example: emits `<EOU>` tokens itself when it
+  decides an utterance has ended. **No separate VAD.** That's why "EOU" is in the name. The model
+  has its own learned end-of-utterance detector trained jointly with ASR.
+  - **`multitalker-parakeet-streaming-0.6b-v1`** processes audio in a streaming buffer (~1 sec
+  lookahead) and emits text continuously, with speaker diarization on top. No VAD chunking; the
+  streaming inference loop is the entire pipeline.
+
+  So: VAD is a property of how *Whisper / Canary / standard Parakeet TDT* are run, not a property of
+  speech recognition in general. Streaming-native models built around that constraint don't need it.
+
+❯ what does NeMo need to be installed for?
+
+● NeMo is **NVIDIA's PyTorch-based speech/NLP framework** — and it's the runtime needed to load and
+  run any model NVIDIA distributes from their ecosystem. Specifically:
+
+  - **All Canary variants** (`canary-1b-flash`, `canary-1b-v2`) — distributed as `.nemo`
+  checkpoints, only loadable through NeMo's model classes
+  - **All Parakeet variants** (`parakeet-tdt-0.6b-v3`, `multitalker-parakeet-streaming-0.6b-v1`,
+  `parakeet_realtime_eou_120m-v1`) — same
+  - The whole "if it's `nvidia/...` on HuggingFace and it's a speech model" set
+
+  It's the equivalent role to what CTranslate2 plays for faster-whisper — the engine that takes the
+  weights file and the audio and produces text. The difference is that NeMo is much heavier because
+  it's a research/training framework first and an inference runtime second.
+
+  What an actual inference call looks like through NeMo:
+
+  ```python
+  import nemo.collections.asr as nemo_asr
+
+  # Canary — single model that does both ASR and translation
+  model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained("nvidia/canary-1b-flash")
+  text = model.transcribe(["audio.wav"], task="asr", source_lang="en", target_lang="en")
+  spanish_to_english = model.transcribe(["audio.wav"], task="ast", source_lang="es",
+  target_lang="en")
+
+  # Parakeet TDT v3
+  model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v3")
+  text = model.transcribe(["audio.wav"])
+  ```
+
+  **What gets dragged in by `pip install nemo_toolkit[asr]`:**
+
+  | Dependency | Why | ~Size |
+  |---|---|---|
+  | **torch** (with bundled CUDA) | The framework everything sits on | ~2.5 GB |
+  | **pytorch-lightning** | NeMo wraps inference in Lightning's abstractions | ~50 MB |
+  | **transformers** | HF tokenizers, sometimes HF model components | ~500 MB |
+  | **librosa, soundfile** | Audio I/O, mel spectrograms, resampling | ~100 MB (with scipy etc.) |
+  | **OmegaConf + hydra-core** | Config system NeMo uses for model architectures | ~10 MB |
+  | **sentencepiece, youtokentome** | Subword tokenizers | ~20 MB |
+  | **numba, llvmlite** | JIT for signal processing kernels | ~100 MB |
+  | **nemo_toolkit itself** | The actual NeMo code (model classes, helpers) | ~200 MB |
+
+  Total: **~5-6 GB on disk** for a venv that does NeMo inference and nothing else. Compare to
+  CTranslate2's ~50 MB. The size is the cost of NeMo being a *training* framework that happens to
+  also do inference, rather than a purpose-built inference runtime.
+
+  **Why we haven't installed it yet:**
+
+  1. The disk and wifi cost (5-6 GB at pony's 3 MB/s = ~30 min)
+  2. **Python 3.14 risk** — NeMo's most recent released wheels (as of late 2025) target Python
+  3.10-3.12. We don't know if there's a 3.14 wheel; if not, we'd need to either source-build or set
+  up a 3.12 venv on the side.
+  3. We had a working faster-whisper path that's lighter, so the question was "is the upgrade worth
+  the cost?" — which depends on whether the streaming-native or multilingual capabilities of the
+  NVIDIA models matter for your use case.
+
+  If you want to try the multilingual Parakeet v3, the streaming multitalker model, or Canary, this
+  is the install that has to happen. Want to start it?
+
+❯ so, what about a 3.12 venv?  do we have python-3.12 available?
+
+● Only Python 3.14 — Ubuntu 26.04 dropped older versions from main repos and there's no conda
+  either. Three ways to get 3.12:
+
+  | Option | Pulls | Pros | Cons |
+  |---|---|---|---|
+  | **uv** (`astral-sh/uv`) | Standalone Python build (~30 MB) | Fastest install, no apt repo,
+  scoped to user | Single-purpose; need uv installed |
+  | **deadsnakes PPA** | `python3.12 python3.12-venv` from `ppa:deadsnakes/ppa` | Standard Ubuntu
+  pattern, apt-managed | PPA may not have a Resolute (26.04) index yet — need to check |
+  | **Miniforge / conda** | ~400 MB installer + conda env | Future-proofs more conda envs for other
+  ML work | Heaviest, brings the whole conda machinery |
+
+  Recommend **uv**. Reasons:
+  - Single command, ~30 MB download, ~10 sec install
+  - The Python build is a fully-functional CPython, not a stripped/packaged thing
+  - Plays nice with regular venv (`uv venv --python 3.12 ~/asr-env-canary`)
+  - No system-wide changes, no third-party repo
+
+  The dance:
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv to ~/.local/bin
+  uv python install 3.12                             # download standalone python 3.12
+  uv venv --python 3.12 ~/asr-env-canary             # new venv on 3.12
+  ~/asr-env-canary/bin/pip install nemo_toolkit[asr]
+  ```
+
+  Total disk for the Python install: ~30 MB; venv adds another ~50 MB; nemo_toolkit[asr] is the ~5-6
+  GB heavyweight as before.
+
+  This keeps your existing `~/asr-env` (Python 3.14, faster-whisper) intact and adds a sibling
+  `~/asr-env-canary` (Python 3.12, NeMo). Want me to proceed?
+
+❯ what's "uv"?
+
+● **uv** is a Python package and project manager from **Astral** — the same group that makes `ruff`
+  (the popular Python linter). Released late 2024, written in Rust, became the standard "modern pip
+  replacement" through 2025.
+
+  It deliberately tries to be a drop-in replacement for **pip + virtualenv + pyenv + pip-tools +
+  poetry + pipx** all at once, in a single static binary. The pieces:
+
+  | It replaces | With | Speedup |
+  |---|---|---|
+  | `pip install` | `uv pip install` | ~10-100× |
+  | `python -m venv` | `uv venv` | ~5× |
+  | `pyenv install 3.12` | `uv python install 3.12` | Much simpler |
+  | `poetry add foo` | `uv add foo` | Faster + lockfile compatible |
+  | `pipx install ruff` | `uv tool install ruff` | Same idea |
+
+  Key technical bits:
+
+  - **Static Rust binary, ~40 MB.** No Python interpreter needed to install or run uv itself —
+  that's why it can manage Python installations cleanly (no chicken-and-egg).
+  - **The Pythons it installs** come from the `python-build-standalone` project (Gregory Szorc's
+  work) — fully relocatable, fully-featured CPython builds with no system dependencies. They go into
+  `~/.local/share/uv/python/` and aren't tied to any system package manager.
+  - **Caching is content-addressed and hard-linked** — installing the same package into 50 venvs
+  uses the disk space of one.
+  - **Resolution is parallel** — that's where most of the speed comes from vs. pip's serial
+  dependency walking.
+
+  In our specific situation, the killer feature is `uv python install 3.12`. Ubuntu 26.04 doesn't
+  ship Python 3.12 anywhere apt can find it, but uv just downloads a self-contained CPython 3.12
+  binary and drops it under `~/.local/share/uv/python/cpython-3.12.X-...`. Then `uv venv --python
+  3.12` makes a venv pointing at that, and pip / NeMo can install into it normally.
+
+  It's MIT/Apache-2 licensed and the de facto standard now in the Python community (replaced poetry
+  as the most-recommended new-project tool over the course of 2025).
+
+❯ is it like nvm for python?
+
+● Sort of, but broader. nvm has one job — install and switch between Node versions. uv does that for
+  Python *plus* several other jobs in the same binary.
+
+  The closer one-to-one Python analogue to nvm is **pyenv** — purely a Python version manager
+  (`pyenv install 3.12`, `.python-version` files, that's it). uv subsumes pyenv but also takes over
+  the roles that npm/yarn, virtualenv, pipx, and poetry play in their respective ecosystems.
+
+  A more honest analogy: **uv is to Python what `bun` is to JavaScript** — a Rust-rewritten
+  "everything-in-one" tool that replaces a stack of legacy tools (pip + venv + pyenv + pipx +
+  poetry) with a single fast static binary. The only thing it doesn't replace is the CPython runtime
+  itself; bun by contrast is also a runtime (replaces Node), so even that analogy isn't perfect.
+
+  So:
+  - Like nvm: yes, in that it manages multiple Python interpreters side-by-side
+  - Unlike nvm: it's *also* the package installer, the venv manager, the project tool, and the tool
+  installer — those are separate tools in the Node world (npm/yarn, no built-in venv concept, etc.)
+
+❯ install uv and set up the canary venv
+
+● Three steps: install uv, get Python 3.12, create the venv. Then NeMo as a long-running background
+  install.
+
+● uv installed (0.11.11), Python 3.12.13 downloaded (~30 sec), venv created. Now the slow part —
+  NeMo install.
+
+● Install running. Setting up an outcome-polling monitor (per the CLAUDE.md addition) — watches for
+  `site-packages/nemo/` to appear, not the process.
+
+● Monitor armed. While we wait — uv's parallel resolver should make the resolution phase fast (a few
+  minutes), then it's mostly download time at pony's wifi rate. ETA ~30-40 min for the full ~5-6 GB.
+  The monitor will surface milestone events (resolution complete, package installs, errors) and exit
+  when `site-packages/nemo/` appears.
+
+● 186 packages downloaded in 23 min — that's the bulk of the work. Now uv hard-links them into the
+  venv (~30 sec).
+
+● NeMo install done — 187 packages in 343 ms after the 23-min download. Outcome-polling monitor
+  exited cleanly (no self-match issue). Smoke-testing the stack now: import NeMo, check torch+CUDA,
+  and try loading `canary-1b-flash` (already in HF cache).
+
+● Stack is working — torch 2.9.1+cu128, CUDA 12.8, RTX 3090 detected, NeMo 2.7.3 imports clean. Now
+  load Canary and transcribe the BBB IVR sample.
+
+● Canary works end-to-end. Results on the same BBB IVR sample:
+
+  |  | faster-whisper-large-v3 | canary-1b-flash |
+  |---|---|---|
+  | Output | "Welcome to **ITPi** Training. Please enter your conference PIN number followed by the
+  pound sign." | "Welcome to **IT Pi** Training. Please enter your conference PIN number followed by
+  the pound sign." |
+  | Inference | 0.89s | 1.2s |
+  | Model load | 6.5s | 18.5s |
+
+  Essentially equivalent transcription — only the brand-name tokenization differs ("ITPi" vs "IT
+  Pi"). Canary is slightly slower per inference (1.2s vs 0.89s) but auto-resampled the 8 kHz input
+  to 16 kHz internally with no fuss.
+
+  (The "Error getting class at nemo.collections.asr.modules.transformer.get_nemo_transformer" line
+  during load is noisy NeMo introspection — actual load succeeded and the model worked. Worth
+  filtering out in the final pipeline but harmless.)
+
+  Now the interesting models to actually pivot toward are the ones we identified earlier for the
+  streaming question:
+
+  1. **`parakeet-tdt-0.6b-v3`** — multilingual ASR replacement for faster-whisper. Drop-in for the
+  existing VAD-driven pipeline. ~250 MB download.
+  2. **`multitalker-parakeet-streaming-0.6b-v1`** — streaming + speaker diarization, the
+  actually-relevant answer to your "respond without waiting for end-of-utterance" question.
+  Phone-call domain match. ~250 MB download.
+
+  Want me to download both and try them on the BBB sample, then pick a winner for rewriting
+  `~/asr-stream.py`?
+
+❯ download both
+
+● Outcome-poller waiting on the marker line. Will report back once both downloads finish (ETA ~3
+  min).
+
+❯ check on them
+
+● Still in progress:
+  - **parakeet-tdt-0.6b-v3**: 1/10 files fetched — large model file still downloading
+  - **multitalker-parakeet-streaming-0.6b-v1**: 7/13 files fetched — further along
+
+  Both processes alive (PIDs 103616, 103617). Two parallel downloads sharing pony's 3 MB/s wifi →
+  each effectively gets ~1.5 MB/s. ETA another 1-2 min. The poller will fire when the marker line
+  appears.
+
+❯ check again
+
+● The log progress bars use `\r` so `tail` doesn't reflect actual progress. Better to check
+  directory sizes directly.
+
+● Correction needed — these are larger than I claimed:
+
+  | Model | Status |
+  |---|---|
+  | **parakeet-tdt-0.6b-v3** | Two large blobs in flight: 1.9 GB + 1.1 GB (still growing). Total
+  cache so far: **2.9 GB**. |
+  | **multitalker-streaming-0.6b-v1** | One blob in flight: 1.2 GB. Total cache so far: **1.2 GB**.
+  |
+
+  I underestimated when I said "~250 MB each" — NeMo models on HF typically ship both the `.nemo`
+  native checkpoint *and* HF safetensors versions, doubling the size. Total per model is more like
+  3-5 GB, not 250 MB. So we're looking at **~7-9 GB total** at the shared ~3 MB/s wifi rate.
+
+  Apologies for the bad estimate. ETA is more like another 15-20 min, not 1-2.
+
+  We've already made good progress (4+ GB landed). Both processes are healthy. The poller will still
+  fire on the marker line when both finish.
+
+● Both done — 23 GB total HF cache now. Let me test parakeet-tdt-0.6b-v3 first (simpler — standard
+  transcribe interface).
+
+● Parakeet v3 works:
+
+  > **"Welcome to ITPI Training. Please enter your conference PIN number followed by the pound
+  sign."** (load 15.0s, infer 1.0s)
+
+  Same content as the other two, slightly different capitalization. Now multitalker-streaming — this
+  one's more complex (streaming + diarization).
+
+● All four models converge on essentially the same text. Comparison table:
+
+  | Model | Load | Infer (5.8s audio) | Output | Special |
+  |---|---|---|---|---|
+  | faster-whisper-large-v3 | 6.5s | 0.89s | "Welcome to **ITPi**..." | CTranslate2 stack |
+  | canary-1b-flash | 18.5s | 1.2s | "Welcome to **IT Pi**..." | ASR + translation in one model |
+  | parakeet-tdt-0.6b-v3 | 15.0s | 1.0s | "Welcome to **ITPI**..." | Multilingual offline |
+  | multitalker-streaming | 8.7s | **0.7s** | "Welcome to **IT Pi**..." | **Streaming + 4-speaker
+  diarization** |
+
+  The **multitalker-streaming model is the winner for your use case** on every relevant axis:
+
+  - Fastest load *and* fastest inference of the four
+  - Native streaming (no VAD chunking needed → no end-of-utterance wait)
+  - Speaker diarization for up to 4 speakers (knows who's speaking on a 2-person call)
+  - Trained on Fisher / Switchboard / AMI — telephone speech is the actual training distribution
+
+  Caveat: we tested it via the offline `.transcribe()` call. To actually get the streaming and
+  diarization features we'd have to use its streaming API — `EncDecMultiTalkerRNNTBPEModel` exposes
+  a different inference interface for that, and figuring out the right method/loop is the next
+  concrete piece of work.
+
+  Two reasonable next moves:
+
+  1. **Look up the multitalker streaming inference API** (probably `transcribe_streaming` or a
+  custom loop with `forward_for_step` — needs reading model card + maybe NeMo docs/source) and
+  rewrite `~/asr-stream.py` around it. Replaces the VAD chunking with native streaming. The big
+  payoff.
+
+  2. **First, sanity-test diarization on a real two-speaker recording** if you have one — a saved
+  phone call where you and someone else were on the line, even if short. That'll tell us whether the
+  diarization quality is actually usable for your use case before we invest in rewriting the
+  streaming script.
+
+  Which sounds better as the next step?
+
+❯ we'll do number 1 next.  see how reasonable it is to provide a switch to ast-stream.py to switch
+  between the different models
+
+● Pretty reasonable, with a couple of structural decisions to make first. Three issues:
+
+  **1. Venv consolidation.** Currently:
+  - `~/asr-env` (Python 3.14) has faster-whisper + silero-vad, no NeMo
+  - `~/asr-env-canary` (Python 3.12) has NeMo, no faster-whisper
+
+  A single script can't switch venvs at runtime, so we need to either (a) install faster-whisper +
+  silero-vad into `~/asr-env-canary` so one venv has all stacks, or (b) keep two venvs and make the
+  user pick the right one before invocation. Option (a) is cleaner — faster-whisper has no torch
+  dependency conflict with NeMo (CTranslate2 is independent), and silero-vad is small. Cost: ~100 MB
+  more in `asr-env-canary`. Then `~/asr-env` can be retired.
+
+  **2. Two fundamentally different inference architectures.** Three of the four models are *offline*
+  (Whisper, Canary, Parakeet-TDT v3) — they want a VAD-chunked utterance dropped on them, same as
+  the current script. The fourth (multitalker-streaming) is *streaming-native* — it runs its own
+  internal frame loop and emits text continuously, no VAD chunking. That means two main loops in the
+  script, not one. Reasonable but worth being explicit about.
+
+  **3. Per-model API differences.** Each model's `transcribe()` call has different mandatory args:
+  - faster-whisper: `transcribe(np_array, language=None, vad_filter=False)` → returns segments
+  - Canary: `transcribe(audio=[path], task="asr", source_lang="en", target_lang="en", pnc="yes")` →
+  returns Hypothesis list
+  - Parakeet-v3: `transcribe([path], batch_size=1)` → returns Hypothesis list, auto-detects language
+  - Multitalker-streaming: **unknown — I haven't read the streaming API.** Need to read the model
+  card / NeMo docs / source before I can write that backend.
+
+  Proposed structure:
+
+  ```
+  ~/asr-stream.py --model {whisper-large-v3, canary-1b-flash, parakeet-tdt-v3,
+  multitalker-streaming}
+  ```
+
+  ```python
+  class Backend(ABC):
+      streaming: bool        # True → main loop calls .feed(frame); False → .transcribe(utterance)
+      def transcribe(self, audio: np.ndarray) -> str: ...   # offline backends
+      def feed(self, frame: np.ndarray) -> Optional[str]: ... # streaming backends
+
+  class WhisperBackend(Backend): ...    # streaming=False
+  class CanaryBackend(Backend): ...     # streaming=False
+  class ParakeetV3Backend(Backend): ... # streaming=False
+  class MultitalkerBackend(Backend): ... # streaming=True
+
+  # main loop
+  backend = REGISTRY[args.model]()
+  if backend.streaming:
+      streaming_main(backend)
+  else:
+      vad_chunked_main(backend)
+  ```
+
+  Total complexity: ~200 lines. Modest. The unknowns are concentrated in the `MultitalkerBackend`
+  because I don't know the streaming inference API yet.
+
+  **Plan I'd suggest:**
+
+  1. Install faster-whisper + silero-vad into `~/asr-env-canary` (~5 min)
+  2. Research the multitalker streaming API — read the model card on HF, look at NeMo's
+  `EncDecMultiTalkerRNNTBPEModel` source for streaming methods, find or write a minimal streaming
+  example (~20-40 min depending on what's documented)
+  3. Write the unified `~/asr-stream.py` with the four backends and two main loops (~30 min)
+  4. Sanity-test each model end-to-end via the live mic
+
+  Step 2 is where the real risk is — if NeMo doesn't expose a clean streaming API for
+  `EncDecMultiTalkerRNNTBPEModel` and we'd have to drive it manually frame-by-frame through the
+  encoder, that's hours of work and a separate decision about whether to proceed.
+
+  Want me to start with step 1+2 (the install + streaming API research) and report back what I find
+  before writing the unified script?
+
+❯ ok, then just have two (or more) separate scripts
+
+● Good call. Plan: keep `~/asr-stream.py` (faster-whisper) as-is; add `~/asr-stream-canary.py` and
+  `~/asr-stream-parakeet.py` as siblings for the two offline NeMo models. Save the multitalker
+  streaming script for last since it needs API research.
+
+  Both new scripts need `silero-vad` in `~/asr-env-canary` for the VAD chunking — kicking that
+  install off in the background while I write the scripts.
+
+● silero-vad installed. Let me smoke-test both scripts (EOF on stdin → models load → exit).
+
+● torchaudio 2.11.0 was installed by silero-vad's deps but it doesn't match our torch 2.9.1
+  (PyTorch's torchaudio ABI is paired tightly with torch's minor version). Two ways to fix:
+
+  1. **Uninstall torchaudio** and rely on silero-vad's `onnx=True` path (which is what we explicitly
+  request)
+  2. **Install matching torchaudio==2.9.x**
+
+  Trying #1 first — cleaner dep tree.
+
+● Real issue found in the traceback: `OSError: libcudart.so.13: cannot open shared object file`.
+  torchaudio 2.11.0 was built against **CUDA 13**, but our torch 2.9.1+cu128 (CUDA 12.8) doesn't
+  have CUDA 13 libs. And silero-vad imports torchaudio unconditionally (uninstalling won't work).
+
+  Plus a uv quirk: uv venvs don't ship `pip`, only `uv pip`. Need to use that.
+
+  Fix: install `torchaudio` version matching torch 2.9.1+cu128, from PyTorch's CUDA 12.8 wheel
+  index.
+
+● Fixed. torchaudio 2.9.1+cu128 now matches torch. Re-running both smoke tests.
+
+● Missing onnxruntime in asr-env-canary (it's in asr-env but I forgot it as a separate dep here).
+  Quick install.
+
+● Both new scripts work. Three live-test commands:
+
+  ```bash
+  # 1. faster-whisper (existing — multilingual auto-detect)
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr-env/bin/python ~/asr-stream.py'
+
+  # 2. parakeet-tdt-0.6b-v3 (multilingual auto-detect, 25 langs)
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr-env-canary/bin/python ~/asr-stream-parakeet.py'
+
+  # 3. canary-1b-flash (single-pass ASR or AST with explicit langs)
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr-env-canary/bin/python ~/asr-stream-canary.py'
+  # bilingual translation example: --task ast --source-lang es --target-lang en
+  ```
+
+  What got installed/fixed in the process:
+  - `silero-vad` 6.2.1 + `torchaudio==2.9.1+cu128` (matching torch) + `onnxruntime` 1.25.1 in
+  `~/asr-env-canary`
+  - silero-vad imports torchaudio unconditionally even in onnx mode, so torchaudio's CUDA-bundled C
+  extension has to load successfully — that's why version-matching mattered
+  - The "Error getting class at nemo.collections.asr.modules.transformer.get_nemo_transformer"
+  warning during canary load is harmless NeMo class introspection; not worth filtering yet
+
+  Multitalker streaming script is still TODO — same separate-scripts pattern, but needs API research
+  (the streaming inference loop for `EncDecMultiTalkerRNNTBPEModel`). Want to do that as a next
+  step, or test these three first?
+
+❯ set the shebang line on those scripts so they can just be run directly
+
+● Done. Three scripts now runnable directly:
+
+  ```bash
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr-stream.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr-stream-parakeet.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr-stream-canary.py'
+  ```
+
+  Each script's shebang absolute-paths to its venv's Python — `asr-stream.py` →
+  `~/asr-env/bin/python` (3.14, faster-whisper); the canary + parakeet scripts →
+  `~/asr-env-canary/bin/python` (3.12, NeMo). Smoke test on parakeet via direct invocation passes.
+
+❯ now research the api
+
+● Researching three sources: the HF model card (full), the NeMo `EncDecMultiTalkerRNNTBPEModel`
+  source, and any official streaming examples.
+
+● This is more involved than I expected. Three findings:
+
+  1. **Two coupled models, not one** — the multitalker-streaming ASR model REQUIRES a separate
+  streaming diarization model (`nvidia/diar_streaming_sortformer_4spk-v2.1`) running in parallel.
+  The diarization model produces speaker activity predictions which get injected into the ASR
+  encoder via "speaker kernels."
+
+  2. **One ASR model instance per speaker** (per the README): for a 2-speaker phone call you load 2
+  copies of the 0.6B ASR model + 1 diarizer. That's ~1.5B params total in VRAM. The 3090's 24 GB has
+  room but it's not lightweight.
+
+  3. **A reference script exists**:
+  `examples/asr/asr_cache_aware_streaming/speech_to_text_multitalker_streaming_infer.py` in the NeMo
+  repo. Let me grab it.
+
+● Research findings — and an honest reality check. The multitalker streaming model is significantly
+  more complex than a drop-in replacement. The actual API:
+
+  ```python
+  from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+  from nemo.collections.asr.parts.utils.multispk_transcribe_utils import SpeakerTaggedASR
+  from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
+
+  # Two coupled models, both on GPU
+  diar_model =
+  SortformerEncLabelModel.from_pretrained("nvidia/diar_streaming_sortformer_4spk-v2.1").eval().to("cuda")
+  asr_model =
+  ASRModel.from_pretrained("nvidia/multitalker-parakeet-streaming-0.6b-v1").eval().to("cuda")
+
+  # NeMo-provided streaming chunker
+  streaming_buffer = CacheAwareStreamingAudioBuffer(model=asr_model, ...)
+  streaming_buffer.append_audio_file(audio_filepath=path, stream_id=-1)
+
+  # Orchestrator that holds per-speaker ASR copies + diar cache
+  multispk_asr_streamer = SpeakerTaggedASR(cfg, asr_model, diar_model)
+
+  # Per-chunk inference
+  for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer):
+      multispk_asr_streamer.perform_parallel_streaming_stt_spk(
+          step_num=step_num,
+          chunk_audio=chunk_audio,
+          chunk_lengths=chunk_lengths,
+          is_buffer_empty=streaming_buffer.is_buffer_empty(),
+          drop_extra_pre_encoded=...,
+      )
+
+  # Transcript extraction (batch, at end of file)
+  seglst = multispk_asr_streamer.generate_seglst_dicts_from_parallel_streaming(samples=samples)
+  ```
+
+  **Three significant integration challenges:**
+
+  1. **Two coupled models, not one** — needs a separate streaming diarizer
+  (`diar_streaming_sortformer_4spk-v2.1`, ~250 MB more) running in parallel. Per the model card, the
+  diarizer's speaker activity predictions get injected into the ASR encoder via "speaker kernels."
+
+  2. **One ASR model instance per speaker.** Per the README: *"deploying one model instance per
+  speaker, meaning the number of model instances matches the number of speakers in the
+  conversation."* For a 2-speaker phone call: 2× the 0.6B ASR model + 1 diarizer = ~1.5B params in
+  VRAM. The 3090 has room but it's not light.
+
+  3. **Reference code is for files, not live mic.**
+  `CacheAwareStreamingAudioBuffer.append_audio_file()` expects a filepath. The output collector
+  (`generate_seglst_dicts_from_parallel_streaming`) runs at the end of the file, not incrementally.
+  To use this with live arecord input, we'd need to:
+     - Find or build a "feed numpy array" path into `CacheAwareStreamingAudioBuffer` (likely doable,
+  ~1 hr of source-reading)
+     - Hook into the streaming loop to extract transcripts *as they're emitted* rather than at
+  end-of-stream (this is the harder one — needs to break apart `SpeakerTaggedASR`'s state to pull
+  tokens mid-stream)
+
+  Realistic effort: **half a day to a day** of integration work, plus some debugging since this is a
+  research-grade codepath.
+
+  **My honest assessment:** I'd reconsider whether the multitalker model is the right answer. Three
+  cheaper alternatives:
+
+  1. **`parakeet_realtime_eou_120m-v1`** — the small streaming-native model from our earlier list.
+  **80-160 ms latency**, self-detects end-of-utterance via `<EOU>` tokens, no diarization, **English
+  only**. Drop VAD entirely. Much simpler integration than multitalker (single model, same NeMo
+  streaming-buffer pattern but only ASR side). For an English-only phone call, this gets you the
+  lowest latency with the least code.
+
+  2. **Stick with the VAD-chunked pipeline and use `parakeet-tdt-0.6b-v3`** (the script we just
+  wrote). 1s inference on 6s audio is ~6× realtime. Total latency = utterance length + 500 ms VAD
+  silence wait + 1 s inference. That's "slightly delayed live captions," but multilingual and
+  already working. Could shorten the VAD silence threshold to 200-300 ms for snappier behavior.
+
+  3. **Build the multitalker integration anyway** if speaker diarization is genuinely valuable —
+  e.g., if you want a transcript that says `[YOU]` vs `[REMOTE]` automatically, or you're recording
+  group meetings rather than one-on-one calls.
+
+  For 1:1 phone calls (the original use case), diarization is mostly redundant — you already know
+  which audio source is yours vs theirs at the routing layer. Option 1 or 2 give you 90 % of the
+  value at 5-10 % of the integration cost.
+
+  Where do you want to go from here?
+
+❯ so, rename asr-stream.py to be consistent with the other two: asr-stream-MODEL.py
+
+● Renamed. Three sibling scripts now:
+
+  ```
+  ~/asr-stream-whisper.py    # faster-whisper-large-v3  (~/asr-env, py3.14)
+  ~/asr-stream-parakeet.py   # parakeet-tdt-0.6b-v3     (~/asr-env-canary, py3.12)
+  ~/asr-stream-canary.py     # canary-1b-flash          (~/asr-env-canary, py3.12)
+  ```
+
+  Old `~/asr-stream.py` removed on both ends; docstring inside `asr-stream-whisper.py` updated to
+  match.
+
+❯ let's move all of this into a subdir
+
+● Just the scripts? Shebangs are absolute paths to the venvs, so the venvs can stay at `~/asr-env*/`
+  without breaking — only the .py files need to move.
+
+  Suggested layout on pony: `~/asr/` containing the three scripts. Anything else you want me to roll
+  in (e.g. move the venvs too, set up a git repo, anything for samsung-side working copies)?
+
+  Or just go ahead with the minimal
+  `~/asr/{asr-stream-whisper,asr-stream-parakeet,asr-stream-canary}.py` move?
+
+❯ everything you suggested on pony - move the venvs, setup `~/asr` as a git repo with the venvs
+  gitignored
+
+● OK. Before moving venvs I need to inspect how uv structured them — entry-point shebangs in `bin/`
+  will need updating. Quick check first.
+
+● Plan confirmed. Executing in steps with safe sed scoping.
+
+● Both venvs survived. Now git init and smoke test.
+
+● Layout on pony:
+
+  ```
+  ~/asr/                          # git repo, branch=main, 1 commit (8c48690)
+  ├── .gitignore                  # tracked — excludes asr-env/ asr-env-canary/
+  ├── asr-stream-whisper.py       # tracked, runnable
+  ├── asr-stream-canary.py        # tracked, runnable
+  ├── asr-stream-parakeet.py      # tracked, runnable
+  ├── asr-env/                    # ignored — faster-whisper venv, py3.14
+  └── asr-env-canary/             # ignored — NeMo venv, py3.12
+  ```
+
+  What changed in the move:
+  - 58 entry-point shebangs in `asr-env-canary/bin/*` and the 7 in `asr-env/bin/*` got `sed -i`'d
+  from old absolute paths to new ones
+  - The python symlinks inside each venv didn't need touching — they point at uv's standalone
+  interpreter at `~/.local/share/uv/python/...`, outside the venv tree
+  - All three `asr-stream-*.py` shebangs updated to the new venv locations
+  - pyvenv.cfg files were already pointing at uv's interpreter (outside the moved tree), so no edit
+  needed there
+
+  Live-test commands now use `~/asr/asr-stream-*.py`:
+
+  ```bash
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/asr-stream-whisper.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/asr-stream-parakeet.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/asr-stream-canary.py'
+  ```
+
+  I should also save a note about how the project is laid out so future-me can pick it up. Want a
+  `~/asr/README.md` (committed) describing the three scripts, the two venvs, and the design
+  decisions (separate venvs because of the NeMo Python 3.14 incompatibility), or save that for
+  later?
+
+❯ yes, write the README
+
+● Committed. `~/asr/` is now self-documenting:
+
+  - `8c48690` — initial scripts move
+  - `3a2b8b3` — README
+
+  The README covers: the three scripts and when to pick each, the live-run command pattern, the
+  two-venv split (and why — Python 3.14 vs NeMo's 3.10-3.12 wheel coverage), what's apt-installed
+  system-wide for CUDA, what's in the HF cache, and the open multitalker-streaming TODO with the
+  integration challenges so future-me knows what they're walking into.
+
+❯ rename the scripts to remove the 'asr-' prefix, since we're now in an 'asr' directory, and use git
+  mv
+
+● Done. Final layout on pony:
+
+  ```
+  ~/asr/
+  ├── README.md
+  ├── stream-whisper.py
+  ├── stream-canary.py
+  ├── stream-parakeet.py
+  ├── .gitignore
+  ├── asr-env/         (ignored)
+  └── asr-env-canary/  (ignored)
+  ```
+
+  git history:
+
+  ```
+  392aaf1  rename: drop asr- prefix from scripts (already in ~/asr/)
+  3a2b8b3  README: project overview, layout, two-venv rationale, TODO
+  8c48690  initial: ASR streaming scripts (whisper, canary, parakeet)
+  ```
+
+  `git mv` preserved rename history (status showed `RM` — rename detected, then content-modified for
+  the docstring's self-reference update). README updated in the same commit. Smoke test on
+  `~/asr/stream-parakeet.py` still passes.
+
+  Live-test commands now:
+
+  ```bash
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/stream-whisper.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/stream-parakeet.py'
+  ssh claude@pony 'arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null |
+  ~/asr/stream-canary.py'
+  ```
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/docs/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<UUID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<UUID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  The standalone skills (`write-a-report`, `compact2`, `extract-kg`)
+  remain usable on their own when you only want one artifact; this
+  skill produces all three with shared session-ID detection.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session UUID hasn't changed
+
+  ```bash
+  test -f ~/.claude/projects/-home-claude/<UUID>.jsonl && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the UUID
+  is good. If it doesn't (rare — session was migrated), fall back to
+  the first-run workflow's marker dance to derive the new UUID, then
+  proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<UUID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per write-a-report's "Re-running in the same session" rule. Fold
+  new material into the right Findings / Recommendations / Known
+  Gaps subsections; expand the Summary if the bottom line shifted;
+  mark resolved gaps as resolved; do **not** tack on "Update since
+  last run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per compact2's re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow extract-kg's post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: re-run update — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to your session's `.jsonl`
+  file, then grepping the project's session directory to find the
+  match. The flush takes a few seconds, so do it in background.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until id=$(find ~/.claude/projects/-home-claude/ -maxdepth 1 -name '*.jsonl' \
+                -mmin -2 -exec grep -l "<MARKER>" {} + 2>/dev/null | head -1); \
+        [ -n "$id" ]; do sleep 2; done
+  basename "$id" .jsonl
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  ### Step 2 — write the report
+
+  Follow `~/project/skills/write-a-report/SKILL.md` for the structure
+  and style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/docs/<slug>.md`.
+
+  If `write-a-report` was invoked earlier in this session, skip the
+  report and go straight to step 3.
+
+  **Re-run detection.** If `~/project/docs/<slug>.md` already exists,
+  follow write-a-report's "Re-running in the same session" rule —
+  update the existing report rather than overwrite it. Verifying the
+  match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<UUID>.md`. Structure and
+  content per `~/project/skills/compact2/SKILL.md` — progress-report
+  half on top, `---`, then the `<analysis>` + `<summary>` blocks
+  following `~/project/skills/compact2/COMPACT_PROMPT.md`.
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<UUID>.json`. Schema
+  and per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md`
+  (the canonical spec). Density and entity-type guidance per
+  `~/project/skills/extract-kg/SKILL.md` step 4 — that skill
+  locally tightens the bare EXTRACT_PROMPT defaults to encourage
+  richer extraction (calibrate against the compaction's analysis
+  block; include when hesitating; soft entity types like `pattern`,
+  `failure-mode`, `constraint`, `gotcha` are first-class). Re-run
+  handling per `extract-kg`'s "Re-extracting in the same session"
+  section — overwrite if still in `incoming/`, delta-style if
+  already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/docs/<slug>.md` to replace it with the
+  real `<UUID>`. Skip this step if the report was an in-place update
+  (re-run case — already has the real UUID) or was skipped entirely
+  (write-a-report was invoked earlier in the session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: report + compaction — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● First run. Kicking off session-ID detection in background, then writing the report.
+
+● JSON is valid: 58 entities, 81 relationships, no dangling refs. Committing the report + compaction
+  to ~/project.
+
+● Three artifacts written:
+
+  - **Report**: `~/project/docs/pony-asr-streaming-bringup.md`
+  - **Compaction**: `~/project/compactions/session-0f989235-b7a0-4853-932e-962eaa14913d.md`
+  - **KG**: `~/lightrag-history/incoming/session-0f989235-b7a0-4853-932e-962eaa14913d.json`
+
+❯ which stem-splitters should we download?
+
+● For piano practice tracks specifically, my concrete recommendation is **demucs's `htdemucs_6s`** —
+  that's the only mainstream model with a dedicated piano stem, and demucs's `--two-stems piano`
+  mode gives you the perfect "piano isolated" + "music-minus-piano" pair in one invocation.
+
+  Concrete download plan:
+
+  ```bash
+  # Into the existing torch-having venv on pony — no need for a new one
+  ~/asr/asr-env-canary/bin/pip install demucs
+
+  # First invocation auto-downloads the model checkpoint (~80 MB)
+  ~/asr/asr-env-canary/bin/python -m demucs --model htdemucs_6s \
+      --two-stems piano <song.mp3>
+  ```
+
+  That gives you `separated/htdemucs_6s/<song>/piano.wav` and
+  `separated/htdemucs_6s/<song>/no_piano.wav`. ~80 MB to download, 5-10 sec inference per minute of
+  audio on the 3090.
+
+  **What I'd skip for now:**
+
+  - **`htdemucs_ft`** (the fine-tuned 4-stem variant — better SDR but no piano stem; 4-stem lumps
+  piano into "other" with strings/brass/synths, useless for your case).
+  - **MDX-Net family** — strong on vocals, but vocal isolation isn't your problem.
+  - **Spleeter** — outdated, noticeably worse quality. Don't bother.
+  - **BS-RoFormer / Mel-RoFormer** (state-of-the-art) — ~1-2 dB better than HTDemucs but requires
+  cloning ZFTurbo's `Music-Source-Separation-Training` repo and downloading checkpoints by hand. Not
+  worth the friction unless `htdemucs_6s` proves insufficient on real practice songs.
+
+  **About the venv choice:** I'm proposing to install into `~/asr/asr-env-canary` because demucs
+  needs torch and that venv already has it. Cost is minimal (~50 MB for demucs itself +
+  auto-downloaded model). The downside is mixing music tooling into the ASR project tree. The
+  cleaner long-term layout would be a sibling `~/music/` repo with its own venv (mirrors the
+  `~/asr/` pattern), but that costs ~3 GB more for a duplicated torch install. Reasonable to start
+  cheap; if music work picks up, refactor into `~/music/` then.
+
+  Go ahead with htdemucs_6s into asr-env-canary, or do you want me to set up `~/music/` properly
+  from the start?
+
+❯ what are the two venv's again?
+
+● Two on pony, both under `~/asr/`:
+
+  - **`~/asr/asr-env/`** — Python 3.14.4 (system Python). Holds the **faster-whisper** stack:
+  ctranslate2, faster-whisper, silero-vad, onnxruntime, tokenizers, av. ~50 MB. No torch. Used by
+  `stream-whisper.py`.
+
+  - **`~/asr/asr-env-canary/`** — Python 3.12.13 (uv-installed standalone, lives at
+  `~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/`). Holds the **NeMo + torch** stack:
+  torch 2.9.1+cu128, nemo_toolkit[asr], silero-vad, onnxruntime, torchaudio. ~5-6 GB. Used by
+  `stream-canary.py` and `stream-parakeet.py`.
+
+  The "-canary" suffix is named after the first NeMo model we used (canary-1b-flash) — slightly
+  misleading now that the venv also runs parakeet. Mental model: **"the venv with torch"** is
+  asr-env-canary.
+
+  For demucs, asr-env-canary is the one — demucs needs torch.
+
+❯ i'm thinking of moving the venv to ~/venv-torch
+
+● Good idea — `asr-env-canary` is misleading now that it'll host demucs and any other torch-based
+  tools. ~/venv-torch is descriptive.
+
+  Concrete plan:
+
+  1. **Move the venv**: `mv ~/asr/asr-env-canary ~/venv-torch`
+  2. **Sed-fix shebangs** in 58 of 65 entry-point files in `bin/*` (same `find ... -exec sed -i
+  's|OLD|NEW|g' {} +` pattern as before)
+  3. **Update the two script shebangs** in `~/asr/stream-canary.py` and `~/asr/stream-parakeet.py`
+  to `#!/home/claude/venv-torch/bin/python`
+  4. **Update ~/asr/README.md** — venv path, the run-command examples, the layout table
+  5. **Update ~/asr/.gitignore** — remove `asr-env-canary/`, since it's no longer in ~/asr/
+  6. **Commit ~/asr/** changes
+
+  The other venv (`asr-env`, faster-whisper, no torch) stays at `~/asr/asr-env/` — it's genuinely
+  ASR-only, no need to hoist it out.
+
+  One question before I execute: do you also want me to **rename `~/asr/asr-env/` →
+  `~/asr/venv-faster-whisper/`** for symmetry? Pros: matches the "venv-X" pattern. Cons: more files
+  to touch (its bin/* shebangs + stream-whisper.py shebang + README). Reasonable either way; my
+  default is to leave it alone since it's already named clearly enough relative to its sibling.
+
+  Go ahead with the venv-torch move only?
+
+❯ first, a question: for demucs, do we want python 3.12?
+
+● Good question — let me check demucs's actual Python compatibility on PyPI.
+
+● **3.12 is the right answer**, with a caveat worth flagging.
+
+  PyPI says demucs 4.0.1 (latest), uploaded **September 2023** — over 2.5 years stale.
+  `requires_python: >=3.8.0` formally allows 3.12, but the package hasn't been touched since 3.12
+  was newly released, and definitely hasn't been tested on newer Pythons. The risk profile by Python
+  version:
+
+  - **3.10 / 3.11** — safest. demucs's transitive deps (julius, torchaudio, etc.) all have wheels
+  for these.
+  - **3.12** — likely fine. By 2025 most of demucs's transitive deps caught up. Some chance of a
+  wheel-resolution hiccup on a less-popular dep like `julius`, but should be installable.
+  - **3.13 / 3.14** — risky. Likely to hit "no wheel available" for one of the older deps; would
+  need source builds.
+
+  So our existing `~/venv-torch` plan (Python 3.12) is the right target — sweet spot for torch wheel
+  availability *and* demucs's stale deps not fighting wheel availability.
+
+  **One thing worth knowing in case demucs's staleness becomes a problem:** there are more
+  actively-maintained alternatives that include demucs as a backend:
+
+  - **`audio-separator`** (PyPI: `audio-separator`) — UVR-CLI wrapper, actively maintained through
+  2025, supports demucs + MDX-Net + RoFormers behind a model picker, works on newer Python.
+  - **ZFTurbo's `Music-Source-Separation-Training`** — clone-and-run repo with current
+  state-of-the-art (BS-RoFormer) plus demucs. Friction higher (no pip install) but quality ceiling
+  higher.
+
+  If `pip install demucs` into `~/venv-torch` succeeds and `htdemucs_6s` runs cleanly on a real
+  song, we're done. If it errors out on a transitive dep wheel, fall back to `audio-separator` (same
+  UX, fresher deps).
+
+  Want me to proceed with the venv move first, then install demucs into the renamed `~/venv-torch`?
+
+❯ perhaps we should call it ~/venv-3.12-torch
+
+● Even better — encodes both the Python version and the major library, future-proofs for siblings
+  (could add `~/venv-3.11-torch` someday if some package needs it). Final plan:
+
+  ```
+  ~/asr/asr-env-canary  →  ~/venv-3.12-torch
+  ```
+
+  Steps:
+  1. `mv ~/asr/asr-env-canary ~/venv-3.12-torch`
+  2. `find ~/venv-3.12-torch/bin -type f -exec sed -i
+  's|/home/claude/asr/asr-env-canary|/home/claude/venv-3.12-torch|g' {} +` (58 entry-point shebangs)
+  3. Update `stream-canary.py` and `stream-parakeet.py` shebangs to
+  `#!/home/claude/venv-3.12-torch/bin/python`
+  4. Update `~/asr/README.md` (path references, layout table)
+  5. Update `~/asr/.gitignore` — drop `asr-env-canary/`
+  6. Commit ~/asr/ changes
+
+  Then `pip install demucs` into the new venv.
+
+  Go?
+
+❯ yes
+
+● Now the README. Pulling it down to edit locally.
+
+● Diff looks right. Smoke test then commit.
+
+● Done. Final layout on pony:
+
+  ```
+  ~/asr/                          # ASR-only
+  ├── README.md
+  ├── .gitignore                  # asr-env/ only now
+  ├── stream-whisper.py           → ~/asr/asr-env/bin/python (3.14)
+  ├── stream-canary.py            → ~/venv-3.12-torch/bin/python
+  ├── stream-parakeet.py          → ~/venv-3.12-torch/bin/python
+  └── asr-env/                    # gitignored (3.14, faster-whisper)
+
+  ~/venv-3.12-torch/              # shared torch venv (3.12, ~5 GB)
+  ```
+
+  git log on `~/asr/`:
+  ```
+  4589db5  hoist torch venv out to ~/venv-3.12-torch (shared, not ASR-only)
+  392aaf1  rename: drop asr- prefix from scripts (already in ~/asr/)
+  3a2b8b3  README: project overview, layout, two-venv rationale, TODO
+  8c48690  initial: ASR streaming scripts (whisper, canary, parakeet)
+  ```
+
+  Smoke test on `stream-parakeet.py` passes — venv reachable via the new path. Ready for
+  `~/venv-3.12-torch/bin/pip install demucs` when you want to proceed with stem-splitting.
+
+❯ install demucs into the torch venv
+
+● demucs installed cleanly. Only 8 new packages (most deps overlapped with NeMo's stack). Three
+  sdist builds (demucs, dora-search, julius — no 3.12 wheels) but uv built them inline.
+
+● demucs 4.0.1 installed and the CLI works. To use it on real music for piano practice tracks:
+
+  ```bash
+  # scp a song to pony first, then:
+  ssh claude@pony '~/venv-3.12-torch/bin/python -m demucs \
+      -n htdemucs_6s --two-stems piano \
+      -o ~/demucs-output \
+      ~/song.mp3'
+  ```
+
+  That'll auto-download the `htdemucs_6s` checkpoint on first run (~80 MB) and produce two files in
+  `~/demucs-output/htdemucs_6s/<song-name>/`:
+  - `piano.wav` — isolated piano part (for learning by ear)
+  - `no_piano.wav` — backing track minus piano (for playing along)
+
+  The 3090 should chew through a 4-min song in 5-10 sec. Want me to test on something, or are you
+  set to take over?
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/docs/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<UUID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<UUID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  The standalone skills (`write-a-report`, `compact2`, `extract-kg`)
+  remain usable on their own when you only want one artifact; this
+  skill produces all three with shared session-ID detection.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session UUID hasn't changed
+
+  ```bash
+  test -f ~/.claude/projects/-home-claude/<UUID>.jsonl && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the UUID
+  is good. If it doesn't (rare — session was migrated), fall back to
+  the first-run workflow's marker dance to derive the new UUID, then
+  proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<UUID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per write-a-report's "Re-running in the same session" rule. Fold
+  new material into the right Findings / Recommendations / Known
+  Gaps subsections; expand the Summary if the bottom line shifted;
+  mark resolved gaps as resolved; do **not** tack on "Update since
+  last run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per compact2's re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow extract-kg's post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: re-run update — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to your session's `.jsonl`
+  file, then grepping the project's session directory to find the
+  match. The flush takes a few seconds, so do it in background.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until id=$(find ~/.claude/projects/-home-claude/ -maxdepth 1 -name '*.jsonl' \
+                -mmin -2 -exec grep -l "<MARKER>" {} + 2>/dev/null | head -1); \
+        [ -n "$id" ]; do sleep 2; done
+  basename "$id" .jsonl
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  ### Step 2 — write the report
+
+  Follow `~/project/skills/write-a-report/SKILL.md` for the structure
+  and style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/docs/<slug>.md`.
+
+  If `write-a-report` was invoked earlier in this session, skip the
+  report and go straight to step 3.
+
+  **Re-run detection.** If `~/project/docs/<slug>.md` already exists,
+  follow write-a-report's "Re-running in the same session" rule —
+  update the existing report rather than overwrite it. Verifying the
+  match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<UUID>.md`. Structure and
+  content per `~/project/skills/compact2/SKILL.md` — progress-report
+  half on top, `---`, then the `<analysis>` + `<summary>` blocks
+  following `~/project/skills/compact2/COMPACT_PROMPT.md`.
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<UUID>.json`. Schema
+  and per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md`
+  (the canonical spec). Density and entity-type guidance per
+  `~/project/skills/extract-kg/SKILL.md` step 4 — that skill
+  locally tightens the bare EXTRACT_PROMPT defaults to encourage
+  richer extraction (calibrate against the compaction's analysis
+  block; include when hesitating; soft entity types like `pattern`,
+  `failure-mode`, `constraint`, `gotcha` are first-class). Re-run
+  handling per `extract-kg`'s "Re-extracting in the same session"
+  section — overwrite if still in `incoming/`, delta-style if
+  already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/docs/<slug>.md` to replace it with the
+  real `<UUID>`. Skip this step if the report was an in-place update
+  (re-run case — already has the real UUID) or was skipped entirely
+  (write-a-report was invoked earlier in the session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: report + compaction — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● Re-run — this session already had `/end` invoked earlier. Verifying same session and updating the
+  three artifacts cumulatively.
+
+● Now updating the compaction cumulatively.
+
+● Now updating the KG with the new entities (demucs, htdemucs_6s, etc.) and renaming the venv
+  entity.
+
+● KG validates: 64 entities, 93 relationships, 0 dangling refs. Now commit `~/project` changes.
+
+● Three artifacts updated cumulatively:
+
+  - **Report**: `~/project/docs/pony-asr-streaming-bringup.md`
+  - **Compaction**: `~/project/compactions/session-0f989235-b7a0-4853-932e-962eaa14913d.md`
+  - **KG**: `~/lightrag-history/incoming/session-0f989235-b7a0-4853-932e-962eaa14913d.json`
+

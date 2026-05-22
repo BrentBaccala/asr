@@ -1,0 +1,682 @@
+❯ You are doing a thorough desk-research investigation. The goal is to
+  pick the best way to add a LIVE RUNNING ENGLISH TRANSLATION of streaming
+  Spanish (telephone-band, often code-switched, conversational) on top of
+  an already-working streaming-Spanish-ASR pipeline, before any build or
+  GPU time is committed — and to surface anything missed. RESEARCH ONLY:
+  no training, no large model downloads, no GPU runs. Web research +
+  model-card/repo inspection + reasoning, plus seconds-scale inspection of
+  what is already on pony if useful.
+
+  It is May 2026. Prefer recent (2025–2026) sources; the field moves fast.
+  The prior sibling task (`~/project/reports/es-streaming-asr-research.md`)
+  proved its worth by finding a model that postdated an earlier web hunt —
+  do the same diligence here for streaming speech translation.
+
+  ================================================================
+  BACKGROUND — established this session (verify, don't re-derive)
+  ================================================================
+
+  End use: live transcription of phone calls, Spanish (telephone-band
+  8 kHz, conversational, frequently EN/ES code-switched). Personal /
+  research use — NOT commercial. Therefore **CC-BY-NC licenses (NLLB,
+  SeamlessStreaming, etc.) are ACCEPTABLE** here; do not down-rank a model
+  solely for a non-commercial license, but DO record license clearly.
+
+  Hard constraint: single NVIDIA RTX 3090 (24 GB) on host `pony`, no
+  cloud rental. The 3090 is **already ~21.7 GB committed** to a running
+  vLLM server for streaming Spanish ASR (`mistralai/Voxtral-Mini-4B-
+  Realtime-2602`, PIECEWISE, 127.0.0.1:8000). So any *additional* GPU
+  model has only ~2 GB free — it must run on CPU, or it must *replace*
+  Voxtral. Treat this as binding.
+
+  Already determined (cite, don't redo):
+  - Streaming Spanish ASR is solved well by Voxtral-Mini-4B-Realtime:
+    ~0.7 s leading-edge latency, real-time on the 3090, clean Spanish
+    with punctuation, dual-channel-capable. **It is transcription-only**
+    — confirmed from the model card: no translate mode, task param, or
+    target-language option. So Voxtral cannot itself emit English.
+  - Code-switch behavior of Voxtral (measured, block-level ES→EN→ES):
+    it tracks the switch (clean ES→EN) but has an English "hangover" on
+    the EN→ES return and formatting degrades across switches;
+    intra-sentential code-switch untested.
+  - `ctranslate2` 4.7.1 is installed in `~/asr/asr-env` (the
+    faster-whisper venv); faster-whisper is present there too (so
+    Whisper `task=translate` is a zero-build baseline already runnable).
+  - `opus-mt-es-en` is NOT in cosine's HF cache (it may exist under the
+    `~claude` account per `~/project/reports/cosine-asr-streaming-
+    report.md`); models replicate cosine<-claude via a /tmp tar, but
+    that is a build step, out of scope here.
+  - ASR-side alternatives (Vosk es-0.42 ~2 s true-streaming words;
+    bookbot IPA zipformer; parakeet) are fully characterized in
+    `~/project/reports/es-streaming-asr-research.md` and
+    `~/project/reports/cosine-asr-streaming-report.md` — read those for
+    context; do not re-evaluate the ASR side.
+
+  Candidate approaches identified (confirm / refute / expand):
+
+    A. **Cascade**: take the streaming Spanish transcript (Voxtral) and
+       translate committed sentences ES→EN with a lightweight MT model
+       run on CPU via CTranslate2 (no GPU contention). MT-stage
+       candidates: `opus-mt-es-en` (small), `opus-mt-tc-big-es-en`,
+       `NLLB-200-distilled-600M` / `-1.3B`, MADLAD-400, M2M-100, small
+       local instruct LLM. Gives BOTH the ES transcript and the running
+       EN line. Current front-runner: cascade → NLLB-200-distilled-600M
+       (research use, so NC is fine), opus-mt-tc-big as the lighter
+       alternative.
+    B. **Direct streaming speech-to-text translation (S2TT)**: one model
+       takes Spanish audio and emits English text directly.
+       SeamlessStreaming / Seamless M4T v2 (streaming, es→en, CC-BY-NC),
+       NVIDIA Canary (offline -> buffered latency), Whisper
+       `task=translate` (buffered ~5 s, weak), Kyutai / other
+       simultaneous-ST systems. Likely must REPLACE Voxtral on the GPU
+       (can't co-reside) and may not also give a clean ES transcript.
+    C. Buffered S2TT (Canary / Whisper-translate in a sliding window) —
+       known multi-second latency (the latency class already rejected
+       for ASR); quality-fallback only.
+
+  ================================================================
+  YOUR JOB — answer thoroughly, with sources
+  ================================================================
+
+  1. STREAMING ST LANDSCAPE (find anything missed). Exhaustively sweep
+     2025–2026 for models/systems that produce English text from Spanish
+     speech with LOW LATENCY suitable for a live running translation:
+     SeamlessStreaming / Seamless M4T v2 (and any newer Meta release),
+     NVIDIA Canary / canary-1b-flash / any streaming Canary, Kyutai
+     (does its STT or any Kyutai model do ES→EN streaming?), Whisper
+     family (large-v3 / turbo / distil) translate, AudioPaLM-likes,
+     SimulST research systems with usable checkpoints, any 2026
+     streaming-ST model, any Mistral/Voxtral variant with translation
+     (base Voxtral-Mini? a Voxtral with a translate task?). For each
+     promising hit: streaming? es→en quality? latency class? VRAM (fits
+     alongside ~2 GB free, or must replace Voxtral)? license? does it
+     ALSO yield a Spanish transcript? Is there now a single model that
+     beats the cascade for "ES transcript + running EN translation"?
+
+  2. CASCADE MT-STAGE DEEP DIVE. For `opus-mt-es-en`,
+     `opus-mt-tc-big-es-en`, `NLLB-200-distilled-600M` and `-1.3B`,
+     MADLAD-400 (3B/7B), M2M-100, and a small local instruct LLM as
+     translator: es→en quality with current numbers where available
+     (FLORES-200, WMT, Tatoeba), but WEIGHT HEAVILY the question that
+     actually matters and is under-reported — **robustness to ASR
+     output: disfluent, unpunctuated, ungrammatical, spontaneous
+     telephone-register Spanish** (find papers/evidence on MT-on-ASR-
+     output / spoken-domain robustness, not just clean-text BLEU).
+     CTranslate2 support + int8 CPU latency/RAM per model on a typical
+     server CPU; sentence vs document-level context; permissive vs NC
+     license. Give a defensible quality+robustness ranking for THIS
+     input, not generic BLEU.
+
+  3. INCREMENTAL / SIMULTANEOUS MT (the hard part of a cascade).
+     Translating a streaming ASR commit-stream is not batch MT: cover
+     re-translation churn, the segmentation/commit policy, and
+     stable/streaming-MT techniques (wait-k, prefix decoding,
+     LocalAgreement-for-MT, "stable"/"streaming" MT, EHA, etc.). What is
+     the right way to drive sentence-level MT from Voxtral's incremental
+     output to get a STABLE running English line with minimal added lag
+     and minimal rewriting? Any libraries/recipes (e.g.,
+     simuleval-style, sacrebleu-irrelevant; real deployable ones).
+
+  4. SINGLE-3090 / GPU-CONTENTION REALITY. Quantify honestly: can ANY
+     GPU translation model co-reside with the 21.7 GB Voxtral vLLM
+     server (NLLB-1.3B GPU, Seamless, Canary, a 7–8B LLM at Q4)? If a
+     direct S2TT model must REPLACE Voxtral, enumerate exactly what is
+     lost (validated 0.7 s streaming ES transcript, dual-channel
+     capacity, the ES transcript itself) and judge whether the net is
+     better. Realistic CPU-only MT throughput (CT2 int8) for
+     sentence-cadence streaming on pony's CPU — is the cascade's MT
+     stage genuinely "free" relative to ASR/segmentation latency?
+
+  5. CODE-SWITCH / BILINGUAL INTERACTION. Real calls mix EN/ES. For the
+     translation layer: the right design for "translate the Spanish,
+     pass English through unchanged" — per-segment language routing
+     (cost, latency, reliability), vs a multilingual MT (NLLB) or
+     Seamless handling mixed input natively. How badly does feeding
+     English into an es→en model fail? Does Seamless/NLLB degrade more
+     gracefully on code-switched input than an opus-mt bilingual? What
+     does the Voxtral code-switch behavior (clean ES→EN, EN→ES hangover)
+     imply for a cascade built on its output?
+
+  6. CONTRARIAN / MISSED FRAMINGS. Argue against the cascade
+     recommendation. Is a single multilingual streaming ASR+ST model now
+     strictly better? Is a small local LLM doing streaming MT viable
+     given the GPU limit (or is CPU-LLM-MT too slow)? Should higher
+     latency be accepted for materially better quality (buffered
+     Seamless/Canary)? Is "running continuous translation" even the
+     right product vs. on-demand/segment or post-call? Is the zero-build
+     Whisper `task=translate` (already in asr-env) a good-enough baseline
+     that changes the cost/benefit? Be willing to conclude the
+     recommendation should change.
+
+  ================================================================
+  CONSTRAINTS / NON-GOALS
+  ================================================================
+
+  - No training, fine-tuning, large downloads, or GPU benchmark runs.
+    Seconds-scale `ssh cosine@pony` inspection (what's cached, lib
+    versions) is fine; do not run heavy compute or restart the vLLM
+    server.
+  - Do not re-derive the established facts above; cite the two prior
+    reports for ASR-side context and move on.
+  - Judge every option against the REAL target: low-latency *running*
+    English translation of telephone-band, conversational, often
+    code-switched Spanish, on a single 3090 already holding Voxtral,
+    personal/research use (NC OK). Not clean-text BLEU, not commercial.
+
+  ================================================================
+  REPORT
+  ================================================================
+
+  Use the `end` skill at the close of the task. The findings report
+  must land at `~/project/reports/es-en-streaming-translation-research.md`.
+
+  **Findings to capture:** the streaming-ST landscape sweep (table:
+  model -> streaming? / es→en quality / latency / VRAM-fits-alongside-or-
+  replaces-Voxtral / also-gives-ES-transcript / license); the cascade
+  MT-stage ranking emphasizing robustness to disfluent ASR output (not
+  just clean BLEU), with CT2-int8 CPU latency/RAM per model; the
+  incremental/simultaneous-MT method recommendation (concrete commit/
+  segmentation policy to avoid rewrite churn); the GPU-contention verdict
+  (co-reside vs replace, what's lost); the code-switch routing design;
+  and an explicit "what was missed / contrarian options" section. Cite
+  every external claim; be honest about uncertainty; flag anything only
+  an experiment can settle.
+
+  **Decision criterion (the Summary must deliver a verdict):** a ranked
+  recommendation — cascade (with the specific MT model) vs a named direct
+  streaming-ST model — stating for the top pick: expected es→en quality
+  on conversational/code-switched telephone Spanish, added latency over
+  the existing ~0.7 s ASR, whether it co-resides with Voxtral or replaces
+  it (and the consequence), total single-3090 build cost, and the single
+  biggest residual risk. Concluding that an off-the-shelf single model
+  should replace the cascade-on-Voxtral design — or that the cascade with
+  model X is clearly right — are both acceptable if evidenced. Name the
+  one cheap experiment that would settle it if the evidence is short.
+
+
+  Closing ritual: before emitting the TASK_RESULT line, invoke the
+  `end` skill if one is defined. (If no such skill exists, skip this.)
+
+  IMPORTANT: As the very last line of your response, write exactly one of:
+    TASK_RESULT: SUCCESS
+    TASK_RESULT: FAILURE
+  When the task has a countable outcome (tests passed, builds completed,
+  checks run, etc.), append an N/M value:
+    TASK_RESULT: SUCCESS 184/184
+    TASK_RESULT: FAILURE 10/11
+  This signals whether the task's objective was achieved (e.g., tests passed,
+  build succeeded), not just whether you completed your analysis.
+
+  Do NOT run Bash commands in the background (no run_in_background on Bash).
+  Run all commands synchronously so output is captured in your response.
+
+  If a message wrapped in <task-inbox>...</task-inbox> tags appears in
+  your context during the run, it is a live instruction sent by the user
+  while this task is in flight (delivered via a hook, not present in the
+  original prompt). Treat its contents as authoritative user direction
+  and incorporate it into your work.
+
+● I'll research the best way to add live English translation on top of the streaming Spanish ASR
+  pipeline. Let me start by reviewing the prior reports for context, then conduct the web research.
+
+● Now let me read the second prior report for ASR-side context.
+
+● Now I have the ASR-side context. Let me do a quick seconds-scale inspection of pony's current
+  state, then do the web research.
+
+● Useful baseline. pony has a 12-thread Haswell-E i7-5820K (2014-era, no AVX-512, has AVX2), ct2
+  4.7.1, faster-whisper 1.2.1. No opus-mt-es-en in cosine's cache (confirms the prompt). Let me
+  check GPU state and the vLLM server, then move to web research.
+
+● Confirmed: GPU has exactly **2381 MiB free** (21744 MiB used by Voxtral vLLM at
+  `--gpu-memory-utilization 0.92`). The binding constraint in the prompt is verified live. Now the
+  web research. Let me load WebSearch and WebFetch.
+
+● Now the streaming-ST landscape sweep. Let me run several searches in parallel.
+
+● Good — SeamlessStreaming uses EMMA, ~2s latency, 66% BLEU drop for real-time. Let me dig into more
+  candidates.
+
+● Significant find: **Hibiki-Zero (Kyutai, Feb 2026)** — multilingual streaming speech translation,
+  **Spanish→English** explicitly, low latency, voice transfer. This postdates the prior ASR report's
+  web hunt (which only knew Kyutai STT en/fr). Let me dig into Hibiki-Zero details.
+
+● Hibiki-Zero: 3B params, MIT license, Spanish→English, but **8-12 GB VRAM and NVIDIA GPU required**
+  — cannot co-reside with Voxtral (only 2.3 GB free), and it's speech-to-speech focused. Let me get
+  more on Hibiki-Zero text output and the original Hibiki, plus the Voxtral TTS / Voxtral translate
+  question.
+
+● Very important finding: **Voxtral Small/Mini (the base instruct models, not the Realtime variant)
+  DO have speech translation** including Spanish↔English (FLEURS-Translation benchmark, SOTA). And
+  Mistral's own April 2026 reference workflow is exactly a **cascade**: Voxtral Mini Transcribe
+  Realtime → Mistral Large translation → Voxtral TTS. This validates the cascade architecture from
+  the vendor itself. Let me dig into the Voxtral translation specifics and whether the *Realtime*
+  variant has any translate capability.
+
+● Let me directly fetch the Voxtral-Mini-4B-Realtime model card to confirm transcription-only (the
+  prompt asserts this; I should verify) and check the Voxtral base translation numbers.
+
+● Confirmed: Voxtral-Mini-4B-Realtime is **transcription-only** (verified from model card). The base
+  Voxtral Mini-3B / Small-24B have translation but are NOT streaming. Now there's a CS-FLEURS
+  code-switched dataset paper (2509.14161) — relevant for the code-switch question. Let me now
+  research the cascade MT stage and the CS-FLEURS dataset, plus check NLLB/Opus-MT robustness on ASR
+  output.
+
+● The key cascade challenge confirmed: ASR output lacks punctuation/case and has errors — the
+  well-known ASR↔MT mismatch. **But Voxtral-Mini-4B-Realtime produces punctuated text** (per prior
+  report: "clean Spanish text with punctuation"), which materially mitigates this. Let me research
+  incremental/simultaneous MT techniques and the CS-FLEURS code-switch dataset.
+
+● Strong evidence: **multilingual MT (NLLB) outperforms narrow bilingual (opus-mt) on code-switched
+  Spanish-English**. This is decisive for the MT-stage ranking given the code-switch requirement.
+  Let me get the re-translation vs streaming paper details and the MLLP-VRAIN IWSLT 2025
+  simultaneous ST system, then check NLLB CT2 performance.
+
+● Let me get the re-translation paper from the HTML version and the IWSLT 2025 simultaneous ST
+  system.
+
+❯ Continue from where you left off.
+
+● No response requested.
+
+❯ the session crashed; resume your work
+
+● Resuming. I have substantial findings already. Let me fill the remaining research gaps
+  (re-translation technique details, CT2 CPU throughput, MADLAD/small-LLM MT), then write the
+  report.
+
+● I have enough for a comprehensive report. One final targeted fetch for the concrete model
+  comparison, then I'll write it.
+
+● I now have comprehensive research. Writing the report.
+
+● Report written. Now invoking the `end` skill as instructed by the task.
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+  ARGUMENTS: Research-only task: desk research on adding live ES→EN streaming translation atop the
+  Voxtral-Realtime Spanish ASR pipeline on pony. Findings report already written at
+  ~/project/reports/es-en-streaming-translation-research.md. Task slug:
+  es-en-streaming-translation-research.
+
+● First run. The report is already written. Let me kick off session-ID detection, then write the
+  compaction and KG.
+
+● Now writing the compaction file.
+
+● Now backfill the correct session ID in the report (I had carried over the sibling report's ID).
+
+● Now commit the `~/project` artifacts.
+

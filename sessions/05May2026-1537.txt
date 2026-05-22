@@ -1,0 +1,1727 @@
+❯ I'd like to configure my Android cell phone and Ubuntu 24 laptop so that the telephone audio from
+  the phone can be routed through an AI model for speech-to-text transcription.  How can i do this?
+
+● Three viable paths; the right one depends on whether you need real-time and whether you control
+  both ends of the call.
+
+  **1. Bluetooth HFP (best real-time path)** — Pair the phone to the laptop, then when a call comes
+  in, route audio to the laptop instead of the phone earpiece. PipeWire on Ubuntu 24 exposes the HFP
+  link as both a sink (your mic to remote) and a source (remote + sidetone to you). You capture the
+  source with `parec` or `pw-record` and pipe to a transcriber. Caveats: HFP is mono 8 kHz (mSBC
+  pushes it to 16 kHz wideband if both ends support it); both sides come mixed on one channel; you
+  need `bluez` + `wireplumber` with HFP enabled (not the default A2DP-only profile — you toggle it
+  via `pactl set-card-profile bluez_card.XX_XX... handsfree_head_unit`).
+
+  **2. 3.5mm splitter / USB-C audio tap (most reliable, not real-time-friendly)** — Hardware
+  splitter from the phone's headset output into the laptop's line-in. Captures the mixed call audio
+  cleanly without OS cooperation. Works on any phone, ignores Android's recording restrictions, but
+  you lose hands-free use unless you add a headset on the splitter's other branch.
+
+  **3. On-device recorder + batch transcribe** — Google Phone's built-in recorder (regional) or an
+  accessibility-service recorder app, then rsync/Syncthing the WAV to the laptop. Not real-time;
+  modern Android (10+) blocks most third-party call recorders unless they exploit
+  accessibility-service loopholes that Google keeps closing.
+
+  **Transcription side on Ubuntu** is the easy half. Run `whisper.cpp` (or `faster-whisper` for GPU)
+  locally, or pipe to OpenAI's Whisper API. Pipeline:
+
+  ```
+  parec --device=<bt-source> --rate=16000 --channels=1 --format=s16le \
+    | ffmpeg -f s16le -ar 16000 -ac 1 -i - -f wav - \
+    | whisper-stream  # or chunked POST to API
+  ```
+
+  For streaming-quality results, `whisper.cpp`'s `stream` example does VAD-chunked transcription on
+  a rolling buffer; that's the closest to live captions you'll get without a paid streaming ASR
+  (Deepgram, AssemblyAI Realtime, Azure Speech).
+
+  **Recommendation:** Bluetooth HFP + local `whisper.cpp` streaming. It's free, on-device, and the
+  HFP plumbing already works on Ubuntu 24's PipeWire stack.
+
+  **Legal note:** Call-recording consent law varies (one-party vs all-party) by jurisdiction — worth
+  checking before routing the remote party's audio through any pipeline, especially a cloud API.
+
+  Want me to write out the concrete PipeWire/whisper.cpp setup as a script?
+
+❯ my friend Alexis suggested nvidia parakeet
+
+● Good pick. Parakeet-TDT-0.6B-v2 (and now v3) is at or near the top of the HuggingFace ASR
+  leaderboard for English, runs at RTF ~0.005 on a modern NVIDIA GPU (i.e., 200× real-time), and has
+  streaming inference baked into NeMo. CC-BY-4.0 license, so no API costs.
+
+  Two practical notes for your setup:
+
+  **Run it on pony, not the laptop.** Your laptop is Ubuntu 24 without a GPU mentioned; pony has the
+  GPU and is already your local-inference host. Pipeline becomes: phone → Bluetooth HFP → laptop
+  captures with `parec` → stream raw 16 kHz s16le over TCP/UDP to pony → NeMo Parakeet on pony →
+  transcript back over the same socket. A 30-line Python script on each side. Latency budget is
+  dominated by the Bluetooth side, not the model.
+
+  **Use the streaming wrapper, not file-based inference.** NeMo ships
+  `cache_aware_streaming_infer.py` and the TDT variants are specifically designed for low-latency
+  chunked decoding (80 ms or 480 ms lookahead chunks). The non-streaming entry point will work but
+  buffers the whole utterance — fine for batch, wrong shape for live calls.
+
+  **Caveat:** Parakeet is English-only through v2; v3 added a few European languages but is still
+  Latin-script. If you ever need other languages, Whisper-large-v3 is the multilingual fallback.
+
+  Want me to sketch the laptop-side capture script + pony-side NeMo server, or set it up end-to-end?
+
+❯ ssh to pony and check out its bluetooth.  maybe we can pair right to pony
+
+● Hardware is there (Broadcom BCM20702 BT 4.0+LE on USB) but the stack isn't installed. Let me check
+  the audio side and confirm what's needed.
+
+● Pony is hardware-ready but the userspace is missing. It's a headless inference box — no audio
+  stack at all.
+
+  **What's there:**
+  - BCM20702 Bluetooth 4.0+LE adapter on USB
+  - Kernel side fully loaded: `btusb`, `bluetooth`, `btbcm`, firmware packages installed
+  - RTX 3090 (great for Parakeet — TDT-0.6B will run at ~500× real-time)
+
+  **What's missing (needs sudo):**
+  ```
+  sudo apt install bluez pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth
+  sudo systemctl --global enable pipewire pipewire-pulse wireplumber
+  sudo systemctl enable --now bluetooth
+  ```
+
+  `bluez` gives you `bluetoothctl` and the daemon; `libspa-0.2-bluetooth` is the PipeWire plugin
+  that exposes HFP/A2DP as PipeWire sources/sinks. Without it the phone can pair but you can't
+  capture audio.
+
+  **One thing to think about before installing:** pony is stationary (desktop tower, fixed
+  wifi/wired IP). Pairing the phone directly means the phone has to be within ~10 m of pony during
+  every call. Two layouts:
+
+  1. **Phone → pony (direct BT)** — simpler pipeline, one fewer hop, but ties you to pony's
+  location.
+  2. **Phone → laptop (BT) → pony (network)** — laptop is mobile, you stream raw 16 kHz PCM over the
+  LAN to pony for inference. Two extra components, but the phone follows you around.
+
+  If pony lives at your desk and that's where you take calls, option 1 is cleaner. If you wander,
+  option 2.
+
+  Want me to draft the install commands for you to run with sudo, or do you want to think about the
+  layout first?
+
+❯ let's go with option 1.  you have sudo access on pony
+
+● Controller is up as `pony` at `[REDACTED-MAC]`. Two things to handle before pairing:
+
+  1. Make pony pairable + discoverable
+  2. Confirm PipeWire's Bluetooth module is loaded (HFP profile)
+
+● Stack is all in place. Now I'll put pony into pairing mode and you handle the phone side.
+
+● Pairable flipped back when the session ended. Let me start a persistent bluetoothctl session in
+  the background so the agent stays registered, and put pony in scan mode.
+
+● Pony is now:
+  - **Powered**: yes
+  - **Discoverable**: yes (5 min timeout)
+  - **Pairable**: yes
+  - **Scanning** for nearby devices
+  - Visible name: **pony**, address `[REDACTED-MAC]`
+
+  A persistent `bluetoothctl` session is running in tmux on pony with a `KeyboardDisplay` agent, so
+  it can accept pairing requests and confirm passkeys.
+
+  **Your turn — on the phone:**
+
+  1. Open **Settings → Bluetooth** (or Connected devices → Bluetooth)
+  2. Tap **Pair new device** / scan
+  3. Tap **pony** when it appears in the list
+  4. A 6-digit passkey will pop up on the phone — tell me the number and I'll confirm it on pony's
+  side (the agent will print the same number; we just need to accept it).
+
+  Once paired, I'll mark the device trusted, set the audio profile to Hands-Free, and we can verify
+  the HFP source shows up in PipeWire.
+
+❯ is it still discoverable?
+
+● Yes — still discoverable and pairable. Let me reset the 5-minute timer so you have a fresh window.
+
+● Fresh 5-minute window. Look for **pony** on your phone's Bluetooth list now.
+
+❯ so, we have the antenna problem again with pony
+
+● Right — the BCM20702 BT chip is on the same onboard combo module as the BCM4360 wifi, so it shares
+  the bare reverse-SMA connectors on the rear I/O panel that are missing antennas. BT range without
+  an antenna is roughly "phone touching the chassis."
+
+  Two practical ways forward:
+
+  1. **Cheap USB Bluetooth dongle** ($5–15, e.g. TP-Link UB400 or any CSR8510-based stick). Plug it
+  in, kernel auto-binds `btusb`, it shows up as a second controller (`hci1`) — or you can disable
+  the onboard one in `bluetoothctl` so it's the only `hci0`. Self-contained antenna in the dongle,
+  no rear-panel cabling. Same fix as the wifi-antenna recommendation, just for BT, and probably the
+  same shopping trip.
+
+  2. **Fall back to phone → laptop (BT) → pony (network).** Your laptop almost certainly has a
+  working BT antenna. Pipeline becomes: pair phone to laptop, capture HFP source on laptop with
+  `parec`, stream raw 16 kHz PCM over TCP to pony, NeMo Parakeet on pony streams the transcript
+  back. ~30 lines of Python on each side. Loses the "single-host simplicity" advantage of option 1
+  but works *today*.
+
+  Given pony's antenna situation is already on the open-items list and a generic dongle solves both
+  wifi *and* BT for under $20, I'd lean toward ordering the antenna(s) and dongle, and using option
+  2 in the meantime so you can develop and test the streaming pipeline without waiting on hardware.
+
+  Should I tear down pony's pairing-mode setup (kill the tmux scan session, turn off discoverable)
+  and pivot to the laptop-as-bridge plan?
+
+❯ tear it down
+
+● Torn down: scan off, discoverable off, pairable off, tmux session killed. The bluez/pipewire stack
+  is still installed (harmless and useful when an antenna or USB dongle arrives) — just not actively
+  advertising.
+
+  Want me to start sketching the laptop-as-bridge pipeline (laptop captures HFP audio, streams PCM
+  to pony, Parakeet on pony returns transcripts)?
+
+❯ sketch it out
+
+● ## Architecture
+
+  ```
+  ┌──────────┐    BT/HFP    ┌──────────────────┐    TCP/PCM    ┌──────────────┐
+  │  phone   │ ───mSBC───▶  │ laptop (Ub 24)   │ ───16k s16─▶ │ pony (RTX    │
+  │  (call)  │              │ pw-record + bridge│              │ 3090)         │
+  │          │  ◀───────────│                   │ ◀───text──── │ Parakeet TDT │
+  └──────────┘              └──────────────────┘   transcript  │ streaming    │
+                                    │                          └──────────────┘
+                                    └─▶ stdout / ncurses / file
+  ```
+
+  Three components, ~150 lines total.
+
+  ---
+
+  ### 1. Laptop: one-time BT pairing
+
+  ```bash
+  bluetoothctl
+  > agent KeyboardDisplay
+  > default-agent
+  > scan on
+  # tap "pair" on phone, see [NEW] Device XX:XX:..., then:
+  > pair  XX:XX:XX:XX:XX:XX
+  > trust XX:XX:XX:XX:XX:XX
+  > connect XX:XX:XX:XX:XX:XX
+  > quit
+  ```
+
+  Confirm wideband HFP (mSBC) — listed in `Audio Sink/Source` UUIDs after connect. Switch the card
+  to HFP when a call is active:
+
+  ```bash
+  pactl set-card-profile bluez_card.XX_XX_XX_XX_XX_XX handsfree_head_unit
+  ```
+
+  (WirePlumber 0.5+ usually auto-switches when SCO traffic starts; the explicit `set-card-profile`
+  is the fallback.)
+
+  ---
+
+  ### 2. Laptop: capture-and-stream bridge (`bridge.py`)
+
+  ```python
+  #!/usr/bin/env python3
+  """Capture HFP source on laptop, stream 16 kHz s16le mono to pony,
+     print transcripts received on the same socket."""
+  import socket, subprocess, threading, sys
+
+  PONY = ("pony", 9101)
+  BT_SOURCE = "bluez_input.XX_XX_XX_XX_XX_XX.handsfree-head-unit"
+  CHUNK = 3200  # 100 ms @ 16 kHz s16 mono
+
+  sock = socket.create_connection(PONY)
+  sock_w = sock.makefile("wb")
+  sock_r = sock.makefile("r")
+
+  # Reader thread: print transcripts (newline-delimited JSON or plain text)
+  def reader():
+      for line in sock_r:
+          sys.stdout.write(line); sys.stdout.flush()
+  threading.Thread(target=reader, daemon=True).start()
+
+  # Capture from PipeWire BT source, pipe raw PCM to socket
+  rec = subprocess.Popen([
+      "pw-record",
+      "--target", BT_SOURCE,
+      "--rate", "16000", "--channels", "1", "--format", "s16",
+      "-",
+  ], stdout=subprocess.PIPE)
+
+  while chunk := rec.stdout.read(CHUNK):
+      sock_w.write(chunk); sock_w.flush()
+  ```
+
+  Run during a call:
+
+  ```bash
+  python3 bridge.py
+  ```
+
+  ---
+
+  ### 3. Pony: streaming Parakeet server (`asr_server.py`)
+
+  ```python
+  #!/usr/bin/env python3
+  """TCP server: read 16 kHz s16le PCM, run Parakeet cache-aware streaming,
+     write newline-delimited transcripts back."""
+  import socket, threading, numpy as np, torch
+  import nemo.collections.asr as nemo_asr
+  from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
+
+  MODEL = "nvidia/parakeet-tdt-0.6b-v2"
+  PORT = 9101
+  CHUNK_MS = 480   # encoder lookahead window for v2
+
+  asr = nemo_asr.models.ASRModel.from_pretrained(MODEL).cuda().eval()
+  asr.encoder.setup_streaming_params(
+      chunk_size=int(CHUNK_MS * 16),  # samples
+      shift_size=int(CHUNK_MS * 16),
+      left_chunks=4,                   # 4 chunks of past context
+  )
+
+  def serve(conn):
+      buf = CacheAwareStreamingAudioBuffer(model=asr)
+      cache = asr.encoder.get_initial_cache_state(batch_size=1)
+      pending = b""
+      SAMPLES_PER_CHUNK = int(CHUNK_MS * 16)
+      BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * 2
+      with conn, conn.makefile("wb") as out:
+          while True:
+              data = conn.recv(8192)
+              if not data: break
+              pending += data
+              while len(pending) >= BYTES_PER_CHUNK:
+                  chunk = np.frombuffer(pending[:BYTES_PER_CHUNK], np.int16).astype(np.float32) /
+  32768.0
+                  pending = pending[BYTES_PER_CHUNK:]
+                  with torch.inference_mode():
+                      text, cache = asr.transcribe_streaming(
+                          audio=torch.from_numpy(chunk).unsqueeze(0).cuda(),
+                          cache=cache,
+                      )
+                  if text.strip():
+                      out.write((text + "\n").encode()); out.flush()
+
+  srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  srv.bind(("0.0.0.0", PORT)); srv.listen(1)
+  print(f"asr_server listening on :{PORT}")
+  while True:
+      conn, _ = srv.accept()
+      threading.Thread(target=serve, args=(conn,), daemon=True).start()
+  ```
+
+  NeMo's actual streaming API has a few variants per model class — the `transcribe_streaming` call
+  above is illustrative. The canonical reference is
+  `examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py` in the NeMo
+  repo; the server is essentially that example wrapped in a socket loop.
+
+  Pony env setup (one-time):
+
+  ```bash
+  ssh claude@pony 'python3 -m venv ~/asr-env && \
+     ~/asr-env/bin/pip install nemo_toolkit[asr]==2.* torch'
+  ```
+
+  Run server:
+
+  ```bash
+  ssh claude@pony '~/asr-env/bin/python ~/asr_server.py'
+  ```
+
+  ---
+
+  ### What to build / test first
+
+  In this order, each step independently verifiable:
+
+  1. **Pair phone to laptop, confirm HFP source exists** — `pactl list short sources | grep
+  handsfree`. Make a test call, run `pw-record --target=... | aplay` to hear the call locally on
+  laptop speakers. Validates the BT half end-to-end.
+  2. **Stand up Parakeet on pony in non-streaming mode first** — feed it a short WAV file, confirm
+  transcripts come out. Validates NeMo install + GPU + model download.
+  3. **Wire streaming + socket** — connect bridge.py to asr_server.py with a pre-recorded WAV (cat
+  into the socket) before doing it live.
+  4. **Live call test.**
+
+  The streaming-API hookup in step 3 is the part most likely to need tuning — chunk size, left
+  context, and whether to call `asr.transcribe_streaming` per chunk vs. drive the encoder/decoder
+  directly. Worth budgeting an evening to get partial-vs-final hypothesis behavior the way you want
+  it (Parakeet TDT emits hypothesis updates that change as more context arrives — you'll want to
+  overprint or use carriage returns rather than newlines once you get the prototype working).
+
+  Want me to start with step 2 (stand up Parakeet on pony, transcribe a test WAV) so we have the
+  inference half proven before touching the BT/streaming side?
+
+❯ for the laptop capture-and-stream bridge - could we just use wireplumber for that?
+
+● Yes, mostly — WirePlumber (the policy engine) + PipeWire's network modules can replace `bridge.py`
+  for the audio direction. You still need *something* small for transcripts to come back, but it's a
+  thin sidechannel rather than a full streaming bridge.
+
+  The cleanest path uses **`module-pulse-tunnel`** since you already have pipewire-pulse running on
+  pony.
+
+  ### Pipeline
+
+  ```
+  phone ──BT/HFP──▶ laptop                            pony
+                    ├── HFP source (pipewire)          ├── pipewire-pulse (TCP :4713)
+                    │                                  │     └── tunnel virtual source
+                    └── module-pulse-tunnel ──TCP─────▶│         "laptop_call"
+                         (sink → pony)                 │              │
+                                                       └── asr_server.py reads
+                                                           from pulse via parec
+  ```
+
+  ### Pony side (one-time): enable the pipewire-pulse TCP listener
+
+  ```
+  # /etc/pipewire/pipewire-pulse.conf.d/60-network.conf
+  context.modules = [
+    { name = libpipewire-module-protocol-pulse
+      args = {
+        server.address = [ "unix:native" "tcp:4713" ]
+        pulse.allow-anonymous-clients = true   # LAN-only, no auth
+      }
+    }
+  ]
+  ```
+
+  `systemctl --user restart pipewire-pulse`. Now anyone on the LAN can ship audio to pony's pipewire
+  (acceptable given the LAN is yours; tighten with an ACL if you ever expose it).
+
+  ### Laptop side: tunnel-sink toward pony
+
+  ```
+  # ~/.config/pipewire/pipewire.conf.d/50-pony-tunnel.conf
+  context.modules = [
+    { name = libpipewire-module-pulse-tunnel
+      args = {
+        tunnel.mode = sink
+        pulse.server.address = "tcp:pony:4713"
+        node.name = "pony_asr"
+        node.description = "Pony ASR"
+        audio.format = S16LE
+        audio.rate = 16000
+        audio.channels = 1
+      }
+    }
+  ]
+  ```
+
+  `systemctl --user restart pipewire`. A virtual sink "Pony ASR" now exists; anything routed to it
+  lands on pony as a source called `tunnel.<hostname>.pony_asr` (or similar — `pactl list short
+  sources` on pony confirms the name).
+
+  ### WirePlumber rule: auto-link HFP source → tunnel sink
+
+  ```
+  # ~/.config/wireplumber/wireplumber.conf.d/60-bt-asr-route.conf
+  monitor.bluez.rules = [
+    { matches = [ { node.name = "~bluez_input\\..*\\.handsfree-head-unit" } ]
+      actions = {
+        update-props = { node.target = "pony_asr" }
+      }
+    }
+  ]
+  ```
+
+  Now any time the phone connects in HFP, its source auto-routes to the tunnel sink — no manual
+  `pw-link` and no Python bridge process. Disconnect the phone and the link tears down on its own.
+
+  ### Pony side: ASR server reads from the tunnel source
+
+  ```python
+  # in asr_server.py, replace the socket recv loop with:
+  src = subprocess.Popen([
+      "parec", "--device=tunnel.laptop.pony_asr.monitor",  # or whatever pactl shows
+      "--rate=16000", "--channels=1", "--format=s16le",
+  ], stdout=subprocess.PIPE)
+  # feed src.stdout into the Parakeet streaming buffer same as before
+  ```
+
+  ### Transcript back-channel
+
+  Still needs a small socket — e.g., the asr_server publishes lines on TCP `:9102`; the laptop runs
+  `nc pony 9102 | tee call.log` (or a 10-line tk window). PipeWire doesn't carry text, so this stays
+  separate.
+
+  ### Tradeoffs vs. the Python bridge
+
+  **Wins:** no bridge process to start/restart; auto-link on HFP connect; PipeWire handles
+  resampling/format negotiation; one less codebase.
+
+  **Losses:** more state spread across config files (laptop + pony + WirePlumber); debug story is
+  `pw-top` / `pactl list` instead of `print()`; the LAN-anonymous PulseAudio TCP listener is a small
+  security surface (mitigate with `pulse.acl` if needed).
+
+  For a project that's going to live for a while, the WirePlumber path is the right one. For a
+  "prove the concept this weekend" prototype, the Python bridge is fewer moving parts. Either is
+  fine — and if you start with the Python bridge, swapping in the tunnel later is a drop-in
+  replacement (just retarget `parec` on pony, the asr_server doesn't care where its bytes come
+  from).
+
+❯ the transcript can just be read over ssh, I think
+
+● Right — that collapses the back-channel entirely. ssh already gives us a bidirectional pipe; we
+  just don't use the upstream side. The "server" stops being a server: it's a one-shot CLI that
+  reads `parec` and writes to stdout, started over ssh.
+
+  ### Final shape
+
+  ```
+  laptop: $ ssh pony asr-transcribe.py | tee call.log
+                  │
+                  └── ssh stdout carries transcripts
+
+  phone ──HFP──▶ laptop ─PipeWire tunnel─▶ pony
+                                              │
+                                              └── parec (tunnel source) → Parakeet → stdout
+  ```
+
+  ### `asr-transcribe.py` on pony (no socket code at all)
+
+  ```python
+  #!/usr/bin/env python3
+  import subprocess, sys, numpy as np, torch
+  import nemo.collections.asr as nemo_asr
+
+  PULSE_SOURCE = "tunnel.laptop.pony_asr.monitor"  # confirm with `pactl list short sources`
+  CHUNK_MS = 480
+  SAMPLES = CHUNK_MS * 16
+  BYTES = SAMPLES * 2
+
+  asr = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2").cuda().eval()
+  asr.encoder.setup_streaming_params(chunk_size=SAMPLES, shift_size=SAMPLES, left_chunks=4)
+  cache = asr.encoder.get_initial_cache_state(batch_size=1)
+
+  rec = subprocess.Popen(
+      ["parec", f"--device={PULSE_SOURCE}", "--rate=16000", "--channels=1", "--format=s16le"],
+      stdout=subprocess.PIPE,
+  )
+
+  while chunk := rec.stdout.read(BYTES):
+      pcm = np.frombuffer(chunk, np.int16).astype(np.float32) / 32768.0
+      with torch.inference_mode():
+          text, cache = asr.transcribe_streaming(
+              audio=torch.from_numpy(pcm).unsqueeze(0).cuda(), cache=cache,
+          )
+      if text.strip():
+          print(text, flush=True)
+  ```
+
+  ### Usage
+
+  ```bash
+  # laptop, when a call is active
+  ssh pony ~/asr-env/bin/python ~/asr-transcribe.py | tee ~/calls/$(date +%F-%H%M).log
+  ```
+
+  Three things, all natural:
+
+  - **Audio path**: PipeWire tunnel, configured once in WirePlumber, auto-routes on HFP connect.
+  - **Transcript path**: ssh stdout. No server, no port, no auth setup beyond your existing ssh key.
+  - **Teardown**: Ctrl-C the ssh session — `parec` gets SIGPIPE, asr-transcribe exits, model
+  unloads. The tunnel itself stays up (cheap; idle).
+
+  That's about as minimal as this gets. Want me to actually wire up the pony side (drop the
+  pipewire-pulse network config, install NeMo in a venv, fetch the Parakeet weights, run a smoke
+  test against a stored WAV) so the inference half is proven before you sort out the laptop config?
+
+❯ start fetching the parakeet weights in background
+
+● CLI was renamed `huggingface-cli` → `hf` in newer huggingface_hub. Switching to `hf download`.
+
+● Download started in tmux on pony. 3 files to fetch. Let me give it a minute then check progress.
+
+❯ [Request interrupted by user for tool use]
+
+❯ how can i play an mp3 on pony?
+
+● Two halves to this — what plays the file, and where the sound goes.
+
+  **Player:** nothing's installed yet. Quickest:
+
+  ```bash
+  ssh claude@pony 'sudo apt-get install -y mpv'   # mp3, ogg, flac, m4a, etc
+  ```
+
+  Then `mpv file.mp3`. Alternatives: `mpg123` (smaller, mp3-only), or `ffplay -nodisp -autoexit
+  file.mp3`.
+
+  **Output:** pony has two audio devices available — **HDA Intel PCH** (rear-panel 3.5mm jacks on
+  the motherboard) and **HDA NVidia** (HDMI/DP audio out from the RTX 3090). Sound only comes out of
+  pony if speakers/headphones are plugged into one of those, or if a monitor with built-in speakers
+  is on the HDMI.
+
+  If pony is fully headless (nothing plugged in), `mpv` will play the file silently — it'll decode
+  and run, just no audio anywhere. Three ways to actually hear it:
+
+  1. **Plug speakers into pony's rear 3.5mm.** `mpv` picks the default sink.
+  2. **Play it on the laptop instead.** `scp pony:file.mp3 . && mpv file.mp3`.
+  3. **Pipe pony's audio back to the laptop.** Reverse of the BT-call pipeline: `ssh pony 'mpv
+  --ao=pcm --ao-pcm-file=/dev/stdout file.mp3' | aplay -` (decodes on pony, plays on laptop). Crude
+  but works.
+
+  **One useful angle for the ASR project:** if you set up the laptop→pony PipeWire tunnel anyway,
+  you can play the mp3 *on the laptop*, route it to the tunnel sink, and it lands as a source on
+  pony. That's a great end-to-end test of the audio path *before* you involve the phone — Parakeet
+  transcribes the mp3 instead of a call.
+
+  What's the underlying goal — testing audio output, testing the tunnel, or actually wanting to
+  listen to something?
+
+❯ install mpv
+
+● Running in background as `b5e23r7g0`. I'll see the result when it finishes.
+
+❯ why is it taking so long?
+
+● Let me see what's happening on pony directly.
+
+● Bandwidth contention on pony's wifi dongle. The Parakeet download (now at 914 MB / ~3 GB total) is
+  saturating the MT7601U USB dongle at ~3 MB/s — that's pony's known cheap-wifi-without-real-antenna
+  ceiling. mpv install (~30-50 MB of deps) is fighting for the same pipe.
+
+  Two options:
+
+  1. **Wait it out** — both finish in maybe 10-15 min.
+  2. **Pause Parakeet, let mpv finish first** — kill the tmux session, install mpv, restart the
+  download. HF resumes from where it left off.
+
+  Which?
+
+❯ what's the form factor on the MT7601U?  what's that kind of dongle called?
+
+● It's a **nano USB WiFi dongle** — the cheapest form factor available. Specifics:
+
+  - **USB-A**, 802.11n single-band (2.4 GHz only), 150 Mbps theoretical
+  - **Roughly fingernail-sized**: barely protrudes ~15-20 mm from the USB port
+  - **Internal PCB antenna** (no external antenna, no SMA connector) — the antenna is just a copper
+  trace on the PCB inside the plastic shell
+  - Sold under generic names like "Mini USB WiFi Adapter 150 Mbps" for $5-10 on Amazon/eBay; the
+  MT7601U is the chip inside almost all of them
+
+  The compactness *is* the problem: a PCB antenna 15 mm long is fundamentally worse than even a
+  stubby 50 mm external antenna, and the metal of pony's chassis sits right next to it shielding
+  half the radiation pattern. That's why the documented effective rate is ~3 MB/s rather than the 18
+  MB/s you'd expect from "150 Mbps."
+
+  Cheap upgrade if you want one: a USB WiFi adapter with an external antenna (sometimes called "high
+  gain" or "long range") — a step up to MT7610U/RTL8811AU dual-band with a 5 dBi external antenna
+  runs ~$10-15 and typically sustains 30-50 MB/s on 5 GHz. Same USB port, same driver story, much
+  more bandwidth. Or — what we already discussed — get the SMA antenna for the BCM4360 and skip USB
+  wifi entirely.
+
+❯ can you recommend a nano USB WiFi dongle that runs well on linux?
+
+● In strict nano form factor, two are reliably good on Linux:
+
+  1. **TP-Link TL-WN725N v3** (~$10, RTL8188EUS chip). Driver is `r8188eu`, in-tree since kernel
+  5.13 — zero DKMS, plug-and-go. 2.4 GHz only, 150 Mbps. This is the boring-but-bulletproof choice;
+  same speed class as your current MT7601U but without the firmware-stall pattern that's been
+  dropping ollama pulls.
+
+  2. **TP-Link Archer T2U Nano (AC600)** (~$15, RTL8811AU chip). **Dual-band** (2.4 + 5 GHz),
+  802.11ac, 433 Mbps real-world. Truly nano — about the same physical size as the WN725N. Driver
+  story is messier: historically out-of-tree (`rtl8812au-dkms` from morrownr or aircrack-ng forks),
+  but pony's kernel 7.0 likely has native `rtw88_8821au` support. Worth one quick `dmesg` after
+  plugging in to see which path it takes; if the in-tree driver picks it up, you're done, otherwise
+  it's a DKMS install.
+
+  The reason there isn't a clear third option is that "nano" puts a hard cap on antenna gain — a 15
+  mm PCB trace can't physically be much better. Going to 5 GHz with an Archer T2U Nano roughly
+  **10×** your current bandwidth even with the same tiny antenna, because there's vastly less
+  interference up there.
+
+  **But — honest reframe:** pony's BCM4360 already works at the protocol level and just needs a
+  $5–15 reverse-SMA antenna stuck on the rear panel. That's the cheapest, most-bandwidth-per-dollar
+  fix and avoids the dongle/driver cycle entirely. The dongle path makes sense only if you
+  specifically want to avoid touching the chassis or want a portable adapter you can move between
+  machines.
+
+● mpv v0.41.0 installed cleanly on pony.
+
+❯ that's a good suggestion, and i am getting an antenna.  However, I have another device (my Linux
+  music keyboard) that runs Linux on a raspberry pi 5 and has the same issues with dropping the wifi
+  connection
+
+● Two angles worth considering before buying.
+
+  **First, the Pi 5's built-in wifi might be fixable in software.** The CYW43455 onboard radio drops
+  connections on a lot of installs, but it's usually one of three causes:
+
+  - **Power-save flapping**: `sudo iw wlan0 set power_save off` (and persist it). Default-on
+  power-save is a frequent dropout source on Pi.
+  - **brcmfmac firmware quirks**: `dmesg | grep brcmfmac` — if you see `Firmware: BCM4345/6`
+  retry/timeout messages, try a kernel/firmware update or pin to a known-good firmware blob.
+  - **Case shielding**: metal cases (Argon ONE, Flirc) cut Pi 5 wifi range dramatically. The chip
+  antenna sits under the SoC; metal directly above it kills it.
+
+  If `iw dev wlan0 station get <bssid>` reports decent signal (-65 dBm or better) and you still get
+  dropouts, it's almost certainly software/firmware. A dongle won't help.
+
+  **If a dongle is the right answer** (case shielding, weak signal, or you've ruled out the software
+  side): for a stationary music keyboard, drop the "nano" constraint. The Pi sits on a desk; a 5 cm
+  flip-up antenna isn't a downside, and it's the difference between "drops twice an hour" and "rock
+  solid for weeks."
+
+  Specific picks for Pi 5 (USB 3.0 ports, kernel 6.x, aarch64 Pi OS):
+
+  1. **TP-Link Archer T3U Plus (~$25)**. RTL8812BU chip, AC1300 dual-band, flip-up high-gain
+  antenna. Driver is `rtl88x2bu` — out-of-tree but morrownr's repo builds cleanly via DKMS on Pi OS,
+  and kernel 6.x is moving toward in-tree support. Best stability/range for the price; people use it
+  as the "if you're tired of fighting Pi wifi" answer.
+
+  2. **Alfa AWUS036ACM (~$35)**. MediaTek MT7612U, dual-band ac, big external antenna. `mt76x2u`
+  driver in-tree, just plug and go. Bigger than a dongle but bulletproof — same chip family used in
+  serious wifi-pentesting kits because the Linux support is so clean. Overkill for a music keyboard
+  but you'll never think about wifi again.
+
+  3. **If you really want nano** for the Pi: same call as for pony — **TP-Link TL-WN725N v3**
+  (in-tree `r8188eu`, 2.4 GHz only). Boring, reliable, but doesn't solve range/interference issues;
+  you'd just be swapping one chip-antenna radio for another.
+
+  For two devices with the same problem, my actual recommendation: try `iw set power_save off` + a
+  firmware update on the Pi first (free, 5 min), and pick up the Alfa AWUS036ACM as the
+  universal-fallback dongle. It works equally well on pony, the Pi, the laptop, anything you plug it
+  into — solves both problems with one purchase.
+
+❯ how do i play mpv audio through the audio jack on the back of pony?
+
+● Found it — `claude` isn't in the `audio` group, so PipeWire can't open `/dev/snd/*` (root:audio
+  mode 660). That's why only "Dummy Output" exists.
+
+● The user systemd manager inherited the old groups at linger time — restarting individual services
+  doesn't pick up the new audio group. Need to bounce the whole user manager.
+
+● Both real audio devices are now visible:
+
+  ```
+  Sinks:
+  *   38. Built-in Audio Analog Stereo      [rear 3.5mm jacks]   ← default
+      53. GA102 ... Digital Stereo (HDMI)   [RTX 3090 HDMI audio]
+  ```
+
+  **Built-in Audio Analog Stereo** is already the default sink, so plain `mpv file.mp3` will go to
+  the rear jack. Volume is at 40 % — bump it if you want.
+
+  ```bash
+  ssh claude@pony 'wpctl set-volume 38 0.8'           # sink volume to 80%
+  ssh claude@pony 'wpctl set-mute 38 0'               # confirm not muted
+  ssh claude@pony 'mpv ~/path/to/song.mp3'            # plays through rear jack
+  ```
+
+  If you ever want to force a specific sink (e.g., HDMI):
+
+  ```bash
+  ssh claude@pony 'mpv --audio-device=pulse/alsa_output.pci-0000_00_1f.3.analog-stereo song.mp3'
+  # pactl list short sinks  shows the exact device names
+  ```
+
+  Plug headphones/speakers into the rear 3.5mm green jack (line out) and try a file. If you hear
+  nothing, the most common causes are:
+
+  1. **ALSA mixer muting** — `alsamixer -c 0` and check that "Master" / "Front" / "Headphone"
+  channels aren't `MM` (muted). Spacebar toggles.
+  2. **Wrong jack** — the rear panel has multiple 3.5mm; line-out is conventionally green, mic is
+  pink, line-in is blue.
+  3. **Front-panel-only retasking** — some HDA codecs default to front-panel output even with
+  nothing plugged in. `alsamixer` will show this as `Auto-Mute Mode: Enabled`. Disable if needed.
+
+  Want me to grab a test mp3 (or generate a sine wave with `pw-cat`/`sox`) to verify before you go
+  hunting for cables?
+
+❯ nothing seems to work
+
+● Let me actually test it instead of guessing. I'll generate a known tone, check the mixer, and
+  watch mpv.
+
+● Two issues found:
+
+  1. **The default sink is the digital S/PDIF (IEC958) output, not the analog 3.5mm jacks.** The
+  "Built-in Audio Analog Stereo" sink we saw earlier disappeared — looks like the card profile
+  flipped to IEC958-only after the restart.
+  2. My tone test had a libsndfile error — separate matter, will use `speaker-test` instead.
+
+  Let me see the card profiles and switch back to analog.
+
+● Found the actual issue: pony's codec reports **no jack inserted** in any of the rear analog
+  outputs. PipeWire's profile policy is "if no analog jack detected, default to S/PDIF digital."
+  That's why your sink is "Built-in Audio Digital Stereo (IEC958)" — and there's nothing on the
+  other end of the optical port.
+
+  ```
+  Port: analog-output-lineout      ... not available
+  Port: analog-output-headphones   ... not available
+  Port: iec958-stereo-output       ... available
+  Active Profile: output:iec958-stereo+input:analog-stereo
+  ```
+
+  So either nothing is physically plugged into the green rear-panel jack, or the codec's jack-sense
+  isn't reporting it. Two questions / paths:
+
+  **Are speakers/headphones plugged into pony's rear panel?** Specifically the green/lime 3.5mm jack
+  (line-out front)? If not, plug something in — the codec will sense it, the analog profile will go
+  `available`, the analog sink will appear, and `mpv` will just work.
+
+  **If something is plugged in and it still says "not available":** jack-sense is misreporting. We
+  can force the profile manually:
+
+  ```bash
+  ssh claude@pony 'wpctl set-profile 49 4'   # 49=card id, 4=analog-stereo profile index
+  # or via pactl:
+  ssh claude@pony 'pactl set-card-profile alsa_card.pci-0000_00_1b.0 output:analog-stereo'
+  ```
+
+  That bypasses jack-sense and creates the analog sink unconditionally — useful for headless boxes
+  where you know there's something connected even if the codec doesn't.
+
+  Which is it — anything plugged into the green jack right now?
+
+❯ i just plugged into the green jack
+
+● Codec saw the plug:
+
+  - `analog-output-lineout`: **available** (was "not available")
+  - Active profile auto-switched to **`output:analog-stereo+input:analog-stereo`**
+  - Default sink is now **`38. Built-in Audio Analog Stereo`** (vol 40 %)
+
+  Try mpv again. Bump volume too while you're at it:
+
+  ```bash
+  ssh claude@pony 'wpctl set-volume 38 0.8 && wpctl set-mute 38 0'
+  ssh claude@pony 'mpv ~/path/to/song.mp3'
+  ```
+
+  You should hear it now. If you want a quick known signal to confirm before hunting for an mp3:
+
+  ```bash
+  ssh claude@pony 'speaker-test -c2 -twav -l1'   # plays "front left/right" voice once
+  ```
+
+❯ i hear nothing, and mpv is running.  can you bring up the volume?
+
+● The PipeWire **Streams** section is empty — mpv isn't actually connected to a sink. Let me check
+  what's happening on pony's side.
+
+● Found it — mpv is running as user **`cosine`**, but we configured PipeWire/audio for user
+  **`claude`**. So:
+
+  - `claude`'s PipeWire daemon owns the ALSA device exclusively
+  - `cosine`'s mpv can't open it — it's either falling back to a backend that's silent or erroring
+  on audio init
+
+  Let me check cosine's audio setup and pick the right fix.
+
+● Both users have PipeWire stacks running. `claude`'s was started first (via linger) and grabbed the
+  ALSA device exclusively, so `cosine`'s pipewire can't open it. Stopping claude's stack frees the
+  device.
+
+● cosine's pipewire is still stuck on "Dummy Output" because it was running while claude held the
+  ALSA device. It needs to rescan.
+
+● Found the actual root cause. Cosine's pipewire process is running with these groups:
+
+  ```
+  Groups: 4 24 27 30 46 100 101 1000     ← no 29 (audio)
+  ```
+
+  cosine **is** in the audio group now (`audio:x:29:claude,cosine`), but the pipewire daemon was
+  started *before* that membership took effect. Restarting individual services within the user
+  manager doesn't pick up new group membership — it has to come from a fresh login.
+
+  `systemctl --user restart pipewire` we already tried doesn't fix it because the user@1000 systemd
+  manager itself was spawned with the old groups and passes them to all its children.
+
+  **Fix:** log out of pony and log back in, then run mpv. The new login session will spawn user@1000
+  with all current groups including audio, pipewire will see `/dev/snd/*`, and your real sinks will
+  appear.
+
+  ```bash
+  # in your cosine ssh session:
+  exit
+  # then:
+  ssh cosine@pony
+  mpv ~/path/to/song.mp3
+  ```
+
+  (If mpv is currently running in your foreground ssh, Ctrl-C it first. Or `kill -9` from another
+  shell.)
+
+  Once you're back in, `wpctl status` should show "Built-in Audio Analog Stereo" instead of just
+  "Dummy Output," and mpv will route there automatically.
+
+❯ i logged out and back it, but it still shows dummy
+
+● Found it — every time *I* ssh in as claude, claude's pipewire respawns and grabs the device, even
+  though we stopped it. It's currently `wireplumber 9399 claude` holding `/dev/snd/controlC0`.
+
+  I'll mask claude's audio services so they don't autostart on my ssh logins, then cosine will own
+  the device cleanly.
+
+● Claude's audio services are masked and `/dev/snd` is free. Now log in as cosine (fresh session)
+  and try mpv — it should pick up the real analog sink this time.
+
+  ```bash
+  ssh cosine@pony
+  wpctl status        # should show "Built-in Audio Analog Stereo" not just Dummy
+  mpv ~/path/to/song.mp3
+  ```
+
+  If wpctl still shows only Dummy Output, the user@1000 manager survived your earlier logout — kill
+  it explicitly first:
+
+  ```bash
+  ssh cosine@pony 'loginctl terminate-user cosine'   # kicks the session, you'll need to re-ssh
+  ```
+
+❯ it's playing now
+
+● Now you've got a confirmed audio path on pony — cosine's pipewire owns the analog sink, mpv routes
+  through it. When we get back to the ASR work, I'll spin claude's pipewire up only for the duration
+  we need it (unmask, start, do the tunnel work, stop, re-mask) so it doesn't fight cosine for the
+  device.
+
+❯ back to the keyboard - it's an 88-key piano keyboard with an embedded raspberry pi 5.  the pi's
+  built-in wifi is used to create a hotspot for operating the keyboard's DAW (Ardour) from a tablet.
+  Two of the pi's USB ports have been brought out on the back of the keyboard, and that's where I
+  have a second wifi dongle connected so it can also be on the house wifi.  I like the nano profile
+  for when I take the keyboard out busking.
+
+● Makes sense — that constrains the choice well. The Pi 5's onboard radio handles the tablet
+  hotspot, the USB dongle is just the upstream link to house wifi (or to the venue's wifi, when
+  there is one). Form factor matters because it has to survive being shoved into a gig bag.
+
+  Given that, I'd revise my earlier recommendations:
+
+  **TP-Link Archer T2U Nano** is probably your sweet spot. Truly nano (~22 mm protrusion, less than
+  the MT7601U you're running now), dual-band ac, 433 Mbps real rate. RTL8811AU chipset — the kernel
+  6.x `rtw88_8821au` driver supports it natively now, but Pi OS Bookworm shipped with 6.6 and the
+  rtw88 8821au backend was iffy until ~6.7. Easiest first step: plug it in, check `dmesg | grep -E
+  "8821|rtw"` — if it associates, you're done. If not, the morrownr/8821au DKMS repo on GitHub has
+  clean aarch64 builds for Pi OS, takes about 5 min to install.
+
+  That gives you a real bandwidth bump at home without changing the transport story. You'd be moving
+  from single-band 2.4 GHz with a stalling firmware to dual-band ac with a maintained driver — both
+  the dropout pattern and the speed should improve.
+
+  **TL-WN725N v3** (the in-tree, no-DKMS option I suggested earlier) is a worse fit for you
+  specifically — same 2.4 GHz single-band class as your MT7601U, so it'd solve the firmware-stall
+  pattern but not the underlying "weak signal at the edge of the house" problem if that's
+  contributing to dropouts. You'd swap one nano-dongle compromise for another.
+
+  Two things worth checking on the Pi side regardless of which dongle you buy:
+
+  1. **Power-save on the dongle.** `iw dev wlan1 set power_save off` (whatever the dongle's iface is
+  called) and persist it in `/etc/NetworkManager/conf.d/` or wherever Pi OS handles it. Default-on
+  power-save is the single most common cause of "wifi drops every few minutes" on USB dongles.
+  2. **USB power budget.** Pi 5 with the official 27 W PSU has plenty for a USB wifi dongle, but if
+  you're ever on a smaller battery for busking, USB devices brown out before the Pi does, and the
+  dongle silently resets. `vcgencmd get_throttled` on the Pi will show under-voltage events
+  historically. Probably not your issue at home, just something to know.
+
+❯ i found this on walmart: `Restored TP-Link Mini - AC600 USB 2.0 Wifi Adapter (Archer T2U Nano)
+  (Refurbished)`
+  is that what you just suggested?
+
+● Yes — "AC600 / Archer T2U Nano" is exactly the model. AC600 is TP-Link's marketing name (200 Mbps
+  2.4 GHz + 433 Mbps 5 GHz), and there's only one product called "Archer T2U Nano" so there's no
+  risk of confusion with a sibling SKU.
+
+  **Refurbished tradeoff:** these dongles don't really wear out — no moving parts, no battery.
+  Refurb risk is mostly DOA-on-arrival (cosmetic damage, rare USB connector issues). Usually 5–10%
+  of refurb electronics, and Walmart's return policy covers it. If it works the first time, it'll
+  work for years. So as long as you can return a dud, refurb is fine here.
+
+  **Driver note before you order:** TP-Link has shipped the T2U Nano with two chip revisions over
+  the years — early units are RTL8811AU (the common one I described), later units sometimes shipped
+  with RTL8821AU. Both are supported by the same `rtw88_8821au` in-tree driver and by morrownr's
+  DKMS repo, so it doesn't matter which silicon arrives. Just plug it in and check `dmesg`.
+
+  Go ahead and grab it.
+
+❯ OK, now back to audio configuration.  let's see - you masked claude's pipewire service.  is that
+  persistent over reboot?
+
+● Yes — masking creates symlinks under `~/.config/systemd/user/<svc>` → `/dev/null`, which are
+  persistent files in claude's home directory. They survive reboots until explicitly unmasked. We
+  also disabled claude's linger, so the user manager won't even auto-start at boot. Combined effect:
+  claude has no audio stack on pony unless we explicitly bring one up.
+
+  For the ASR work going forward, the cleanest path is to **let cosine own the audio stack** —
+  cosine's pipewire is already running, already has the analog sink configured, and now owns
+  `/dev/snd` cleanly. We'd:
+
+  - Pair the phone (when antenna arrives) and configure WirePlumber rules under cosine
+  - Run `asr-transcribe.py` as cosine (or as claude with cosine's pipewire socket, but that's just
+  complication for no gain)
+  - Drop the pipewire-pulse network config under cosine's user too
+
+  That way there's only ever one pipewire daemon on pony fighting for the device, and we don't have
+  to juggle masking/unmasking.
+
+  Only thing claude needs to keep doing is run the Python ASR server — which doesn't need pipewire
+  at all, just `parec` (a client) talking to cosine's pipewire-pulse socket. We can give claude read
+  access to cosine's `/run/user/1000/pulse/native` socket via `pulse.allow-anonymous-clients` or a
+  group, same way we'd handle a network tunnel.
+
+  Want me to keep the rest of the ASR setup under cosine when we resume?
+
+❯ i think so.  what i'm thinking of for the workflow:  a phone call comes in, i switch it to
+  bluetooth on the android and i want it to immediately start playing audio through the speakers on
+  pony (so it becomes a speaker phone).  then i can ssh in and start the transcription
+
+● That's a clean workflow and the architecture supports it well. Sketch:
+
+  ```
+  phone ──HFP──▶ pony BT (when antenna lands)
+                     │
+     bluez_input.XX.handsfree-head-unit  ← single PipeWire source, fan-out
+                     │
+                     ├── auto-routed → analog sink → rear-jack speakers   ← always-on speakerphone
+                     │   (WirePlumber rule does this whenever HFP source appears)
+                     │
+                     └── parec subscriber on demand → asr-transcribe.py    ← started by ssh later
+  ```
+
+  PipeWire sources support multiple simultaneous consumers, so the speaker route and the
+  transcription route share one source without any tee/loopback plumbing. The WirePlumber rule fires
+  the moment the phone activates SCO (which is when you tap BT-audio on the Android call screen), so
+  the speakerphone behavior is automatic. The transcript path stays opt-in: nothing happens until
+  you start the script.
+
+  ### One caveat worth flagging now: the upstream mic side
+
+  HFP is a bidirectional profile. When Android routes the call to a BT device, it expects that
+  device to provide a microphone too — and PipeWire's HFP-HF role advertises one whether you have a
+  mic or not. So in your sketch:
+
+  - **Downstream (caller → you)**: works perfectly. Their voice → phone → BT/HFP → pony's HFP source
+  → analog sink → speakers. ✓
+  - **Upstream (you → caller)**: pony has no mic. Whatever PipeWire feeds into the HFP source's
+  *input* direction (silence, by default) is what the remote party hears. So they hear nothing from
+  you, even when you talk near the phone — Android stops using the phone's onboard mic the moment it
+  routes the call to BT.
+
+  Three ways to handle that:
+
+  1. **Plug a cheap USB mic into pony** ($10–20 — a clip-on, a desk mic, anything). PipeWire will
+  auto-detect it and use it as the HFP audio-in direction. Full two-way speakerphone.
+  2. **Stay one-way and use the phone for talking.** Keep the phone in your hand, hear the caller
+  through pony's speakers, but speak into the phone. On Android this means the phone is in BT-audio
+  mode but you talk close to the device anyway — usually works because the phone keeps its mic hot
+  for echo-cancel; remote audibility is muffled but understandable. Workable for a transcription
+  session, not great for actual conversations.
+  3. **Don't route the call to BT at all — use phone's onboard speakerphone.** The phone plays the
+  call audio out loud through its own speaker. You'd need a separate microphone on pony to capture
+  the *room* audio (i.e., an open mic listening to the phone's speaker output). More noise, less
+  clean — but no Android-routing weirdness, and same transcription pipeline. Fits a busking-style
+  "set the phone on the table, the laptop captures it" scenario better than a tight HFP-mediated
+  path.
+
+  For your stated workflow (call comes in, becomes a speakerphone on pony), option 1 is the right
+  call — same shopping trip as the antenna and BT dongle. A USB mic also gives you a sound source
+  for testing the transcription pipeline before you have a real call to make.
+
+  Want me to wire up the WirePlumber rule + asr-transcribe.py skeleton under cosine now (everything
+  that doesn't depend on the antenna), so it's ready to test the moment hardware arrives?
+
+❯ i was hoping for #2
+
+● I have to walk back what I wrote about option 2. I oversold it.
+
+  When Android routes a call to BT-HFP, it stops using the phone's mic — the BT device's mic becomes
+  the call mic. If pony's HFP source has nothing feeding it (which is the default), the remote party
+  hears silence even when you're talking right into the phone. The phone's mic isn't "kept hot for
+  echo-cancel and bled into the call" — I made that up. Echo-cancel runs locally and doesn't leak
+  local mic into the upstream stream.
+
+  So option 2 in its pure form (just route to BT, talk into phone, all good) doesn't work on stock
+  Android. What can salvage it:
+
+  1. **Cheapest fix that makes the user-talks side work: any 3.5mm analog mic in pony's pink rear
+  jack.** The Realtek ALC1150 has mic input on board. If you have an old earbud/headset mic,
+  computer headset, lavalier, even a Karaoke mic with a 3.5mm adapter — plug it in. The mic doesn't
+  need to be near the phone; it needs to be near *you*. PipeWire will auto-route the analog mic to
+  the HFP upstream, and remote hears your voice. No purchase needed if you've got a junk drawer.
+
+  2. **Test before assuming.** Different Android versions and OEMs handle BT-HFP routing slightly
+  differently. Once the antenna lands and you can pair, place a test call and see what the remote
+  actually hears with no mic on pony. If you happen to be on a phone+ROM combo where the phone's mic
+  stays live alongside BT, free win — your option 2 just works for that phone and you can stop
+  worrying about it. (Don't bet on it, but cost of testing is zero.)
+
+  3. **Accept one-way for this particular use case.** For recorded calls, lectures, voicemail
+  playback, conference calls where you're mainly listening, or any "transcribe what the remote says"
+  workflow — one-way is actually fine. You set the phone down, listen on pony's speakers, transcript
+  appears in your ssh terminal. You'd still be able to talk back by using the phone's own
+  speakerphone for those moments (toggle BT off → phone speakerphone → say what you need → toggle BT
+  back on for listening). Awkward but workable.
+
+  So the honest version of option 2 is: **route call to pony's BT, listen via pony speakers, talk
+  via any mic on pony's pink jack.** Can probably be assembled from existing junk; no extra purchase
+  necessary unless none of your old headsets have a mic plug.
+
+❯ there's no BT option for speaker-only?
+
+● No, unfortunately. The Bluetooth profile that carries phone-call audio is HFP (Hands-Free Profile,
+  or its older sibling HSP) and the spec requires bidirectional audio — there is no "speaker-only"
+  call profile in stock Bluetooth. A2DP *is* speaker-only, but Android specifically refuses to route
+  call audio over A2DP because A2DP isn't designed for two-way real-time voice. So whichever way you
+  slice it, the moment Android sends call audio to a BT device, that device is also expected to
+  provide a mic.
+
+  There's a future-tech answer: **Bluetooth LE Audio** (BT 5.2+ with LC3 codec) defines a
+  unidirectional "Broadcast Audio Stream" mode that *could* support speaker-only call playback, and
+  Android 13+ supports LE Audio for telephony. But pony's BCM20702 is BT 4.0+LE — not LE Audio — so
+  this isn't a path you can take today without new hardware on both ends.
+
+  There is one cheeky-but-clean workaround if you really want to avoid plugging a mic in: **pair
+  pony as A2DP-only** (mask the HFP/HSP profiles in bluez). Android will see pony as a "music"
+  device and won't route calls to it at all. Then for a call, you use the phone's normal
+  speakerphone (the phone's own loud speaker), and a *separate* path handles transcription — e.g., a
+  USB lavalier on pony aimed at the phone, or a screen-recorder-style accessibility app on Android
+  that captures call audio and streams it to pony over WiFi/network. That avoids the BT-HFP-mic
+  dilemma entirely, but it gives up the clean "phone routes to pony's speakers" UX you wanted.
+
+  So the practical landscape really is: HFP with a mic on pony (any 3.5mm mic works), or accept
+  silence upstream, or step outside BT for the audio path.
+
+❯ well, that's nice to know, but not the answer I wanted.  any add-on android apps that could help
+  here?
+
+● Yes, but the honest answer here is mostly pessimistic for modern stock Android.
+
+  **The structural problem:** since Android 10, the platform deliberately isolates voice-call audio
+  from third-party apps. The `AudioPlaybackCapture` API (the one apps like scrcpy 2.x, SoundWire,
+  AudioRelay use to stream phone audio to a PC over WiFi) explicitly excludes `STREAM_VOICE_CALL`
+  and `USAGE_VOICE_COMMUNICATION`. The system Phone app doesn't opt in to capture, and there's no
+  way for a third-party app to override that. This was tightened in 11, 12, 13, 14 in turn — Google
+  views call-audio capture as a surveillance/malware vector.
+
+  **The category of apps that try anyway:**
+
+  - **Cube ACR** (formerly "Call Recorder - ACR") — best-known call recorder. Uses Accessibility
+  Service tricks that *sometimes* work depending on phone vendor and Android version. Records to a
+  file; doesn't stream live.
+  - **Boldbeast Recorder** — paid, per-device; broader compatibility because they have
+  device-specific implementations. Same file-based output model.
+  - **OkCallRecorder**, **Truecaller's recorder** — same general category.
+  - **scrcpy / SoundWire / AudioRelay** — won't help because their capture path explicitly excludes
+  call audio.
+
+  The category-best for you would be a recorder that writes a live PCM stream you can `tail
+  -f`-style pipe over WiFi. That's basically nonexistent as a polished app — you'd be cobbling
+  together Tasker + a call recorder with a "save in real time" mode + a script that ships the
+  growing file to pony. A research project.
+
+  **Where it would actually work cleanly:** rooted Android. With root, an app can talk to the audio
+  HAL directly and capture `VOICE_CALL` stream as PCM, stream it over WiFi, all live. But rooting
+  modern Android is increasingly painful (SafetyNet/Play Integrity blocks banking apps, etc.) and
+  not worth it for one feature.
+
+  **Specific to your stack:** if your incoming calls are ever coming over a VoIP app (Signal,
+  WhatsApp, Google Voice, Linphone) rather than the cellular stack, you have *more* options because
+  the audio is application-level rather than system-level. Some VoIP apps will route audio to A2DP
+  or expose it to capture. Worth knowing if the calls you most want to transcribe happen to come
+  over VoIP.
+
+  Realistically, for cellular calls on a non-rooted modern Android, my recommendation stays: plug
+  any mic into pony's pink rear jack. The Android side just won't cooperate with the speaker-only-BT
+  vision, no matter what app you install on top of it.
+
+❯ the phone in question in a [REDACTED-DEVICE] (2024) running Android 15
+
+● A specific phone narrows this usefully. The bad news first, the silver lining second.
+
+  **Bad news for the BT-speaker-only goal:** Motorola's Android 15 build is close to stock, so it
+  inherits all of Android 15's restrictions. There's no Samsung-style "Separate App Sound" or "Audio
+  Sharing" UI to abuse. Cube ACR and Boldbeast on a Moto + Android 15 will fall back to capturing
+  the room mic (via VOICE_RECOGNITION source) rather than the real call downlink — quality is poor
+  and you'd still hear most of the call from the phone's earpiece. Motorola also doesn't ship the
+  kind of "live audio mirroring" tools some OEMs do.
+
+  The [REDACTED-DEVICE] (2024) does have a Snapdragon 6 Gen 1 with **Bluetooth LE Audio** support,
+  and LE Audio's Auracast broadcast mode is genuinely a one-way speaker profile that could solve
+  this in theory. But: (1) Android telephony over LE Audio still uses Unicast (bidirectional), not
+  Auracast — call audio doesn't broadcast; and (2) pony's BCM20702 is BT 4.0, no LE Audio support,
+  so even if the phone could broadcast, pony couldn't receive. Path closed on the receiver side.
+
+  **Possible silver lining you might not have considered: Live Caption.** Android 15 ships Google's
+  Live Caption as an accessibility feature, and on Android 11+ it works for phone calls on most
+  non-Pixel devices including Motorola. During a call, press the volume button → tap the Live
+  Caption icon, and you get on-screen real-time transcription, on-device, no network. Quality is
+  decent — comparable to Parakeet or Whisper-small, somewhat worse on technical vocabulary, much
+  better on conversational speech. If your real goal is "I want to read what the caller is saying,"
+  you might already have that on the phone for free. You could still use pony as the speaker (with
+  the mic-on-pink-jack fix) for room-listening, and just glance at the phone screen for the
+  transcript.
+
+  Worth a 30-second test next time you're on a call — call yourself from another phone, see if the
+  Live Caption icon shows up on the volume slider. If it does and the transcription is acceptable,
+  the whole "stream call audio to pony for transcription" architecture might be unnecessary, and
+  you'd only need pony for the speakerphone audio (i.e., back to the simpler problem of "pony plays
+  HFP, mic on pony's pink jack handles upstream").
+
+❯ OK.  thanks for the advice; i'll try it.  would a newer version of Android help?
+
+● Honestly, no. The restriction is structural, not a bug Google might fix. Each Android release
+  since 10 has *tightened* call-audio isolation, never loosened it — capture restrictions in 11,
+  MediaProjection scope narrowing in 12, accessibility-service tightening in 13/14/15. Google views
+  third-party access to call audio as a surveillance vector and has been steadily walling it off.
+  Android 16 (which the [REDACTED-DEVICE] will probably get) and 17 won't reverse that.
+
+  The LE Audio path doesn't help either, even on newer hardware. LE Audio's telephony profile
+  (Unicast Audio Stream) is still bidirectional by spec — just over a newer protocol than HFP.
+  Auracast / Broadcast Audio Stream is unidirectional but is for media, not telephony. The Bluetooth
+  SIG hasn't standardized "speaker-only telephony" because the audio profile design assumes if
+  you're using a BT device for calls, it's a headset/handsfree (with a mic) or you're not using BT
+  at all. The "BT smart-speaker for my phone call" use case just isn't a thing the spec
+  accommodates.
+
+  So the things that would actually unlock this stay the same regardless of Android version: a
+  custom ROM with audio HAL access (LineageOS / GrapheneOS, with the security and banking-app cost),
+  or — much simpler — a microphone in pony's pink jack.
+
+  Try Live Caption first; that may quietly make the whole question moot.
+
+❯ if there's spanish in the stream, i'd also like to see a side-by-side english translation
+
+● That changes the model lineup a bit. The key shift: Parakeet 0.6b v2 (what's currently
+  downloading) is **English-only** — Spanish audio would come out as garbled English approximations.
+  We'd want to swap to a multilingual model for the ASR side.
+
+  **Architecture**
+
+  ```
+  HFP audio → multilingual ASR → (text, detected_lang)
+                                     │
+                                     ├── lang == es → translate to EN
+                                     │
+                                     └── display:  [lang] original  |  [en] translation
+  ```
+
+  **Model picks**
+
+  For ASR — three reasonable options on the 3090:
+
+  1. **faster-whisper large-v3** (CTranslate2 backend). Whisper auto-detects language per segment,
+  handles code-switching well, ~99 languages, RTF ~0.05 on RTX 3090. ~3 GB VRAM in fp16. The
+  pragmatic default for this exact use case.
+  2. **Parakeet TDT 0.6b v3** (the multilingual sibling of v2). 25 languages including Spanish,
+  smaller and faster than Whisper, but newer and less battle-tested for streaming + code-switching
+  specifically.
+  3. **NVIDIA Canary 1B** — does ASR *and* X→English translation in a single forward pass.
+  Languages: en/es/fr/de. Cleanest architecturally because translation isn't a second hop. Less
+  mature streaming story than Whisper.
+
+  For translation (if you go with options 1 or 2):
+
+  - **Helsinki-NLP/opus-mt-es-en** (MarianMT, ~300 MB) — purpose-built ES→EN, very fast, plenty good
+  for telephony quality.
+  - **NLLB-200-distilled-600M** — generalizes to other source languages easily (FR, IT, DE) if you
+  ever want them.
+  - **qwen3.6:27b via ollama** — already on pony; 27 B params is overkill for translation and
+  competes with Whisper for VRAM. Skip unless you specifically want LLM-style fluency.
+
+  My recommendation: **faster-whisper large-v3 + opus-mt-es-en**. ~3.3 GB VRAM total, both warm in
+  ~5 s, cleanly handles the code-switching, and Marian's ES→EN quality is well-vetted. If you later
+  want FR/IT/DE/PT translation, swap in NLLB without changing the rest.
+
+  **Display**: easiest is two-column terminal output —
+
+  ```
+  [14:32:07 ES]  ¿cómo estás hoy?            │ [EN]  How are you today?
+  [14:32:09 EN]  Pretty good thanks          │
+  [14:32:12 ES]  necesito el documento ahora │ [EN]  I need the document now
+  ```
+
+  `rich` or `textual` make the side-by-side layout cleaner if you want responsive resizing. Plain
+  ANSI columns work fine for ssh.
+
+  **One consequence:** the in-flight Parakeet 0.6b v2 download is now wasted bandwidth (~3 GB on a 3
+  MB/s wifi). Want me to kill that download and start the Whisper-large-v3 + opus-mt-es-en fetches
+  instead? Total swap would be ~3.3 GB, similar to what was already in flight, and we'd be
+  downloading the *useful* models.
+
+❯ what's the download status?
+
+● The Parakeet v2 download stalled at **1.6 GB out of ~2.5 GB** (~65% done) — the file is
+  `.incomplete`. The tmux session got killed when claude's user@1001 manager shut down (after we
+  disabled linger and the last claude ssh session timed out). Nothing is actively downloading right
+  now.
+
+  So the timing is good — we haven't wasted that much, and we can pivot cleanly. Three options:
+
+  1. **Abandon Parakeet v2, start Whisper-large-v3 + opus-mt-es-en.** ~3.3 GB total to fetch. Best
+  fit for the bilingual use case.
+  2. **Resume Parakeet v2 then later add Whisper anyway.** We'd be carrying both. ~5+ GB total. Not
+  crazy on a 217 GB disk but pointless if v2 won't be used.
+  3. **Switch to Parakeet v3** (multilingual, ~2.5 GB, includes Spanish). One model only, no
+  separate translation step needed if Canary-style ASR+translate isn't required (v3 is ASR-only,
+  would still need the Marian translator).
+
+  For your code-switching English/Spanish scenario, **option 1** is the right call. Faster-whisper
+  handles language detection and code-switching better than Parakeet v3 in current testing, and the
+  separate Marian translator is a tiny (~300 MB) cherry on top.
+
+  Want me to delete the `.incomplete` file, kick off Whisper + Marian downloads in a fresh tmux
+  session, and re-enable claude's linger so it doesn't die again on logout?
+
+❯ what's linger?
+
+● Short version: a systemd feature that keeps a user's services running when they're not logged in.
+
+  By default on systemd Linux, when you log out, your user's systemd instance (`user@UID.service`)
+  shuts down — and that takes everything it owns with it: tmux servers, pipewire, cron jobs,
+  anything. That's what just happened: claude's last ssh session ended, the user manager timed out,
+  and the tmux server holding the Parakeet download got killed.
+
+  `loginctl enable-linger <user>` flips a switch that says "run this user's systemd manager at boot,
+  keep it running regardless of login state." With linger on:
+
+  - The user has services running 24/7 even with nobody logged in
+  - Tmux sessions, daemons, downloads, etc. survive logouts
+  - Systemd-user timers fire on schedule
+
+  Earlier I enabled linger for claude (so pipewire would run for the BT setup), then disabled it
+  later (when we wanted cosine to own the audio device cleanly without claude's pipewire
+  respawning). The disable is what caused the download to die when I logged out.
+
+  For long-running unattended work on pony — model downloads, eventual ASR server, anything you want
+  to keep running across reboots — linger is what you want. It's per-user, set once, persists.
+
+  Reasonable plan: re-enable linger for claude, restart the download (Whisper this time), and now
+  anything we kick off in claude's tmux survives. Pipewire stays masked so it won't fight cosine for
+  the audio device.
+
+❯ re-enable linger, but i want to do these downloads early tomorrow morning (overnight)
+
+● Pony's clock is UTC, currently 22:05 UTC (May 5). For "early tomorrow morning" I'll need to know
+  your timezone — but I'll set it up tentatively for **08:00 UTC tomorrow (May 6)**, which is 04:00
+  EDT / 03:00 CDT / 01:00 PDT. Tell me if you want it earlier/later or in a different zone.
+
+● Set up:
+
+  - **Linger re-enabled** for claude (`Linger=yes`) — user manager + tmux + scheduled jobs survive
+  logouts and reboots.
+  - **Stale Parakeet `.incomplete` cleaned up** (cache back to 5.7 MB, just metadata).
+  - **Download script** at `~/download-models.sh` (logs to `~/download-models.log`).
+  - **Scheduled** via systemd-user timer to fire at **2026-05-06 08:00 UTC** (~9h from now). Models:
+  faster-whisper-large-v3 + opus-mt-es-en, ~3.3 GB total, should take 20-25 min on the dongle.
+
+  Tell me your timezone if 08:00 UTC isn't right and I'll adjust the calendar spec. To check status
+  tomorrow, `tail ~/download-models.log` on pony.
+
+❯ set the timezone to US/Eastern
+
+● Pony is now on America/New_York (EDT, -0400). Local time 18:07 EDT, and the existing timer now
+  displays as **Wed 2026-05-06 04:00:00 EDT** — that's the same UTC moment we scheduled, just
+  rendered in your timezone now.
+
+  If 04:00 EDT is fine, we're set. If you'd prefer earlier or later, I can reschedule.
+
+❯ add NVIDIA Canary 1B to the list
+
+● Updated. The 04:00 EDT timer fires the same script, just with three downloads now:
+
+  - `Systran/faster-whisper-large-v3` (~3 GB) — multilingual ASR
+  - `Helsinki-NLP/opus-mt-es-en` (~300 MB) — fast ES→EN translation
+  - `nvidia/canary-1b` (~4-5 GB) — single-model ASR + X→EN translation, en/es/fr/de
+
+  Total ~7-8 GB, ~40-50 min on the dongle. Comfortable in the overnight window.
+
+  One note: I picked **`canary-1b`**, the original. There's also `canary-1b-flash` (lower-latency
+  variant for streaming) and possibly newer revisions on HuggingFace. If you specifically want a
+  different Canary variant, let me know and I'll swap. We won't really know which fits your
+  call-streaming workflow best until we try them side by side anyway — having both Whisper and
+  Canary downloaded means we can A/B them on the same audio.
+
+❯ lower-latency sounds good.  add it to the list and check for newer revisions
+
+● There are five Canary variants on HuggingFace. The picture:
+
+  | Model | Date | Notes |
+  |-------|------|-------|
+  | `nvidia/canary-1b` | 2024-02 | original, superseded |
+  | `nvidia/canary-1b-flash` | 2025-03 | low-latency variant, most-downloaded (~423k) |
+  | `nvidia/canary-180m-flash` | 2025-03 | smaller flash variant |
+  | `nvidia/canary-qwen-2.5b` | 2025-06 | larger hybrid with Qwen LLM head |
+  | `nvidia/canary-1b-v2` | 2025-08 | newest 1B revision, 25 languages |
+
+  So the original `canary-1b` (which I had in the script) is outdated — **superseded by flash**
+  (better latency) and **v2** (newer, broader language coverage). I'll drop it and add the two
+  relevant ones.
+
+● Updated overnight list:
+
+  - `Systran/faster-whisper-large-v3` (~3 GB) — multilingual ASR
+  - `Helsinki-NLP/opus-mt-es-en` (~300 MB) — fast ES→EN translator
+  - `nvidia/canary-1b-flash` (~4 GB) — low-latency ASR + X→EN translation, en/es/fr/de
+  - `nvidia/canary-1b-v2` (~4 GB) — newest revision, 25 languages, ASR + translation
+
+  Total ~11-12 GB, ~60-70 min on the dongle. Still fits the overnight window with hours to spare.
+
+  Tomorrow we'll have all four models on disk and can A/B them on real call audio: Whisper for the
+  broadest language coverage, opus-mt as a known-good ES→EN baseline, canary-flash if low end-to-end
+  latency is what wins, canary-v2 if its 25-language coverage gives the best raw transcription
+  quality.
+
+  Sources:
+  - [HuggingFace API: NVIDIA Canary
+  models](https://huggingface.co/api/models?author=nvidia&search=canary&limit=20)
+  - [HuggingFace: nvidia author search for
+  canary](https://huggingface.co/nvidia?search_models=canary)
+
+❯ something else about the music keyboard: there's a post on freesoft.org about it called "Linux
+  Keyboard"
+
+● Got it — that's useful context. A few things I now know that I didn't:
+
+  - **OS is Ubuntu 24 ARM with the real-time kernel**, not Pi OS Bookworm. That actually *helps* the
+  dongle story — Ubuntu 24's kernel 6.8 has `rtw88_8821au` mainline, so the Archer T2U Nano should
+  just work without DKMS. (RT-kernel ARM variant tracks closely with the GA ARM kernel for driver
+  coverage.)
+  - **HiFiBerry DAC2 ADC Pro** is the audio interface — a real ADC, not just the Pi's onboard. So if
+  you ever want to feed call audio *into* the keyboard's DAW (or capture instrument audio for
+  transcription/network streaming), the path is much cleaner than I was assuming. JACK is already
+  running.
+  - **VNC for tablet control**, not a Pi-as-AP hotspot per se — sounds like the tablet joins
+  whatever wifi the keyboard exposes (the Pi's onboard radio in AP mode for busking, presumably
+  joins house wifi when home).
+  - Ardour autostarts full-screen at boot. Real-time kernel for thread priorities. Williams Allegro
+  1 chassis. Salamander piano + AVL drums.
+
+  The dongle recommendation doesn't change — TP-Link Archer T2U Nano on a kernel 6.8 system is the
+  one-line `dmesg | grep 8821` test, and Ubuntu LTS gets you the morrownr DKMS as a fallback if it
+  ever doesn't. The build looks well-considered; the wifi flakiness is just the chip-antenna penalty
+  on the cheap MT7601U you're trying to replace, not a deeper system issue.
+
+❯ - it's Pipewire, not JACK.  only a slight difference, I know
+  - the Pi's onboard radio is always in AP mode so that the Pi and tablet configuration never
+  changes.  That's why I want a second dongle to connect to the house wifi when home
+
+● Both noted, and both have practical follow-throughs:
+
+  **PipeWire instead of JACK** — slight difference protocol-wise (PipeWire emulates JACK's API so
+  Ardour, etc., don't notice), but it means *same audio stack on both your boxes now*. Anything we
+  work out for pony's PipeWire setup (BT routing rules, tunnel modules, Marian-pipeline
+  stream-targeting) ports directly to the keyboard with no JACK-vs-PipeWire translation. If you ever
+  want to, say, stream Ardour's master out to pony for a remote rehearsal, the wireplumber rule
+  pattern is identical to what we'd write for the BT call audio.
+
+  **Pi onboard always-AP** — good call architecturally; tablet sees the same SSID forever, you don't
+  fiddle with credentials between gigs. It also strengthens the dongle requirement: the dongle is
+  now the *only* piece of network config that varies (between house wifi and "no upstream available"
+  busking mode), so it's the single point of failure for "is the keyboard online." A T2U Nano with
+  the in-tree rtw88 driver is exactly the right reliability profile for a load-bearing-but-portable
+  component — the dongle just works at home, and when busking it doesn't matter that house wifi
+  isn't reachable because nothing depends on it.
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/docs/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<UUID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<UUID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  The standalone skills (`write-a-report`, `compact2`, `extract-kg`)
+  remain usable on their own when you only want one artifact; this
+  skill produces all three with shared session-ID detection.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session UUID hasn't changed
+
+  ```bash
+  test -f ~/.claude/projects/-home-claude/<UUID>.jsonl && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the UUID
+  is good. If it doesn't (rare — session was migrated), fall back to
+  the first-run workflow's marker dance to derive the new UUID, then
+  proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<UUID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per write-a-report's "Re-running in the same session" rule. Fold
+  new material into the right Findings / Recommendations / Known
+  Gaps subsections; expand the Summary if the bottom line shifted;
+  mark resolved gaps as resolved; do **not** tack on "Update since
+  last run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per compact2's re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow extract-kg's post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: re-run update — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to your session's `.jsonl`
+  file, then grepping the project's session directory to find the
+  match. The flush takes a few seconds, so do it in background.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until id=$(find ~/.claude/projects/-home-claude/ -maxdepth 1 -name '*.jsonl' \
+                -mmin -2 -exec grep -l "<MARKER>" {} + 2>/dev/null | head -1); \
+        [ -n "$id" ]; do sleep 2; done
+  basename "$id" .jsonl
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  ### Step 2 — write the report
+
+  Follow `~/project/skills/write-a-report/SKILL.md` for the structure
+  and style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/docs/<slug>.md`.
+
+  If `write-a-report` was invoked earlier in this session, skip the
+  report and go straight to step 3.
+
+  **Re-run detection.** If `~/project/docs/<slug>.md` already exists,
+  follow write-a-report's "Re-running in the same session" rule —
+  update the existing report rather than overwrite it. Verifying the
+  match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<UUID>.md`. Structure and
+  content per `~/project/skills/compact2/SKILL.md` — progress-report
+  half on top, `---`, then the `<analysis>` + `<summary>` blocks
+  following `~/project/skills/compact2/COMPACT_PROMPT.md`.
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<UUID>.json`. Schema
+  and per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md`
+  (the canonical spec). Density and entity-type guidance per
+  `~/project/skills/extract-kg/SKILL.md` step 4 — that skill
+  locally tightens the bare EXTRACT_PROMPT defaults to encourage
+  richer extraction (calibrate against the compaction's analysis
+  block; include when hesitating; soft entity types like `pattern`,
+  `failure-mode`, `constraint`, `gotcha` are first-class). Re-run
+  handling per `extract-kg`'s "Re-extracting in the same session"
+  section — overwrite if still in `incoming/`, delta-style if
+  already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/docs/<slug>.md` to replace it with the
+  real `<UUID>`. Skip this step if the report was an in-place update
+  (re-run case — already has the real UUID) or was skipped entirely
+  (write-a-report was invoked earlier in the session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<UUID>.md \
+    && git commit -m "<topic>: report + compaction — session-<UUID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● First run. Kicking off session-ID detection.
+
+● Got the session ID: `7f9f7657-af04-4fda-a75e-a351c6e52ad0`. Writing the report now.
+
+● - Report: `~/project/docs/phone-asr-pipeline-design.md`
+  - Compaction: `~/project/compactions/session-7f9f7657-af04-4fda-a75e-a351c6e52ad0.md`
+  - KG: `~/lightrag-history/incoming/session-7f9f7657-af04-4fda-a75e-a351c6e52ad0.json`
+

@@ -1,0 +1,1541 @@
+❯ we've got the asr script in ~cosine on pony, and we've also got some asr models we've downloaded
+  in ~claude on pony.  what are they all?
+
+● Here's the full picture. The two accounts split cleanly: **`~cosine` is the production phone-call
+  script**, **`~claude` is the model zoo + experimental rigs**.
+
+  ## `~cosine` — the live phone-call transcriber
+
+  One script, one model engine:
+
+  - **`~cosine/bin/asr-call-transcribe`** — the actual phone-call pipeline. Runs as `cosine` because
+  it pulls audio out of cosine's PipeWire session via `pw-record`, capturing the two RTP-streamed
+  sources from samsung (`rtp_call_remote_source` = the remote party, `rtp_call_me_source` = your
+  mic), 4-second chunks, faster-whisper with VAD, prints color-coded speaker-tagged timestamped
+  lines.
+  - Model is **faster-whisper**, selectable per-invocation. Default `small.en` (CPU-fine);
+  `asr-call-transcribe large-v3` for the GPU/best-quality path. Uses the *same* shared HF cache as
+  `~claude` (HF default location), so `large-v3` here is the same weights claude downloaded.
+  - Venv: `~cosine/asr-env/`. Plus a `Music/` dir of mp3s (unrelated — looks like demucs stem-split
+  fodder).
+
+  This is the freshest piece — script dated May 14, after the claude-side experimentation.
+
+  ## `~claude` — the ASR model zoo and streaming experiments
+
+  The git repo **`~claude/asr/`** holds three sibling streaming scripts (read PCM from stdin via
+  `arecord` off the Blue Snowball USB mic, Silero-VAD chunked, 500 ms silence trigger):
+
+  | Script | Model | Engine | Why |
+  |---|---|---|---|
+  | `stream-whisper.py` | faster-whisper-large-v3 | CTranslate2 | 99-lang, lightest runtime |
+  | `stream-parakeet.py` | parakeet-tdt-0.6b-v3 | NeMo/PyTorch | fastest (~1 s on 6 s audio),
+  25-lang auto-detect |
+  | `stream-canary.py` | canary-1b-flash | NeMo/PyTorch | ASR **+ translation** in one model
+  (`--task ast`) |
+
+  **Models downloaded** (HF cache `~claude/.cache/huggingface/hub/`, ~23 GB; `download-models.sh`
+  fetched the first four):
+
+  - `Systran/faster-whisper-large-v3` (2.9 G) — used by both stream-whisper and cosine's `large-v3`
+  - `nvidia/canary-1b-flash` (6.4 G) — ASR+AST, en/es/fr/de
+  - `nvidia/canary-1b-v2` (6.0 G) — downloaded, **no script wired to it**
+  - `nvidia/parakeet-tdt-0.6b-v3` (4.7 G) — stream-parakeet's model
+  - `nvidia/multitalker-parakeet-streaming-0.6b-v1` (2.4 G) — streaming/diarization research, **no
+  script yet** (the README's TODO; needs a second diarization model not yet downloaded)
+  - `Helsinki-NLP/opus-mt-es-en` (599 M) — Marian es→en translator, **unused**, kept for a possible
+  Whisper+Marian two-hop translation path
+
+  Two venvs because pony is Ubuntu 26.04 / Python 3.14: `~claude/asr/asr-env/` (3.14,
+  faster-whisper/ctranslate2 stack) and `~claude/venv-3.12-torch/` (uv-installed 3.12, torch+NeMo
+  stack — hoisted out of `~/asr` so demucs etc. can share it).
+
+  Also in `~claude` but separate concerns: `~/.ollama` (7 LLMs incl. `qwen3.6:27b`, `bge-m3` —
+  that's the lightrag skill's local-inference host, not ASR), and `tei-data`/`.lhotse`.
+
+  **Status per the README:** all three stream scripts smoke-tested (load + VAD init); only
+  `stream-whisper.py` confirmed with real live speech; all four core models give identical output on
+  a 5.8 s test clip. `canary-1b-v2`, the multitalker model, and the opus-mt translator are
+  downloaded-but-unused.
+
+  There's a design doc referenced for the broader project:
+  `~/project/docs/phone-asr-pipeline-design.md` on samsung. Want me to check what's there or look at
+  anything in more depth?
+
+❯ check what's in the phone-asr-pipeline-design.md doc
+
+● The README's path was slightly off — there are actually three related docs. Let me read them.
+
+● The README's path was stale — the actual reference doc is
+  `~/project/docs/phone-call-asr-pipeline.md` (359 lines, built 2026-05-14), with two companion
+  reports alongside it. Here's what the main doc covers:
+
+  ## `docs/phone-call-asr-pipeline.md` — the reference doc
+
+  **The pipeline itself.** samsung is BT-paired to a [REDACTED-DEVICE]. During a call, PipeWire on
+  samsung taps two points of the ALC256 analog path — the sink *monitor* (remote party's voice,
+  heard on wired headphones) and the mic *capture* (your voice) — and ships each as a separate
+  fire-and-forget RTP UDP stream (ports 46000/46002) over wifi to pony. pony's PipeWire re-exposes
+  them as `rtp_call_remote_source` / `rtp_call_me_source`; `asr-call-transcribe` runs faster-whisper
+  on both and prints `[Remote]`/`[Me]` tagged lines. The overlay is **always-on**: pony down →
+  packets discarded, samsung unaffected; pony up → transcription auto-resumes.
+
+  **The hard-won debugging knowledge** is the bulk of the doc — three PipeWire 1.0.5 quirks and the
+  BT gotchas (these match the memory pointers you already have):
+
+  - **Loopback identity rule** — `module-loopback` must have matching rate/channels on capture &
+  playback or it silently auto-resamples and attenuates ~25 dB. Push rate/channel conversion to
+  `pw-record` on the consumer side instead.
+  - **`target.object` with `.monitor` suffix doesn't resolve** in PW 1.0.5 — use
+  `stream.capture.sink = true` to tap a sink monitor.
+  - **The set_nice fallback trap** (the big one) — the root cause of audio chops under CPU load.
+  `module-rt`'s `set_nice(-11)` fails because `user@1000.service` has `LimitNICE=0` (artifact of the
+  commented-out `@audio - nice -19` in `/etc/security/limits.d/audio.conf`), which flips PipeWire to
+  RTKit even though direct RT at prio 88 worked, leaving `pw-data-loop` stuck at RR 20. Workaround:
+  `nice.level = 20` (the `DEFAULT_NICE_LEVEL` sentinel) skips the `set_nice` call entirely. Note:
+  that `99-rt-prio.conf` override was **removed end-of-session** — the doc preserves the
+  reconstruction recipe but the chop's RT-causation was never conclusively confirmed.
+  - **BT gotchas** — samsung QCA9377 vanishing into D3cold (fix: full poweroff, not reboot), pony
+  BCM20702 antenna-orientation sensitivity, phone-side "Media audio" toggle.
+
+  **Operational sections:** lifecycle/restart behavior (RTP source modules auto-start after pony
+  reboot via cosine's enabled linger; the wrapper does *not* auto-start by design — kept
+  interactive), verification probes (`pw-data-loop` should show `FF 88`), and known limitations: no
+  call-only gating (always-on overlay streams any sink audio + the mic — privacy property; needs a
+  ~30–50 line wireplumber.lua hook), and the wrapper has no restart-on-EOF (orphaned `pw-record`
+  subprocs spin silently after a pony pipewire bounce).
+
+  ## The two companion reports
+
+  - `reports/phone-asr-pipeline-design.md` (120 lines) — the original design doc (this is what the
+  asr README's stale path was pointing at).
+  - `reports/phone-call-asr-bringup-report.md` (160 lines) — the bring-up/`/end` task report.
+
+  One thing worth noting: this `docs/` doc says default model `small.en`, GPU model
+  `large-v3-turbo`; the actual script in `~cosine/bin` we just read uses `large-v3` (not `-turbo`)
+  as the GPU path — minor drift between doc and code. Want me to read either companion report, or
+  reconcile the doc against the current script state?
+
+❯ what's the difference between large-v3 and large-v3-turbo?
+
+● Both are OpenAI Whisper large-v3 variants; **turbo is a pruned-decoder distillation** of it
+  (OpenAI, Oct 2024).
+
+  | | large-v3 | large-v3-turbo |
+  |---|---|---|
+  | Decoder layers | 32 | **4** (distilled) |
+  | Parameters | ~1550 M | ~809 M |
+  | Encoder | full | **identical** (unchanged) |
+  | Decode speed | baseline | **~5–8× faster** |
+  | Transcription accuracy | best | within ~1–2% of large-v3 on most languages |
+  | Translation (X→en) | full | **noticeably degraded** — turbo's fine-tune dropped the translation
+  task |
+  | VRAM (fp16) | ~10 GB | ~6 GB (less under CTranslate2 int8) |
+
+  The key trade-off: turbo keeps the full encoder but slashes the decoder from 32 to 4 layers, so
+  it's dramatically faster with almost no transcription-quality loss — but if you ever ask Whisper
+  to *translate* non-English speech to English, turbo is meaningfully worse because that capability
+  was pruned out.
+
+  **For your setup specifically:**
+
+  - The phone-call pipeline is transcription-only English (`language="en"` is hardcoded in
+  `asr-call-transcribe`), so turbo would be the strictly better choice there — same accuracy,
+  several times faster, lower VRAM, leaving more of the RTX 3090 free. The doc recommending
+  `large-v3-turbo` is the right call; the script using plain `large-v3` is leaving speed on the
+  table.
+  - But turbo **isn't actually downloaded on pony** — the HF cache only has
+  `Systran/faster-whisper-large-v3`. So `asr-call-transcribe large-v3-turbo` as the doc suggests
+  would trigger a fresh ~1.6 GB CTranslate2 download (`Systran/faster-whisper-large-v3-turbo`) on
+  first run, not use a local model. That's likely why the script defaults to what's on disk.
+  - Note this only matters for the faster-whisper path. Your multilingual ambitions (the
+  canary/parakeet models in `~claude`) are a separate engine entirely — turbo-vs-v3 doesn't apply
+  there.
+
+  Want me to pull `Systran/faster-whisper-large-v3-turbo` into pony's HF cache so the doc's
+  recommended invocation actually works offline?
+
+❯ I'd like to get all of the ~claude scripts and models working with cosine's pipewire setup.  can i
+  just run the ~claude scripts as cosine?
+
+● Short answer: **no, not as-is.** Running the `~claude` scripts as `cosine` hits two independent
+  walls, and only one of them is about how you launch them. Let me verify the specifics rather than
+  guess.
+
+● Now I have the concrete picture. Here's the honest answer:
+
+  ## No — running them as `cosine` fails on two independent walls
+
+  **1. Filesystem permission wall (the hard blocker).** `/home/claude` is mode `750`, owned
+  `claude:claude`. cosine is uid 1000 and is **not** in the `claude` group (1001) — the only groups
+  they share are `audio` and `users`. So cosine cannot even `cd` into `/home/claude`, let alone:
+  - exec the venv interpreters the shebangs hardcode (`/home/claude/asr/asr-env/bin/python`,
+  `/home/claude/venv-3.12-torch/bin/python`),
+  - read the 23 GB HF model cache (blocked at `/home/claude` and `/home/claude/.cache` = `700`,
+  regardless of the `huggingface/` subdir being group-readable).
+
+  As cosine the scripts die at the shebang with "permission denied" before a line runs. `chmod 755
+  /home/claude` would fix traversal but exposes claude's entire home (`.ssh`, `.openclaw`, history)
+  to cosine — not acceptable.
+
+  **2. Wrong audio input.** Even with perms solved, the three `~claude` scripts read PCM from
+  **stdin**, designed for `arecord -D plughw:Snowball,0` — the local Blue Snowball USB mic via ALSA.
+  The phone call isn't a local mic; it's the two RTP sources (`rtp_call_remote_source` /
+  `rtp_call_me_source`) inside **cosine's** PipeWire session. The scripts don't know they exist.
+
+  ## The good news
+
+  Blocker 2 is nearly free: because the scripts read stdin, you don't touch their input logic — you
+  pipe cosine's existing incantation into them:
+
+  ```bash
+  pw-record --target rtp_call_remote_source --format=s16 --rate=16000 --channels=1 - |
+  stream-parakeet.py
+  ```
+
+  That's exactly the 16 kHz S16LE mono PCM they expect. So the real work is **blocker 1**: getting
+  the rig into a place cosine can reach. Relocating the rig and running as cosine (the way
+  `asr-call-transcribe` already works) is the robust path — not opening up `/home/claude`, and not
+  moving the venvs (venvs bake absolute paths into `bin/python` + `pyvenv.cfg`; they must be
+  recreated, not `mv`'d).
+
+  Effort is very uneven across the models, and there's a design fork, so let me scope this before I
+  start building:
+
+❯ [Request interrupted by user for tool use]
+
+❯ the cosine asr-call-transcribe - does it use the GPU?
+
+● It doesn't pin a device — it relies on faster-whisper's auto-detect. The only knob the script sets
+  is compute type:
+
+  ```python
+  model = WhisperModel(MODEL_NAME, compute_type="auto")
+  ```
+
+  It does **not** pass `device=`, so it takes faster-whisper's default `device="auto"`. Under
+  "auto", CTranslate2 uses **CUDA if it can find a GPU and load the CUDA runtime libraries**,
+  otherwise it silently falls back to CPU. The pipeline doc notes that `libcublas12` +
+  `nvidia-cudnn` were apt-installed system-wide *specifically because* ctranslate2 looks those up on
+  the system loader path (it doesn't bundle CUDA the way PyTorch/NeMo do). So the host is set up for
+  the GPU path.
+
+  Net: **yes — on pony it runs on the RTX 3090**, for whatever model is loaded, including the
+  default `small.en` — not just `large-v3`.
+
+  One thing worth correcting: the script's docstring comments (`small.en (CPU OK)`, `large-v3 # GPU,
+  best quality`) read like `small.en`=CPU and `large-v3`=GPU, but that's not what the code does.
+  There's no device split by model — `device="auto"` means *every* model goes to the GPU if CUDA
+  loads. Those comments describe the quality/latency trade-off and the fact that small.en is light
+  enough to be *fine* on CPU if CUDA weren't available; they don't reflect an actual device
+  restriction.
+
+  Caveat: "auto" fails *open* to CPU. If CUDA can't initialize at runtime (driver/lib mismatch, GPU
+  busy), it'll quietly run on CPU with no error — the only way to be sure a given run is on the GPU
+  is to watch `nvidia-smi` while it transcribes. Want me to start it and confirm it's actually on
+  the 3090?
+
+  This also matters for the rig plan you were scoping: cosine's whisper already wants the 3090, so
+  adding the NeMo parakeet/canary models (also GPU) means they'd share VRAM on the same card during
+  a call.
+
+❯ does it transcribe spanish?
+
+● No — not as written, for two compounding reasons:
+
+  **1. The default model is English-only by architecture.** `small.en` (the default) is a `.en`
+  model — trained only on English. It physically cannot transcribe Spanish; fed Spanish audio it
+  emits English-ish garbage, not a fallback.
+
+  **2. The language is hardcoded to English.** Even if you load a multilingual model:
+
+  ```python
+  segments, _ = model.transcribe(
+      audio,
+      vad_filter=True,
+      vad_parameters={"min_silence_duration_ms": 400},
+      language="en",          # ← forces English decoding
+      beam_size=1,
+  )
+  ```
+
+  `language="en"` forces Whisper to decode as English regardless of what's spoken. Feed it Spanish
+  and it mistranscribes/transliterates rather than giving correct Spanish.
+
+  **To make it do Spanish you'd need both:** (a) a multilingual model — drop the `.en` (`large-v3`,
+  or `small`/`medium`); and (b) change the `language` param — `language="es"` for a Spanish call, or
+  `language=None` to auto-detect. Caveat on auto-detect: it runs per 4-second chunk here, and
+  per-chunk language ID is flaky on short/noisy audio — pinning `"es"` is more reliable for a
+  known-Spanish call, but then English in the *same* call (code-switching, or the `[Me]` side
+  speaking English) won't transcribe well. That single-language-per-invocation limitation is
+  inherent to this whisper-with-fixed-language design.
+
+  This is exactly why the `~claude` NeMo models matter for your goal:
+
+  - **`parakeet-tdt-0.6b-v3`** — auto-detects per utterance across 25 languages incl. en/es; no
+  language flag, handles a mixed en/es call far better than fixed-language Whisper.
+  - **`canary-1b-flash`** — does Spanish ASR *and* `--task ast --source-lang es --target-lang en`
+  (Spanish speech → English text) in one model.
+
+  So if Spanish (or a Spanish/English call) is the actual driver here, the right move isn't tweaking
+  `asr-call-transcribe` — it's getting the parakeet/canary path working on the cosine side, which
+  loops back to the scoping question you interrupted. Is a Spanish or mixed Spanish/English call the
+  real use case here? That would push the scope decision toward the NeMo models rather than the
+  faster-whisper quick win.
+
+❯ do you have a copy of cosine's asr-call-transcribe?
+
+● Yes — I read it in full earlier this session, so the complete script is in my context and I can
+  reproduce it verbatim. But to be precise about what "have a copy" means:
+
+  - **No copy exists on disk** — not in `~claude` on samsung, not anywhere. The only instance is
+  `~cosine/bin/asr-call-transcribe` on pony (readable only via `sudo`, since `/home/cosine` is `750
+  cosine:cosine`).
+  - **I have its full contents in conversation context** (the ~95-line Python script: dual
+  `pw-record` capture loop over `rtp_call_remote_source`/`rtp_call_me_source`, faster-whisper with
+  VAD, `language="en"` hardcoded, `compute_type="auto"`, colored `[Remote]`/`[Me]` output).
+
+  So I can write it out to a file here on samsung, or to a shared/cosine-readable location on pony,
+  whenever useful — e.g. as the starting point for the multilingual rig we were scoping (it already
+  has the correct `pw-record --target ... --rate=16000 --channels=1` incantation and the two-stream
+  speaker-tag structure the `~claude` scripts lack).
+
+  Want me to save a copy somewhere — and if so, where: a local reference copy on samsung (e.g.
+  `~/project/reports/` or a scratch path), or staged on pony as the base for the parakeet/canary
+  version?
+
+❯ no, it's fine where it is.  i'd like to try it with large-v3 and es.  can you add an option to it
+  to specify language?
+
+● I have the original verbatim in context. I'll add a second positional argument for language
+  (keeping the script's existing argv style — no argparse), back up the original, write it as
+  `cosine`, and verify with a diff.
+
+● Done. The diff confirms exactly the intended changes and the script parses (`syntax OK`). Original
+  backed up at `~cosine/bin/asr-call-transcribe.bak`.
+
+  **What changed:**
+  - New optional 2nd positional arg: `asr-call-transcribe <model> <language>`. Language defaults to
+  `en` (unchanged behavior with no 2nd arg). `auto`/`none`/`detect` → `language=None` (Whisper
+  auto-detects per chunk).
+  - The hardcoded `language="en"` in the transcribe call is now `language=LANGUAGE`.
+  - Loads-model banner now prints the language; a `.en` model + non-English language prints a
+  warning (since `.en` models are English-only).
+
+  One practical heads-up before you run it — let me check whether `large-v3` is actually available
+  to cosine:
+
+● cosine's cache already has `faster-whisper-large-v3` (and `small.en`) — so no multi-GB download
+  wait. Let me confirm the large-v3 download is complete, not a partial:
+
+● The model's complete — 2.9 GB (same as the full copy in `~claude`) with all five faster-whisper
+  files present (`model.bin`, `config.json`, `tokenizer.json`, `vocabulary.json`,
+  `preprocessor_config.json`). And I can now `ssh cosine@pony` directly — thanks. Quick confirmation
+  via the direct login:
+
+● All set. Summary:
+
+  **The language option is live.** `~cosine/bin/asr-call-transcribe` now takes an optional 2nd arg.
+  Original is backed up at `asr-call-transcribe.bak`. And `large-v3` is already fully cached for
+  cosine (2.9 GB, complete) — no download wait.
+
+  **To try it with large-v3 + Spanish**, from cosine's session on pony:
+
+  ```bash
+  ssh cosine@pony
+  asr-call-transcribe large-v3 es
+  ```
+
+  A few things to know before you do:
+
+  - **It only transcribes during a live call.** With no RTP audio arriving from samsung it just sits
+  at `ready. listening for samsung audio...` — that's expected, not a hang. You need samsung
+  BT-paired to the phone with a call active (the RTP overlay streaming) for anything to print.
+  - **`large-v3` + GPU + Spanish:** `device="auto"` will put it on the 3090, and `language="es"`
+  forces Spanish decoding on both streams. Note that means the `[Me]` side (you, if you speak
+  English) will be force-decoded as Spanish too — mistranscribed. For a genuinely bilingual call,
+  `asr-call-transcribe large-v3 auto` (per-chunk auto-detect) handles mixed es/en better, at the
+  cost of occasional language-ID flip-flops on short/noisy 4-second chunks. `es` is the more
+  reliable choice if the whole call is Spanish.
+  - **Run it in cosine's own session.** The script self-sets `XDG_RUNTIME_DIR=/run/user/<uid>`,
+  which resolves correctly under a direct `ssh cosine@pony` login (uid 1000). If pony's pipewire was
+  bounced or samsung's pipewire restarted, the RTP source modules can get stuck emitting silence —
+  the pipeline doc's restart dance (restart pony's `pipewire wireplumber pipewire-pulse`, then
+  relaunch the wrapper) fixes that.
+
+  Want me to launch it now so it's listening (it'll block until there's call audio), or leave it for
+  you to start when you're actually on a Spanish call?
+
+❯ i'm running it.  the delay from the audio to the translation is annoying.  can it be shortened?
+
+● Yes. Let me explain where the delay comes from, because it tells you how much you can shave and at
+  what cost.
+
+  **The dominant delay is structural, not the model.** Look at the loop:
+
+  ```python
+  CHUNK_SEC = 4
+  ...
+  while len(buf) < bytes_per_chunk:        # accumulate a full 4 s
+      piece = proc.stdout.read(...)
+  ...
+  segments, _ = model.transcribe(audio, ...)   # only now does the model see it
+  ```
+
+  The script is **fixed-interval chunking**: it buffers a solid 4 seconds of audio *before the model
+  sees anything*. So a word spoken at the start of a window can't appear as text until ~4 s later,
+  plus inference. Average added delay from buffering alone is ~2 s, worst case ~4 s. large-v3
+  inference on the 3090 adds only ~0.5–1 s on top — so the buffer, not the model, is ~80% of what
+  you're feeling.
+
+  There are two tiers of fix:
+
+  **Quick knob (just applied):** lower `CHUNK_SEC`. I set it to **2** — roughly halves the perceived
+  delay, one-line change, instantly reversible:
+
+● `CHUNK_SEC = 2` is set and the script still parses. **The process you have running won't pick this
+  up** — Ctrl-C it and relaunch (`asr-call-transcribe large-v3 es`) to get the shorter latency.
+
+  **Trade-offs of the quick knob:**
+  - Going from 4 s → 2 s halves the buffer delay but gives the model less context per window, so
+  you'll see more word-boundary splits (a word straddling the 2 s line gets cut) — slightly more
+  fragmented output and marginally worse accuracy. More frequent inference calls too, but the 3090
+  won't notice.
+  - You can push further (`CHUNK_SEC = 1.5` or `1`) for even less delay; accuracy degrades
+  progressively. 2 is a reasonable balance — try it, drop it lower if the lag still bugs you more
+  than the fragmentation does. Tell me and I'll change it.
+
+  **The proper fix (bigger change):** the real problem is the fixed-grid design — chopping on an
+  arbitrary clock instead of on speech. The right architecture is **VAD-endpoint dispatch**:
+  accumulate audio and submit each utterance the *instant the speaker pauses* (Silero VAD, ~400 ms
+  silence trigger). That gives the lowest possible latency for conversational speech *and*
+  eliminates word-splitting, because it cuts on natural pauses, not a timer. This is exactly what
+  the `~claude` stream scripts already do — it's the same integration we were scoping earlier. The
+  latency complaint is the strongest argument yet for doing that properly rather than just tuning
+  `CHUNK_SEC`.
+
+  One clarification, since you said "translation": this script **transcribes** — Spanish audio →
+  Spanish text. It does not translate to English. If you actually want English output from Spanish
+  speech, that's a different change (faster-whisper's `task="translate"` does X→English, or the
+  `canary-1b-flash` model in `~claude` does Spanish→English as a dedicated AST task). Which do you
+  want — Spanish text, or English translation? That also affects whether the quick `CHUNK_SEC`
+  tuning is enough or whether the proper rebuild is the better investment.
+
+❯ let's do transcription for now.  are there any models that process audio by looking at overlapping
+  chunks, say, 4 seconds of context, but shifted left every second or so, so it looks at several
+  seconds of context but doesn't have that much latency?
+
+● Good question — and the precise answer splits into two genuinely different things, because what
+  you described is more a *decoding strategy* than a model property.
+
+  ## (A) Sliding-window wrappers around an offline model (this is exactly your idea, applied to
+  Whisper)
+
+  Whisper itself has no streaming mode — it's a 30-second offline encoder-decoder. But your "4 s of
+  context, shifted left ~1 s" scheme is a well-known wrapper technique, and there's a reference
+  implementation: **`whisper_streaming`** (UFAL, Macháček et al., *"Turning Whisper into a Real-Time
+  Transcription System"*). It does precisely what you're picturing, with one critical addition you'd
+  otherwise have to invent:
+
+  - It re-runs faster-whisper on an overlapping, sliding/growing buffer every ~1 s.
+  - The trailing edge of each run is unstable (the model revises the last few words as more audio
+  arrives), so you **cannot just print the latest run's text** — it flickers and rewords. The fix is
+  a **LocalAgreement** policy: only *commit* a token once two successive overlapping runs agree on
+  it. Unconfirmed tail stays provisional.
+
+  Net effect: each emitted word still benefited from several seconds of left context (near-offline
+  accuracy), latency granularity drops to ~1 s, but a word isn't *confirmed* until the next
+  overlapping run sees it — so there's an inherent ~1-chunk confirmation lag, and you pay redundant
+  recompute (re-running large-v3 on overlapping audio every second). On the 3090 that recompute is
+  affordable. **`WhisperLive`** (Collabora) is a similar VAD+chunk streaming Whisper wrapper.
+
+  This keeps Whisper (good Spanish, what you have working now) and is the closest drop-in to your
+  current `asr-call-transcribe`.
+
+  ## (B) Streaming-native models that get long context *without* recompute
+
+  The architecturally-correct answer to "lots of context but low latency": **RNN-T / transducer
+  models with cache-aware streaming encoders**. These carry an internal cached encoder state, so
+  each new ~0.1–1 s of audio benefits from multi-second left context *for free* — no redundant
+  reprocessing, no commit-confirmation lag, latency tunable by a look-ahead setting.
+
+  The one relevant to you for Spanish is already on pony: **`nvidia/parakeet-tdt-0.6b-v3`** (the 4.7
+  GB model in `~claude`, multilingual incl. Spanish). TDT = Token-and-Duration Transducer —
+  inherently streaming-capable. NeMo's **cache-aware streaming** FastConformer exposes latency
+  presets (~80 ms / 480 ms / 1040 ms look-ahead) trading latency against accuracy, with the
+  left-context cache kept regardless. This is strictly better than the sliding-window hack — lower
+  latency, no flicker, no recompute — but it's the heavier integration (NeMo
+  `CacheAwareStreamingAudioBuffer`, the `venv-3.12-torch` stack, and the cross-user perms work we
+  discussed). Note `stream-parakeet.py` as written does *not* use cache-aware streaming — it does
+  VAD-endpoint chunking — so it'd need that streaming buffer wired in, not just a copy-over.
+
+  `canary` is *not* in this category — it's an offline encoder-decoder like Whisper, so it has the
+  same buffering problem.
+
+  ## For your situation
+
+  Three escalating options, all transcription-only:
+
+  1. **Tune `CHUNK_SEC` lower** (done — at 2). Crudest; word-splitting cost. Zero new work.
+  2. **LocalAgreement sliding-window on faster-whisper** (option A). Keeps your working Spanish
+  Whisper path, gets you ~1 s granularity with near-offline accuracy, no new model. Moderate code
+  change to the cosine script — essentially adopting the `whisper_streaming` decoding loop in place
+  of the fixed-chunk loop.
+  3. **parakeet-tdt-0.6b-v3 cache-aware streaming** (option B). Best latency/accuracy frontier for
+  Spanish, but the full NeMo-on-cosine integration we scoped earlier.
+
+  Given you want to stay on transcription and already have Whisper+Spanish working, **option 2 is
+  the sweet spot** — biggest perceived-latency win without the NeMo/perms project. Want me to build
+  the LocalAgreement sliding-window version of `asr-call-transcribe` (keeping large-v3 + `es`, dual
+  `[Remote]`/`[Me]` streams), or prototype option 3 to compare?
+
+❯ we've got parakeet working in ~claude, right?
+
+● Per the asr README's "Tested" section, parakeet is only *partially* validated — let me not trust a
+  possibly-stale doc and actually check the current state on pony.
+
+● The `set -e` aborted on the `ls` miss. Let me continue the real checks — and actually run parakeet
+  on audio rather than just smoke-test it:
+
+● Environment is fully sane: torch 2.9.1+cu128, CUDA on the RTX 3090, NeMo ASR imports,
+  parakeet-tdt-0.6b-v3 present (4.7 GB). But "loads fine" isn't "works" — and the README admitted
+  parakeet was never tested with real speech (only a 5.8 s clip via the *offline* interface, and the
+  /tmp fixture is long gone). Let me settle it by actually running speech through
+  `stream-parakeet.py`:
+
+● ffmpeg is there but no TTS. I need real speech to actually exercise it. Let me look for a clean
+  speech sample on the box (ALSA ships spoken test wavs) and run both the offline model and the
+  streaming script through it:
+
+● `Front_Center.wav` is a clean spoken sample — perfect. Two tests: the offline model, then the
+  actual streaming script.
+
+● Offline model is genuinely working — `Front_Center.wav` → "Front, center,", loaded from cache on
+  the 3090. Now the actual streaming script, fed the spoken wav as raw PCM with trailing silence so
+  the VAD flushes:
+
+● Yes — and now verified with real speech, not just the smoke-test the README claimed. Both paths
+  work:
+
+  | Test | Result |
+  |---|---|
+  | Offline NeMo model on `Front_Center.wav` | `Front, center,` ✓ correct, loads from cache on the
+  RTX 3090 |
+  | **`stream-parakeet.py` end-to-end** (real PCM piped in, VAD-flushed) | `[1.9s in / 0.60s asr]
+  Front, center,` ✓ correct, clean exit 0 |
+
+  So the `~claude` parakeet path is genuinely functional: `venv-3.12-torch` (torch 2.9.1+cu128,
+  CUDA, RTX 3090), NeMo ASR, `parakeet-tdt-0.6b-v3` (4.7 GB cached), and the streaming wrapper all
+  work. The asr README's "the other two haven't been tested with real speech yet" line is now stale
+  — I just closed that gap.
+
+  **Why this matters for your latency problem.** Look at that timing tag the script emitted: **0.60
+  s of ASR inference for 1.9 s of speech**. parakeet-tdt-0.6b is far lighter than Whisper large-v3,
+  and `stream-parakeet.py` already uses **VAD-endpoint dispatch** (transcribes ~500 ms after the
+  speaker pauses), *not* the fixed 4 s grid that's killing `asr-call-transcribe`. So functionally
+  it's already the low-latency design you were asking about in the last question — utterance text
+  appears roughly half a second after someone stops talking, plus ~0.6 s inference, instead of on a
+  4 s clock. And parakeet-tdt-0.6b-v3 is multilingual including Spanish, so it covers your
+  transcription use case.
+
+  The catch is unchanged from earlier: this works **as `claude`, reading stdin from a local mic**.
+  To point it at the actual *phone call*, it still needs the cross-user bridge — the script reaching
+  cosine's RTP PipeWire sources, which runs into the `/home/claude` perms wall (cosine can't read
+  claude's venv/cache; claude isn't in cosine's PipeWire session). That's the integration we scoped
+  a few turns back.
+
+  Net: parakeet works and is the right engine for low-latency Spanish transcription. The remaining
+  work is purely the cosine-side plumbing — recreate the torch/NeMo venv + share the model cache
+  where cosine can reach them, then drive `stream-parakeet.py` from `pw-record --target
+  rtp_call_remote_source` instead of stdin. Want me to lay that out concretely and start on it?
+
+❯ get the parakeet installation working in the `cosine` account.  you can use the same setup - an
+  `asr` directory, a `venv-3.12-torch` directory, just put it all in ~cosine, please
+
+● This is a real multi-step build. Let me gather everything needed to reproduce claude's environment
+  exactly, then execute.
+
+● `pip freeze` was empty because uv venvs ship without pip — I need `uv pip freeze`. Let me capture
+  the real package set and start the fast copy steps (uv binary, asr dir, and the 5 GB model cache
+  copied locally rather than re-downloaded).
+
+● asr dir copied (the `ls` only failed because claude can't traverse `/home/cosine`); 199-package
+  freeze captured. Now: verify/fix the asr scripts as cosine, kick off the 5 GB model copy in the
+  background, and start the Python 3.12 setup.
+
+● Shebangs fixed; Python 3.12.13 installed for cosine (same cpython build as claude). Now create the
+  venv and install the full 199-package frozen set — this is the long pole (torch + CUDA wheels +
+  NeMo, several GB). Running it in the background:
+
+● The model copy finished (exit 0). Let me confirm it, while the venv install runs:
+
+● Model cache copied (4.7 GB in cosine's cache). And the venv install just completed (exit 0) — let
+  me verify it succeeded and then run the definitive end-to-end test as cosine:
+
+● Install failed — an index-strategy issue with the pytorch extra index. Let me see the full error:
+
+● Classic uv + PyTorch-index issue: `certifi` exists on the pytorch index at a different version,
+  and uv's default index strategy won't fall back to PyPI. The documented fix is `--index-strategy
+  unsafe-best-match` (safe here — both are trusted official indexes). Re-running:
+
+● Status so far — the cosine parakeet setup is most of the way there:
+
+  | Component | State |
+  |---|---|
+  | `~cosine/asr/` (scripts + README) | ✓ copied, shebangs rewritten claude→cosine |
+  | Python 3.12.13 (uv-managed) | ✓ installed for cosine (same cpython build as claude) |
+  | `uv` 0.11.11 | ✓ copied to `~cosine/.local/bin` |
+  | parakeet-tdt-0.6b-v3 model (4.7 GB) | ✓ copied locally into cosine's HF cache (no re-download) |
+  | `~cosine/venv-3.12-torch/` | ⏳ installing 199-pkg frozen set (torch 2.9.1 + cu128 + NeMo) —
+  retry in progress after the index-strategy fix |
+
+  The venv install (torch + CUDA wheels + NeMo, several GB) is running in the background and will
+  notify me when it finishes. Once it's done I'll run the same definitive test we used for claude —
+  `stream-parakeet.py` as cosine on the spoken `Front_Center.wav` — and it must print `Front,
+  center,` to confirm parity. I'll report back when the install completes.
+
+● Install succeeded. Now the definitive parity test — sanity-check the venv, then run
+  `stream-parakeet.py` as cosine on the spoken wav, exactly as we validated for claude:
+
+● Done — parakeet is fully working in the `cosine` account, byte-for-byte parity with the `~claude`
+  setup.
+
+● Everything is in `~cosine` as you asked, mirroring the claude layout exactly:
+
+  | Component | Location | State |
+  |---|---|---|
+  | Streaming scripts | `~cosine/asr/` | ✓ stream-parakeet/canary/whisper.py, README; shebangs
+  rewritten to `/home/cosine/...` |
+  | Torch/NeMo venv | `~cosine/venv-3.12-torch/` | ✓ 199 pkgs, **torch 2.9.1+cu128**, CUDA on the
+  RTX 3090 — identical pins to claude |
+  | Python 3.12.13 + uv 0.11.11 | `~cosine/.local/...` | ✓ uv-managed, same cpython build as claude
+  |
+  | parakeet-tdt-0.6b-v3 (4.7 GB) | `~cosine/.cache/huggingface/hub/` | ✓ copied locally (no
+  re-download), loads from cosine's own cache |
+
+  **Verification (same test as claude):**
+
+  ```
+  torch 2.9.1+cu128 cuda True NVIDIA GeForce RTX 3090
+  [1.9s in / 0.79s asr] Front, center,
+  ```
+
+  `stream-parakeet.py` run as cosine, fed the spoken `Front_Center.wav` → correct transcription,
+  model restored from `/home/cosine/.cache/...`, clean exit 0. Matches claude's earlier `[1.9s in /
+  0.60s asr] Front, center,` (the 0.6→0.8 s difference is just first-run warmup, not significant).
+  It's self-contained — no dependency on `/home/claude`.
+
+  You can now run it directly:
+
+  ```bash
+  ssh cosine@pony
+  arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null | ~/asr/stream-parakeet.py
+  ```
+
+  **What this does and doesn't do:** the parakeet rig is now installed and proven in cosine — that
+  was the ask. It is *not yet wired to the phone call*: `stream-parakeet.py` still reads stdin
+  (designed for a local mic). To point it at the actual call you'd feed it from cosine's RTP source
+  instead — `pw-record --target rtp_call_remote_source --format=s16 --rate=16000 --channels=1 - |
+  ~/asr/stream-parakeet.py` — run inside cosine's PipeWire session. That swap (and optionally adding
+  the dual `[Remote]`/`[Me]` speaker-tagging like `asr-call-transcribe`) is the remaining
+  integration step whenever you want it; the hard part (the cross-user install) is now done.
+
+❯ this seems to wait for a gap in the audio before transcribing.  I get output like this:
+
+❯ this seems to wait for a gap in the audio before transcribing.  I get output like this:
+  ```
+  Transcribing:
+  100%|████████████████████████████████████████████████████████████████████████████████████████████████████████|
+  1/1 [00:00<00:00,  1.39it/s]
+  [27.8s in / 0.74s asr] Electoral votantes para depositar su papeleta in las urnas. Hoy más de 6
+  millions de andaluzes andaluzas eligen su new parliamentary, de los que más de 300.000 votarán por
+  primera vez. El dato de participación atrás de la tarde has been the 37,2% del censo. Esto supone
+  una subida de 3 puntos con respectores comicios del año 2022.
+  Transcribing:
+  100%|████████████████████████████████████████████████████████████████████████████████████████████████████████|
+  1/1 [00:00<00:00,  3.29it/s]
+  [49.1s in / 0.33s asr] The primera clave va a servir si el Partido Popular va a conseguir una
+  mayoría absoluta o depender de los votos de Vox. Se habla también del batacazo del Partido
+  Socialista y veremos si los socialistas se quedan con el peor resultado de su historia.¿Va a
+  mejorar ligeramente o bien se estancará? Y a la izquierda de los socialistas también veremos y
+  comprobaremos si adelante Andalucía se dispara y da el sorpaso o no a por Andalucía, que tiene la
+  baza de la fuerte implantación de Izquierda Unida. A las ocho de la tarde cierran los colegios
+  electorales. Marta Manchón.
+
+  ```
+  listening to a news report, this results in long delays before seeing text
+
+● That's the VAD-endpoint design hitting its worst case: `stream-parakeet.py` only flushes when
+  Silero detects ~500 ms of silence, and a news anchor barely pauses — so it accumulates 27 s, 49 s
+  of continuous speech before emitting anything. Great for conversational turn-taking, terrible for
+  continuous monologue. The fix is a **max-utterance cap**: force a flush after N seconds even with
+  no silence. Let me read the actual script to modify it precisely:
+
+● The script flushes only on a Silero VAD "end" (500 ms silence). A news anchor never pauses, so the
+  utterance grows unbounded — 27 s, 49 s — and nothing prints until they finally breathe. The fix:
+  force a flush when an utterance exceeds a max duration, regardless of silence. I'll add a
+  configurable `--max-sec` cap (and expose `--min-silence-ms`), keeping the nice VAD-boundary flush
+  when pauses *do* occur.
+
+● Installed (original at `stream-parakeet.py.bak`), syntax OK. Now prove the cap works: I'll
+  synthesize ~15 s of *continuous, gapless* speech (silence stripped from the spoken wav, then
+  looped) and confirm it now emits `cap` flushes every ~6 s instead of one huge delayed `pause`
+  flush:
+
+● The cap works. Feeding ~14 s of continuous gapless speech:
+
+  ```
+  [6.0s in / 0.58s asr / cap]  Front center front center ...
+  [6.0s in / 0.07s asr / cap]  Center front center ...
+  [2.1s in / 0.07s asr / pause] Front, center, front, center.
+  ```
+
+  Instead of one delayed flush after the whole 14 s, text now lands **every 6 s** during continuous
+  speech, and still flushes early on a natural pause when one occurs (the final `pause` line). Each
+  line is tagged with why it flushed (`cap` / `pause` / `eof`).
+
+● What changed in `~cosine/asr/stream-parakeet.py` (original backed up at `stream-parakeet.py.bak`):
+
+  - **`--max-sec` (default 6.0)** — force-flushes an utterance after this many seconds even with no
+  silence. This is the fix for the news-report case: bounds your worst-case latency to ~max-sec +
+  ~0.5 s inference instead of "whenever the anchor finally pauses."
+  - **`--min-silence-ms` (default 500)** — exposes the pause threshold for natural turn-taking;
+  lower it for snappier conversational response.
+  - Natural-pause flushing still works (better word boundaries when a real pause exists); the cap
+  only kicks in when speech runs long.
+  - Flushes any buffered speech on EOF, and each line is tagged `cap`/`pause`/`eof`.
+
+  **To use it** — the process you have running is still the old code, so stop it and relaunch:
+
+  ```bash
+  ssh cosine@pony
+  arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr/stream-parakeet.py --max-sec 4
+  ```
+
+  (or whatever your current audio source is, piped into `stream-parakeet.py`).
+
+  **Tuning for a news report:** `--max-sec 6` is the balanced default. For a continuous broadcast
+  you'll likely want it lower — try `--max-sec 4` or `--max-sec 3` for output every 3–4 s. The
+  trade-off: shorter slices mean more frequent occasional word-splits at the cut boundary (you can
+  see one in the test above — "...front center / Center front..."), and slightly less context per
+  chunk so marginally lower accuracy. parakeet handles ~4–6 s slices well; below ~3 s the
+  fragmentation gets noticeable. It's a pure latency-vs-cleanliness dial — adjust to taste without
+  touching the code.
+
+  One inherent limitation worth knowing: this is still chunk-then-transcribe, so the floor on
+  latency is ~max-sec. True sub-second continuous output (text appearing *as* the anchor speaks, not
+  in slices) needs NeMo's cache-aware streaming API — the bigger rewrite we discussed. The
+  `--max-sec` cap is the right pragmatic fix unless you need that.
+
+❯ you put Silero VAD in the script?  it's not part of parakeet?
+
+● Correct on both counts — and to be precise about authorship: **I did not add Silero VAD. It was
+  already in the original `stream-parakeet.py`** (the `~claude` version we copied). The `from
+  silero_vad import ...` and the `VADIterator` setup were there before my edit — all three sibling
+  scripts use it by design (the asr README says each one pairs "one speech model with a Silero VAD
+  chunker"). My change only added the `--max-sec` force-flush *on top of* that existing VAD logic.
+
+  **Silero VAD is not part of parakeet — they're two independent models doing two different jobs:**
+
+  - **parakeet-tdt-0.6b-v3** is the *recognizer*: audio → text. That's all it does. Called here via
+  NeMo's offline `model.transcribe(buffer)` — you hand it a chunk of audio, it transcribes the whole
+  thing. It has no notion of "is someone talking right now" or "where does this utterance end."
+  - **Silero VAD** is a separate ~2 MB voice-activity-detection model (from `snakers4/silero-vad`,
+  loaded via the `silero-vad` PyPI package). Its only job: for each 32 ms frame, *speech or
+  silence?* It's the *segmenter*.
+
+  The script glues them: `stdin PCM → Silero (find speech segment boundaries) → parakeet (transcribe
+  each segment)`. Something has to decide *what* audio to feed parakeet's offline transcribe call,
+  and the choice is either fixed-time slices (what `asr-call-transcribe`/Whisper does with
+  `CHUNK_SEC`) or VAD-delimited utterances (what these scripts do). The VAD approach gives cleaner
+  cuts — at pauses, not mid-word — and skips transcribing silence. parakeet doesn't supply that
+  itself.
+
+  This is also exactly why the "true streaming" rewrite I keep flagging is different: NeMo's
+  **cache-aware streaming** mode ingests a continuous audio stream and emits tokens incrementally —
+  in *that* mode you wouldn't need an external chunker like Silero at all, because the model handles
+  the streaming endpointing internally. The current script doesn't use that mode (it uses offline
+  transcribe per segment), so it needs Silero as the front-end chunker. The `--max-sec` cap I added
+  is a crude backstop for when Silero's pause-based chunking never triggers (continuous monologue) —
+  it doesn't replace the VAD, just bounds how long it'll wait.
+
+❯ how can we get NeMo's cache-aware streaming API working?
+
+● Good question to ask *before* writing code, because "get the cache-aware streaming API working"
+  has a hard precondition that determines whether it's a small job or a model swap: **NeMo's
+  cache-aware streaming only works on a model that was trained/exported as a cache-aware streaming
+  model.** The API itself is `CacheAwareStreamingAudioBuffer` + the encoder's
+  `cache_aware_stream_step` / `setup_streaming_params` — but feeding a *full-context offline* model
+  through it either errors or produces garbage, because the limited-context attention assumptions
+  are baked in at training time.
+
+  `parakeet-tdt-0.6b-v3` is NVIDIA's high-accuracy **offline** model — I don't believe it's
+  cache-aware, but I shouldn't guess. Let me check it definitively, plus the
+  `multitalker-parakeet-streaming` model (already downloaded in `~claude`, the README flagged it as
+  the streaming one):
+
+● Important nuance in that result: `setup_streaming_params()` *succeeding* is a NeMo API artifact,
+  not proof the model streams well. The real discriminator is `att_context_size: [-1, -1]` with
+  `att_context_style: regular` — that means **parakeet-tdt-0.6b-v3 was trained with full (unlimited)
+  context**. A genuine cache-aware streaming model shows `chunked_limited` style with small finite
+  contexts (e.g. `[[70,13],[70,1]]`). So running parakeet-tdt-0.6b-v3 through the streaming API will
+  *run* but produce degraded output — it never learned to work without future context. My earlier
+  "offline model" claim holds.
+
+  The multitalker probe failed only because `/tmp` is shared between the two SSH users and cosine's
+  file blocked claude's write. Re-running it correctly — that's the model that may actually be
+  streaming-trained:
+
+● Now I have the definitive picture. Three models probed:
+
+  | Model | Style | Cache-aware? | Language |
+  |---|---|---|---|
+  | **parakeet-tdt-0.6b-v3** (what you're running) | `att_context_size [-1,-1]`, `regular` | **No —
+  full-context offline.** API runs but output degrades; never trained without future context |
+  Multilingual incl. **Spanish** ✓ |
+  | **multitalker-parakeet-streaming-0.6b-v1** (in ~claude) | `[[70,13],[70,6],[70,1],[70,0]]`,
+  `chunked_limited` | **Yes — genuine** (4 latency presets, ~1040 ms → 0 ms lookahead) | Almost
+  certainly **English-only** (1024-token tokenizer vs 8192 for multilingual parakeet); also a
+  *multitalker* model — heavier, speaker-kernel machinery |
+  | **stt_en_fastconformer_hybrid_large_streaming_multi** (in ~claude) | `[[70,13]…[70,0]]`,
+  `chunked_limited` | **Yes — genuine.** This is NVIDIA's canonical cache-aware streaming reference
+  model, official example code | **English-only** (`stt_en_`) |
+
+  **The API itself is straightforward** — for a genuine cache-aware model it's:
+  `model.encoder.setup_streaming_params()`, then `CacheAwareStreamingAudioBuffer` feeding
+  `model.conformer_stream_step()` in a loop while carrying the `cache_last_channel` /
+  `cache_last_time` state, picking an `att_context_size` index for your latency/accuracy point
+  (index 0 ≈ 1 s lookahead/best, index 3 = 0 ms/snappiest). NeMo ships a reference:
+  `examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py`. I can wire
+  that.
+
+  **But here's the real gate, and it's a decision, not a coding problem:** every genuine cache-aware
+  streaming model we have is **English-only**. Your use case has been **Spanish** news. Cache-aware
+  streaming's whole benefit is latency — and the multilingual model that does Spanish
+  (parakeet-tdt-0.6b-v3) is precisely the one that *won't* stream properly. So the path forks on
+  what you prioritize:
+
+● I'll research this properly — whether a Spanish or multilingual cache-aware streaming model exists
+  to download.
+
+● The hunt has a fairly clear answer forming. Two findings already nail down most of it:
+
+  - **`multitalker-parakeet-streaming-0.6b-v1` is confirmed English-only** — NVIDIA states the
+  multitalker Parakeet model "is currently limited to English" (there's even an open HF discussion
+  *"Multilingual model planned?"*). My tokenizer inference was right.
+  - **parakeet-tdt-0.6b-v3 and Canary-1B** (the Spanish-capable ones) are both **offline**
+  architectures — full-attention / AED, not cache-aware streaming.
+
+  The one candidate worth verifying is `stt_multilingual_fastconformer_hybrid_large_pc` (same hybrid
+  family as the English streaming model). Its name lacks "streaming" and has the offline "_pc"
+  suffix, but let me confirm rather than infer:
+
+● The multilingual HF card 401'd (HF blocks WebFetch sometimes). Let me confirm it via the NGC
+  catalog page instead:
+
+● The hunt is conclusive. **No Spanish or multilingual cache-aware streaming model exists from
+  NVIDIA/NeMo as of May 2026.** The evidence is consistent across the catalog:
+
+  **Every genuine cache-aware streaming model NVIDIA ships is English-only:**
+  - `stt_en_fastconformer_hybrid_large_streaming_multi` + the single-latency `_80ms/_480ms/_1040ms`
+  variants — English
+  - `nemotron-speech-streaming-en-0.6b` (newest, 2025–26) — confirmed English-only:
+  *"Nemotron-ASR-Streaming is an English, streaming ASR"*
+  - `multitalker-parakeet-streaming-0.6b-v1` — confirmed English-only: NVIDIA says it *"is currently
+  limited to English"*, non-English only "in the near future" (open HF discussion *"Multilingual
+  model planned?"* — not yet)
+
+  **Every Spanish-capable model is offline / full-context** — not cache-aware:
+  - `parakeet-tdt-0.6b-v3` — multilingual (25 langs incl. es) but `att_context_size [-1,-1]`,
+  `regular` (we probed this directly — full attention; "local attention" long-form mode is chunking,
+  not streaming)
+  - `canary-1b` — es/en/de/fr but an offline attention encoder-decoder
+  - `stt_multilingual_fastconformer_hybrid_large_pc` — multilingual but the "_pc" offline model; no
+  "streaming" in the name (NVIDIA's streaming models *always* carry that tag), so full-context
+
+  The architectural reason: cache-aware streaming is a specific *training* configuration
+  (limited/chunked-limited attention with multi-lookahead). NVIDIA simply has not
+  trained-and-released a multilingual model that way. It's not a download we're missing — it doesn't
+  exist publicly.
+
+  **So the fork from before stands, now with the "hunt" branch eliminated.** The realistic Spanish
+  low-latency options are:
+
+  1. **NeMo buffered/chunked streaming on parakeet-tdt-0.6b-v3** — keeps Spanish + the rig you just
+  installed. Overlapping-window buffered RNNT inference (NeMo's
+  `speech_to_text_buffered_infer_rnnt`-style approach). ~1–2 s latency floor with redundant compute
+  — not "true" streaming, but a large improvement over the current 6 s+ VAD wait, and no model swap.
+  2. **Whisper LocalAgreement streaming** (`whisper_streaming`) with multilingual large-v3 — also
+  Spanish, ~1–2 s, the non-NeMo equivalent; you already have faster-whisper-large-v3 cached for
+  cosine.
+  3. **True cache-aware streaming, accept English-only** —
+  `stt_en_fastconformer_hybrid_large_streaming_multi` or `nemotron-speech-streaming-en-0.6b`.
+  Sub-second, cleanest code path, but no Spanish.
+
+  My recommendation: **option 1** — it's the best latency you can get *in Spanish* without a model
+  swap, reuses everything we just set up in cosine, and NeMo's buffered RNNT is well-supported. It
+  won't hit sub-second like true cache-aware streaming, but ~1–2 s continuous output is a major step
+  down from where you are, and it's the realistic ceiling for Spanish today.
+
+  Want me to build option 1 (NeMo buffered RNNT streaming on the Spanish parakeet model, as a new
+  `stream-parakeet-buffered.py` in `~cosine/asr/`)? Or take a different branch?
+
+  Sources:
+  [stt_en_fastconformer_hybrid_large_streaming_multi](https://huggingface.co/nvidia/stt_en_fastconformer_hybrid_large_streaming_multi),
+  [nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b),
+  [multitalker-parakeet-streaming-0.6b-v1 — "Multilingual model
+  planned?"](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1/discussions/2),
+  [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [NeMo cache-aware
+  streaming
+  docs](https://docs.nvidia.com/nemo-framework/user-guide/24.09/nemotoolkit/asr/models.html)
+
+❯ build option 1
+
+● I'll build it as a new `stream-parakeet-buffered.py` using a LocalAgreement-2 sliding-window
+  policy (the live-stream form of buffered RNNT — NeMo's own `speech_to_text_buffered_infer_rnnt` is
+  file-oriented, so for a live stdin stream the correct adaptation is overlapping windows + a
+  stability-commit policy + timestamp-based buffer trim, same algorithm as whisper_streaming,
+  applied to parakeet).
+
+  The one implementation unknown is parakeet's word-timestamp API shape in NeMo 2.7.3 — that drives
+  the buffer-trim logic, so let me probe it first rather than guess:
+
+● Timestamp API confirmed: `hyp.timestamp['word']` is a list of `{"word","start","end",...}` with
+  `start`/`end` in seconds. That's everything I need for the buffer-trim logic. Writing the script:
+
+● Deployed (`stream-parakeet-buffered.py`, syntax OK). Now test with varied continuous speech — I'll
+  concatenate the 8 ALSA directional clips (looped) into one continuous ~20 s stream and watch it
+  commit words incrementally:
+
+● It works — incremental commits with timestamps, LocalAgreement-2 confirming stable prefixes,
+  coherent text, exit 0:
+
+  ```
+  [   0.0s] Front,
+  [   0.8s] Center. Front. Left.
+  [   2.6s] Left, front, right, rear, center,
+  [   5.5s] Center. Rear,
+  [   6.6s] Left.
+  [  10.2s] Side, right, front, center, ... side, left, side, right.
+  ```
+
+  (The big final line is the EOF tail dump — at end-of-stream there's nothing left to confirm
+  against so it commits everything at once. A live call never EOFs, so that doesn't happen in real
+  use; words keep committing ~1–2 per chunk.)
+
+  One usability defect to fix before calling this done: NeMo logs a `Timestamps requested...` INFO
+  line on *every* chunk (visible spamming stderr). The top-level `logging` setLevel doesn't catch
+  NeMo's own logger. Patching that:
+
+● Patched. Quick re-test to confirm stderr is now clean and output still works:
+
+● Option 1 is built, deployed, and verified. stderr is now clean (5 lines total — just the load
+  banner and a harmless Megatron warning, no per-chunk spam), incremental commits work, exit 0.
+
+  ## What was built
+
+  **`~cosine/asr/stream-parakeet-buffered.py`** — low-latency buffered streaming on the
+  Spanish-capable `parakeet-tdt-0.6b-v3`, no model swap.
+
+  **Algorithm:** since parakeet-tdt-0.6b-v3 has no cache-aware streaming mode, this runs it on an
+  **overlapping sliding window** every `--chunk-sec` and commits words with a **LocalAgreement-2**
+  policy — a word prints only once two successive overlapping transcriptions agree on it, so the
+  unstable trailing edge never reaches the screen. The audio buffer is trimmed at the last committed
+  word using parakeet's word timestamps (probed and confirmed: `hyp.timestamp['word']` →
+  `{word,start,end}`), which bounds both latency and recompute. A whole-buffer RMS gate drops dead
+  air/music so silence can't grow the window. This is the live-stream form of NeMo's buffered RNNT
+  (NeMo's own `speech_to_text_buffered_infer_rnnt` is file-only).
+
+  **Verified** on continuous multi-phrase speech: words commit incrementally with absolute
+  timestamps, text is coherent, stderr clean.
+
+  ## How to run it (your Spanish use case)
+
+  ```bash
+  ssh cosine@pony
+  # live mic:
+  arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr/stream-parakeet-buffered.py --chunk-sec 1.0
+  # or the phone-call RTP source (in cosine's PipeWire session):
+  pw-record --target rtp_call_remote_source --format=s16 --rate=16000 --channels=1 - \
+    | ~/asr/stream-parakeet-buffered.py --chunk-sec 1.0
+  ```
+
+  ## Tuning
+
+  - `--chunk-sec` (default 1.0) — emit cadence. Effective latency ≈ chunk-sec (fill) + chunk-sec
+  (LA-2 confirmation) + ~0.1–0.3 s inference, so ~**1.5–2 s** at the default vs the 6 s+ (and the 27
+  s/49 s you actually saw) on the old pause-triggered VAD path. `--chunk-sec 0.5` ≈ ~1 s latency at
+  more recompute (fine on the 3090).
+  - `--max-context-sec` (12.0) — caps the rolling window.
+  - `--silence-rms` (0.004) — buffer reset threshold for dead air.
+
+  ## Honest limitations
+
+  - Not "true" streaming: there's a hard `chunk-sec` latency floor and redundant overlap compute
+  (cheap here — parakeet 0.6b does a few-second window in ~0.1–0.3 s on the 3090).
+  - LocalAgreement-2 inherently delays each word by one extra chunk (the confirmation), and
+  occasional word artifacts can appear at window boundaries.
+  - At EOF the whole uncommitted tail dumps in one line — irrelevant for a live call/broadcast (no
+  EOF); only shows up in finite-file tests.
+
+  You now have three parakeet scripts in `~cosine/asr/`: `stream-parakeet.py` (VAD-endpoint +
+  `--max-sec` cap — best for conversational turn-taking), and `stream-parakeet-buffered.py` (this
+  one — best for continuous monologue / news, lowest latency in Spanish). True sub-second
+  cache-aware streaming remains English-only and unavailable for Spanish, as the hunt established.
+
+❯ if this loaded a model, does it stay loaded on the GPU if the command is run again within seconds?
+
+● No. Each invocation is a brand-new Python process, and nothing about the model survives between
+  processes.
+
+  **What actually happens on each run:**
+  - `ASRModel.from_pretrained(...)` reads the cached `.nemo`, builds the model graph, loads weights,
+  then `.to("cuda")` uploads them into GPU VRAM and spins up a CUDA context. That's the ~8–10 s
+  startup you see in every test.
+  - When the process exits (Ctrl-C, EOF, crash), the CUDA context is torn down and that VRAM is
+  freed immediately.
+  - Run it again two seconds later → a fresh process repeats the entire load from scratch. There's
+  no daemon, no shared cache, no GPU-resident persistence.
+
+  **What a quick re-run *does* benefit from:** only the OS page cache. After the first load the
+  `.nemo` file sits in RAM filesystem cache, so the *disk-read* part is fast. But that's a small
+  slice — the ~8–10 s is dominated by framework init, model construction, and the CUDA
+  upload/context setup, and that recurs every single time regardless of how recently it ran.
+
+  **Within one run**, the model stays resident on the GPU for the life of the process — that's
+  exactly why per-chunk transcribe is ~0.1–0.3 s and not paying a reload each chunk. The design
+  intent is that you start it once and leave it running for the whole call/session, not restart it.
+
+  **One caveat for "run again within seconds":** if you start it again *without killing the first
+  one*, you get two independent processes each holding their own copy in VRAM (~2–3 GB model + ~1–2
+  GB CUDA overhead each). The RTX 3090's 24 GB absorbs a couple of copies, but they're redundant and
+  they'll contend for the GPU — and cosine's faster-whisper `asr-call-transcribe`, if also running,
+  holds its own separate VRAM on top.
+
+  If fast restarts actually matter to you — e.g., you want to relaunch with different flags without
+  eating 10 s each time — the fix is a **persistent model server**: one long-lived process loads
+  parakeet once and holds it on the GPU, and the stream scripts become thin clients that connect
+  over a socket/FIFO and pay zero load time. That's a clean ~100-line addition (a server wrapper +
+  making `stream-parakeet-buffered.py` able to talk to it). Want me to build that?
+
+❯ how can you see real-time utilization on the GPU?
+
+● Let me show you the actual tools on pony rather than just list them generically:
+
+● Only `nvidia-smi` is installed (no `nvtop`), but that's enough. Note the GPU is **completely idle
+  right now** — 0 % SM, 9 MiB used, 25 W — which incidentally confirms the previous point: nothing
+  from the test runs stayed resident; it all freed on exit.
+
+  The three modes you'll want, all over SSH:
+
+  **1. Live scrolling device metrics — the go-to for "is the GPU busy":**
+  ```bash
+  ssh claude@pony nvidia-smi dmon          # one line/sec, runs until Ctrl-C
+  ```
+  Watch the **`sm`** column — that's compute utilization (the real "GPU busy" number). `pwr`, `pclk`
+  (clock), temp also scroll. For an ASR stream you'll see `sm` spike briefly each chunk (~0.1–0.3 s
+  bursts) rather than a sustained number — it's bursty by nature.
+
+  **2. Per-process — which PID is actually using the GPU:**
+  ```bash
+  ssh claude@pony nvidia-smi pmon          # per-process sm/mem, one line/sec
+  ```
+  This is what you'd use to tell apart multiple model processes (e.g., a parakeet stream vs.
+  cosine's faster-whisper) and see which is active and how much VRAM each holds.
+
+  **3. Full table refreshed in place — utilization + memory + process list together:**
+  ```bash
+  ssh claude@pony 'watch -n1 nvidia-smi'   # or:  nvidia-smi -l 1
+  ```
+
+  **For logging/scripting** (one CSV line per second):
+  ```bash
+  ssh claude@pony 'nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw,clocks.sm \
+    --format=csv,noheader -l 1'
+  ```
+
+  One clarification that trips people up — there are **three different "memory" numbers**:
+  - `sm %` (dmon) / `utilization.gpu` — **compute** busy %. This is the one you usually mean by "GPU
+  utilization."
+  - `mem %` (dmon) / `utilization.memory` — memory-**bandwidth** utilization, *not* how full VRAM
+  is.
+  - `memory.used` (the query, 9 / 24576 MiB above) — **actual VRAM occupancy**. This is what tells
+  you whether a model is resident (parakeet 0.6b ≈ 2–3 GB + ~1–2 GB CUDA context).
+
+  If you want the nice interactive htop-style view, `nvtop` isn't present but is installable (`sudo
+  apt install nvtop` — claude has passwordless sudo on pony). Want me to install it?
+
+❯ can ~/asr/stream-parakeet-buffered.py be set exclusively for Spanish?  i see some english mixed in
+  the output
+
+● Good catch — parakeet-tdt-0.6b-v3 does per-chunk language *auto-detection*, and the buffered
+  approach makes that worse (lots of short overlapping windows, each independently re-detecting;
+  ambiguous/short ones flip to English). The real question is whether parakeet can be *forced* to a
+  language at all. Let me check its actual API rather than guess:
+
+● The probe is conclusive: **no — parakeet-tdt-0.6b-v3 cannot be pinned to a language, by design.**
+  Its `transcribe()` has no `language`/`source_lang` parameter (fixed signature, no `**kwargs`), one
+  shared `SentencePieceTokenizer` with no per-language split (`tokenizer.langs` is None), and no
+  language-prompt mechanism. Architecturally it's a plain RNNT/TDT transducer with a single shared
+  decoder across all 25 languages — language isn't an *input*, it just emerges from the acoustics.
+  The "auto-detect" isn't a switchable LID step you can lock; it's whatever the decoder emits. The
+  buffered approach amplifies the flips because each short overlapping window re-decides
+  independently. There's no bias knob, no vocab mask (Spanish/English share subwords), and no usable
+  prompt seed.
+
+  So "exclusively Spanish" requires a model that actually *takes* a language. Two models can
+  hard-lock Spanish, both compatible with the exact LocalAgreement buffered algorithm I just built
+  (it's still a `.transcribe()` call + word timestamps):
+
+  - **faster-whisper large-v3 with `language="es"`** — Whisper's language pin is bulletproof, the
+  model is *already cached for cosine*, and faster-whisper gives solid word timestamps for the
+  buffer-trim. Lowest-risk path; reuses everything.
+  - **Canary-1b-flash with `source_lang=es`** — also exact-language (Canary is an AED with explicit
+  lang/task prompt tokens), and as a bonus can do es→en *translation* (`task=ast`) if you ever want
+  that. Costs a ~6.4 GB model copy into cosine's cache (only in claude's now) and Canary's
+  word-timestamp support is newer/less battle-tested for the trim logic.
+
+● The probe path is clear. Before writing, I need to confirm cosine's faster-whisper venv
+  (`asr-env`, what `asr-call-transcribe` uses) is GPU-capable and check faster-whisper's
+  word-timestamp object shape so the buffer-trim logic is correct:
+
+● `asr-env` is a minimal venv (no `soundfile`) — fine, faster-whisper decodes file paths itself and
+  the streaming script only needs numpy (which `asr-call-transcribe` already uses, so it's present).
+  Re-probing without soundfile:
+
+● All confirmed: `asr-env` runs faster-whisper large-v3 on GPU, `info.language: es` proves the pin
+  takes effect (no auto-detect), word objects are `.word/.start/.end`. Building the Spanish-locked
+  buffered script — same LocalAgreement-2 algorithm, faster-whisper engine, `language="es"`
+  hard-pinned:
+
+● Test 1 passes — `--lang en` on the English clips gave correct incremental output (`Front, center,`
+  → `Center, front,` → `Front, left, rear, right, side, left.`), clean stderr, exit 0. The buffered
+  algorithm + faster-whisper + word timestamps all work.
+
+  Now test 2: `--lang es` on the *same English* audio, to prove the pin is active (it should NOT
+  auto-detect and emit clean English — it's locked to Spanish):
+
+● The language pin is **proven working**. Same English audio, two forced languages:
+
+  | `--lang en` | `--lang es` |
+  |---|---|
+  | `Center, front,` | **`Centro, frente,`** |
+
+  With `es` forced, Whisper transliterated the English acoustics into Spanish words ("Centro" =
+  center, "frente" = front) — it did *not* auto-detect and fall back to English. That's the exact
+  behavior you want: **one fixed language for the whole session, no per-chunk re-detection, no
+  English flips.** (The stray English words remaining are just because I fed it real English speech;
+  on actual Spanish input with `es` pinned, every window decodes as Spanish — the parakeet flip
+  problem is structurally gone.)
+
+  ## Delivered: `~cosine/asr/stream-whisper-buffered.py`
+
+  - **Engine:** faster-whisper `large-v3` (already cached for cosine), GPU via the `asr-env` venv
+  (`asr-call-transcribe`'s venv).
+  - **Language:** hard-pinned, **`--lang` defaults to `es`** — exclusively Spanish out of the box,
+  no flag needed.
+  - **Algorithm:** identical LocalAgreement-2 buffered sliding window as
+  `stream-parakeet-buffered.py` (overlapping windows, stability-commit, timestamp buffer-trim, RMS
+  silence reset).
+  - **Verified:** en→correct English, es→Spanish (pin proven), incremental timestamped commits,
+  clean stderr, exit 0.
+
+  ## Run it for the Spanish news / call
+
+  ```bash
+  ssh cosine@pony
+  # phone-call RTP source, in cosine's PipeWire session:
+  pw-record --target rtp_call_remote_source --format=s16 --rate=16000 --channels=1 - \
+    | ~/asr/stream-whisper-buffered.py
+  # or live mic:
+  arecord -q -D plughw:Snowball,0 -f S16_LE -r 16000 -c 1 2>/dev/null \
+    | ~/asr/stream-whisper-buffered.py
+  ```
+
+  No `--lang` needed (defaults to `es`). Tuning knobs are the same as the parakeet buffered script:
+  `--chunk-sec` (latency vs recompute), `--max-context-sec`, `--silence-rms`.
+
+  ## Honest caveat
+
+  `large-v3` is heavier than parakeet-0.6b. At `--chunk-sec 1.0` on the 3090 each window is ~0.4–1 s
+  of inference — fine (real-time factor < 1, redundant recompute absorbed), but if it ever falls
+  behind on a long continuous broadcast, raise `--chunk-sec` to 1.5 or drop to a lighter `--model`
+  (e.g. `medium`, also multilingual). The LocalAgreement-2 one-chunk confirmation delay and the
+  EOF-tail dump (irrelevant for a live never-EOF stream) are unchanged from the parakeet buffered
+  version.
+
+  You now have, in `~cosine/asr/`: `stream-parakeet.py` (VAD-endpoint, multilingual auto-detect,
+  conversational), `stream-parakeet-buffered.py` (low-latency continuous, multilingual auto-detect),
+  and **`stream-whisper-buffered.py` (low-latency continuous, exclusively Spanish)** — the one
+  matching your requirement.
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the JSONL
+  lives in the subagent dir tree:
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Two locations need to be searched, because subagents log to a
+  different place than top-level sessions:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl`. The ID is the basename.
+  - **Task-runner subagents** flush to
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl`. The ID
+    is the composite `<parent>-<aid>`.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 2 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID (subagent → composite, top-level → UUID)
+  case "$path" in
+    */subagents/*/agent-*.jsonl)
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why the subagent search matters.** Before this dual-search, the
+  poller only checked `~/.claude/projects/-home-claude/`. In subagent
+  runs the marker never appeared there (subagent events go to the
+  `sessions/subagents/` tree instead), the poller timed out, and the
+  agent fell back to "find the recently-touched top-level JSONL" —
+  which yielded the *parent session's* UUID, not the subagent's own
+  identity. That accidentally produced a per-parent compaction
+  filename, collapsing multiple subagents under one parent into the
+  same file. The dual search yields the correct composite ID and gives
+  each subagent its own compaction.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● Session ID detection running. Writing the report:
+
+● Session ID: `c0fe5fde-1f38-4381-b26f-94bcb3e3b305`. Writing the compaction:
+
+● Now the KG entry. Reading the canonical extraction spec:
+
+● Writing the KG JSON (reusing existing entity names where they match):
+
+● Validating the JSON and committing the `~/project` artifacts:
+
+● All "dangling" refs are existing graph entities (verified present in `current-entities.txt`:
+  `CacheAwareStreamingAudioBuffer`, `silero-vad`, `RTX 3090`, `pony`, `rtp_call_remote_source`, `uv
+  venvs don't ship pip`, etc.) — valid cross-references per spec. JSON valid (25 entities, 34
+  edges). Committing the `~/project` artifacts:
+
+● Committed. Three artifacts written:
+
+  - **Report:** `~/project/reports/cosine-asr-streaming-report.md`
+  - **Compaction:** `~/project/compactions/session-c0fe5fde-1f38-4381-b26f-94bcb3e3b305.md`
+  - **KG:** `~/lightrag-history/incoming/session-c0fe5fde-1f38-4381-b26f-94bcb3e3b305.json` (25
+  entities, 34 edges; drain runs separately)
+

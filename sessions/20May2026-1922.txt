@@ -1,0 +1,1441 @@
+❯ let's continue our work on the asr tui
+
+● Let me check more recent compactions — there's one from 5h ago and another from 17h ago.
+
+● I notice pony's repo at `~claude/asr` looks out of date. Let me check the actual deployment
+  location.
+
+● I'm caught up. Samsung's `~/asr` is canonical (edit-here, push, pony pulls). State as of 5h ago:
+
+  - **TUI complete**: dual-stream Voxtral→NLLB cascade, ANSI alt-screen, masked re-translation,
+  VAD-driven WS recycle, per-stream liveness/recycle/session-age headers, scrollback, marker-MT.
+  - **Deployment**: `voxtral.service` systemd user unit; repo public at
+  `github.com/BrentBaccala/asr` with `INSTALL.md`.
+  - **Last work (5h ago)**: triaged the upstream vLLM `_bookkeeping_sync` bug, posted comments on
+  issue #39996 and PR #40072 — waiting on maintainer.
+
+  Open threads I see:
+  1. **Telephone-band / code-switched validation** — parked, needs real call audio.
+  2. **Auto-idle-stop timer** for `voxtral.service` — sketched, not built (so GPU can be reclaimed
+  for ollama without manual `systemctl stop`).
+  3. **vLLM cap raise** to ~45000 — deferred; auto-recycle deflected urgency.
+  4. **vLLM upstream PR #40072** — waiting on maintainer (out of our control).
+
+  Where do you want to go?
+
+❯ [Request interrupted by user for tool use]
+
+❯ so, i'm seeing some of the colors aren't right.  most of the text is white, but when there's a
+  block of text that spans multiple lines, sometimes the second and third lines are brown or cyan.
+  white is fine, and I'd like it to be consistent
+
+● Found it. In `asr-tui.py:1298-1307` the history `_trans_line` wraps each line with `CSI + ansi +
+  "m" ... CSI + "0m"`, where ansi is `"33"` (yellow/brown) for ES and `"36"` (cyan) for EN. But the
+  tag (e.g. `[Remote] ES   `) is itself `opener + tag_text + closer` where `closer = CSI 0m` — so on
+  the **first** line the inner `0m` resets the color before the body, leaving the body white. On
+  wrapped continuation lines the prefix is just spaces with no embedded reset, so the body stays in
+  yellow/cyan. Exactly the symptom you describe.
+
+  Live block has the same `wrap_pref` shape at 1225 but applies `1;33` / `1;36` *after* the prefix
+  so it's consistently bold-colored there — that's why you mostly see the issue on the history rows.
+
+  Fix: drop the body color on ES/EN rows in both regions; keep the dim color only on the `⋯` / `—`
+  pending placeholders so you can still distinguish pending from real. The `[Remote]`/`[Me]` accent
+  on the prefix and the `ES`/`EN` label already disambiguate channels.
+
+● Both regions now render bodies in default (white):
+  - **History** (`_trans_line`): drop the `CSI ansi m … 0m` wrap around the body; placeholder `⋯` /
+  `—` keeps its dim color so pending/empty is still distinguishable.
+  - **Live** (`wrap_pref` calls at 1274/1276/1280): pass `"0"` instead of `"1"` / `"1;33"` /
+  `"1;36"` so the body is plain default. The placeholder `⋯` for live ES/EN still uses dim
+  yellow/cyan, matching history.
+
+  `[Remote]` / `[Me]` accent + the `Live`/`ES`/`EN` label still carry the channel identity.
+
+● Want me to commit + push so you can `git pull` on pony and check it, or hold for review first?
+
+❯ commit
+
+● Committed as `6316501`. Not pushed — let me know when you want it on pony.
+
+❯ i can't select text with the mouse, or right-click to get a copy/paste menu.  you know that,
+  right?
+
+● Yes — the TUI turns on xterm mouse reporting (`?1000h` + `?1006h` at line 948, enabled at 1143) so
+  the wheel sends scroll events to the app. While that's active the terminal hands every click and
+  wheel event to us instead of letting it drive selection or the right-click menu.
+
+  Three ways to get selection back:
+
+  1. **Shift+click / Shift+drag** — most terminals (gnome-terminal, konsole, xterm, iTerm2, wezterm)
+  treat Shift as the bypass: while you hold it, mouse reporting is suppressed and you get native
+  selection + the right-click menu. Zero code change. Works today.
+  2. **Drop the wheel and turn mouse reporting off** — scrollback then runs on keyboard only
+  (PgUp/PgDn/↑↓/Home/End, already wired at 1112-1121). You'd lose wheel-scroll but selection works
+  without any modifier.
+  3. **Keep wheel, add a hotkey to toggle reporting on/off** — e.g. Ctrl-X flips between "wheel
+  scrolls / no selection" and "selection works / wheel ignored".
+
+  Which do you want? Shift+click is probably enough if you didn't know about it; otherwise I'd lean
+  toward the toggle (3) so the wheel-scroll feature you asked for in the last session stays useful.
+
+❯ OK, shift - I didn't know that!
+
+  now, here's what happened a few minutes ago.  I had played the audiobook, then paused it.  I saw
+  this:
+  ```
+  [Remote] Live ...
+  [Remote] ES   ¿ Qué ?
+  [Remote] EN   - I 'm not .
+
+  ```
+  then, when I resumed the audio, I saw this:
+  ```
+  [Remote] Live ...
+  [Remote] ES   ¿ Qué ?
+  [Remote] EN   - I 'm not .
+
+  [Remote] Live logrado conseguir el sueño reparador que le iba haciendo cada día más necesario.
+  [Remote] ES   logró conseguir el sueño reparador que le hacía cada vez más necesario.
+  [Remote] EN   He managed to get the restful sleep that was making him more and more needy.
+
+  [Remote] Live A medida que sus fuerzas se gastaban.
+  [Remote] ES   A medida que sus fuerzas se gastaron.
+  [Remote] EN   As their forces were being spent.
+
+  ```
+  the first block, of course, is what I saw at first.  the second block is the text that was
+  "queued".  the third block is the text when it started playing again
+
+  any explanation for this?
+
+● Honest answer: I have a few hypotheses but none I can confirm without seeing the actual stream.
+  Let me check the code first.
+
+● Looking at the code, there are three places audio/text can be buffered between Voxtral and
+  history:
+
+  1. **PipeWire RTP jitter buffer** + the audiobook player's output buffer — usually 100–500 ms, not
+  enough to hold a whole sentence.
+  2. **Voxtral's internal state on the `/v1/realtime` WS** — it streams partial deltas but doesn't
+  finalize a sentence until it sees enough audio + sentence-end. With `transcription_delay_ms=240`
+  and the encoder window, this can hold several seconds of in-progress transcription.
+  3. **asr-tui's `cur_live` + pause-watcher** (line 611): the in-progress text sits in `cur_live`
+  (displayed in the *Live* region below the separator, not the history region above it) until either
+  Voxtral signals sentence end OR no deltas arrive for `--sentence-close-ms` (default **3000 ms**),
+  which fires `_emit_chunk_locked(is_final=True)` and runs MT → that's when a row lands in history.
+
+  Most plausible story for what you saw:
+
+  - "Había logrado conseguir el sueño reparador que le iba haciendo cada día más necesario." was
+  *already being spoken* in the audiobook when you paused — Voxtral was streaming partial deltas of
+  it into `cur_live`, which renders in the **live block** below the separator, not in history. You
+  probably didn't focus on it; "¿Qué?" was the last *finalized* row at the top.
+  - When you paused, deltas stopped. After 3 s of no deltas the `pause_watcher` fired
+  `is_final=True`, promoted `cur_live` to history, and MT translated it. Whether that landed during
+  the pause or right after you resumed depends on timing: if you resumed within 3 s, the close timer
+  fires *just after* the new audio resumes activity, and the row appears to "pop in" right at
+  resume.
+  - Then the new audio "A medida que sus fuerzas se gastaban." rolled through normally → block 3.
+
+  What would falsify this:
+
+  - If you noticed the live block below the separator was **empty** during pause, then the partial
+  sentence wasn't sitting there and the buffering theory has to live in PipeWire / Voxtral.
+  - If the pause was **longer than 3 s** but block 2 didn't appear until you resumed, the
+  `pause_watcher` timer either didn't fire or fired but had nothing to flush — that's a real anomaly
+  worth tracking.
+
+  How long was the pause, and do you remember whether the live block (below the `─── separator ───`
+  line) was showing anything during the pause? If we want to nail this down repeatably I can add a
+  `stderr` timestamp log on each `_emit_chunk_locked` call so the next pause/resume tells us exactly
+  when blocks landed.
+
+❯ i think it was longer than 3 seconds.  the live block was showing ellipses
+
+● To pin this down: do you mean `⋯` (the pending-translation placeholders, U+22EF) or literal `...`
+  (three dots) as the raw text?
+
+  It matters because:
+
+  - If you saw `⋯`: `cur_live` was non-empty (Voxtral was actively streaming text) but the live MT
+  preview hadn't filled in. In that case `cur_live` would have had visible body text on the `Live▸`
+  row too. After 3 s of no new deltas the sentence-close timer should have fired and pushed it to
+  history.
+  - If you saw `...`: that's literal raw output from Voxtral — it sometimes emits "..." on
+  quiet/non-speech audio. The text would have been short (3 chars), and looking at `pause_watcher`
+  (line 654: `tail = rem if (rem and len(rem) >= min_sub) else ""` with `min_sub` defaulting to 12),
+  a 3-char "..." gets **discarded** as the tail — sentence closes with `tail=""`, no row added.
+  - If the live block showed just `[Remote] Live▸` / `ES▸` / `EN▸` with **no body at all** on any of
+  the three rows: that's the "cur_live empty, render bare prefix" path (line 1269-1273). Then
+  `pause_watcher` had nothing to flush.
+
+  So which of those three did you actually see?
+
+  And one more diagnostic question: if block 2 ("logrado conseguir…") didn't exist anywhere on
+  screen *during* the pause, then either (a) Voxtral never delivered that text to us during the
+  pause, or (b) it did but `pause_watcher` discarded it. The audio for that sentence has to come
+  from *somewhere* — most likely it's audio that was sitting in the audiobook player's output buffer
+  or PipeWire's pipe when you hit pause, and Voxtral chewed through it after some delay. Then it sat
+  in `cur_live` briefly, got flushed by `sentence_close_ms`, and showed up.
+
+  If you want, I'll add a small stderr trace — timestamps on every `_emit_chunk_locked` call and
+  every `pause_watcher` fire — so the next time we can read exactly when block 2 was emitted and
+  which code path put it there. Want me to add that?
+
+❯ ok
+
+● Now instrument the three sites. First `_emit_chunk_locked`:
+
+● Now `pause_watcher`:
+
+● Now `recycle_watcher`. Let me find the recycle trigger point:
+
+● Let me also add one more trace at the Voxtral WS receive — that'll show whether deltas were still
+  arriving during the pause (i.e., buffered audio was being processed) or whether Voxtral truly went
+  quiet.
+
+● All four trace sites wired. Quick check the script still parses:
+
+● Committed as `9b4bf82`. To use on pony after a `git pull`:
+
+  ```
+  asr-tui.py --dual --trace-emit 2>/tmp/asr-trace.log
+  ```
+
+  Then in another terminal: `tail -f /tmp/asr-trace.log` while you reproduce the pause/resume. The
+  trace will show the exact ordering of deltas → emits → pause-watcher fires → recycles, so we can
+  see whether deltas kept arriving during the pause (audio buffered through), when the close-timer
+  fired, and whether the "logrado…" sentence emit happened during the pause or only after resume.
+
+  Two unpushed commits on `master` now (`6316501` color fix + `9b4bf82` trace). Say the word when
+  you want them pushed.
+
+❯ push it
+
+● Pushed `e37220b..9b4bf82` to `github.com/BrentBaccala/asr`. On pony: `git -C ~/asr pull` to pick
+  them up.
+
+❯ let's also drop the colorization on the U+22EF markers, too
+
+● Pushed `8b4c1ef`. `⋯` and `—` placeholders now render in the default terminal color in both the
+  live block and history — no dim, no yellow/cyan. Channel/state is still disambiguated by the
+  `[Remote]`/`[Me]` accent on the prefix and the `Live`/`ES`/`EN` label.
+
+❯ why didn't this block translate:
+  ```
+  [Remote] Live ordenadas simétricamente, que se referían a la otra vida, tales como
+  [Remote] ES   ordenadas simétricamente, que se refieren a la otra vida, tales como:
+  [Remote] EN   They are arranged in a symmetrical way, and they refer to the Hereafter, such as:
+  "Enter the House of Allah".
+
+  [Remote] Live Entráis en la morada de Dios.
+  [Remote] ES   —
+  [Remote] EN   —
+
+  [Remote] Live Que la luz eterna os ilumine.
+  [Remote] ES   Que la luz eterna os ilumine.
+  [Remote] EN   May the eternal light shine upon you.
+
+  [Remote] Live Jagenbach encontró durante algunos minutos una distracción seria en leerlas y en
+  dejar que su mirada ideal se perdiese en el misticismo de
+                que estaban penetradas.
+  [Remote] ES   Jagenbach encontró durante unos minutos una seria distracción en leerlas y en dejar
+  que su mirada ideal se perdiera en el misticismo de que
+                estaban penetradas.
+  [Remote] EN   Jagenbach found for a few minutes a serious distraction in reading them and letting
+  his ideal gaze be lost in the mysticism that they were
+                permeating.
+
+  ```
+
+● That `—` placeholder means marker-MT decided this chunk's translation belongs in a neighbor's row,
+  not its own. Let me look at the splitting logic.
+
+● The chunk *was* sent to NLLB; the `—` means the splitter found only one segment when it expected
+  two for that sentence.
+
+  What happened:
+
+  1. Voxtral emitted two chunks back-to-back as one sentence:
+     - chunk A: `ordenadas simétricamente, que se referían a la otra vida, tales como`
+     - chunk B: `Entráis en la morada de Dios.`
+  2. `_emit_chunk_locked` (line 414-420) joined them into `sent_raw` with a marker:
+     ```
+     ordenadas simétricamente, que se referían a la otra vida, tales como [1] Entráis en la morada
+  de Dios.
+     ```
+  3. When the sentence closed, `mt_worker` called `translate_dual(sent_raw)` and got back `full_es`
+  / `full_en`.
+  4. `_split_on_markers` (line 367-379) split each output on `[N]` markers. **For both ES and EN it
+  found only 1 segment instead of 2** — i.e. NLLB dropped the `[1]` marker on this input.
+  5. With 1 segment but `expected_n=2`, the splitter pads: `[seg, ""]`. Chunk A gets `seg`, chunk B
+  gets `""` → renders as `—`.
+
+  Look at chunk A's EN: `…such as: "Enter the House of Allah".` — that "Enter the House of Allah"
+  *is* NLLB's English for chunk B. NLLB merged the two clauses into one English sentence and dropped
+  the marker between them. Then the whole merged translation landed in chunk A's row.
+
+  On the ES side: NLLB's `full_es` ends at `tales como:` (no "Entráis en la morada de Dios" in it at
+  all). NLLB likely either dropped that clause entirely or absorbed it into the previous one without
+  surfacing equivalent text.
+
+  So this is a **known marker-MT failure mode**: NLLB-distilled-600M isn't 100% reliable at
+  preserving the `[N]` markers, especially on short clauses or stylistically-divergent translations
+  (it rewrites "morada de Dios" → "House of Allah" — a religious-context substitution that suggests
+  it's reshaping rather than translating word-for-word). The earlier 7-sentence probe showed
+  "perfect order, 0 marker drops" but that was on clean test sentences; real audiobook text with
+  embedded quotations is a harder case.
+
+  Want me to add a trace at the marker-MT call site (`mt_worker`) that logs `sent_raw`, `full_es`,
+  `full_en`, and the segment counts? That'd let us see exactly when NLLB drops markers and on what
+  kinds of inputs — useful if we want to mitigate (e.g. fall back to per-chunk translation when the
+  segment count is off, or stop emitting visual sub-chunks for tightly punctuated clauses so the
+  marker isn't needed).
+
+❯ no, let's keep watching it.  look at what it did here with the spanish "translation":
+  ```
+                devolvía su mirada de un modo tan agresivo cara a cara tan abiertamente resuelto a
+  llevar la cosa al último extremo y a obligar al otro a
+                retirar su mirada que hagenbach con una impresión penosa se apartó y comenzó a
+  pasear a lo largo de las verjas decidido a no volver a fijar
+                su atención en aquel hombre y en efecto a los pocos momentos lo había olvidado pero
+  bien porque el aspecto errante del desconocido hubiese
+                impresionado su fantasía o por obra de cualquier otra influencia física o espiritual
+  lo cierto es que de pronto advirtió una sorprendente
+                ilusión en su alma una especie de inquietud aventurera un ansia juvenil hacia lo
+  lejano
+  [Remote] ES   Quizás Hagenbach hubiera pecado de indiscretión en este examen del medio desconocido
+  medio distraído medio inquisitivo pero de pronto notó
+                que le devolvía su mirada de una manera tan agresiva cara a cara tan abiertamente
+  resuelto a llevar la cosa al último extremo y obligar al
+                otro a retirar su mirada que hagenbach con una impresión dolorosa se apartó y
+  comenzó a caminar a lo largo de las veredas decidido a no
+                volver a fijar su atención en pocos momentos y de hecho lo había olvidado bien
+  porque el aspecto errante de su impresionado o por obra de
+                cualquier otro influencia espiritual o espiritual es que de pronto se dio cuenta de
+  una ilusión sorprendente en su alma con una especie de
+                inquietud aventurosa se apartó y comenzó a caminar a lo largo de las veredas tan
+  decidido como para no fijar su atención en cierto hombre y
+                en algunos momentos había olvidado bien porque el aspecto errante de su fantasma o
+  por cualquier otro efecto espiritual o influencia es que
+                de pronto se dio cuenta de una ilusión sorprendente en su alma con una especie de
+  inquieto aventurosa un poco menos ansioso hacia el suelo
+                con el que se detuvo el viento de los sentimientos físicos tan vivos en el suelo con
+  un poco menos que el ojo joven en el cual se detuvo en
+                el estado tan desconocido o el fantasma de su mente tan joven como el fantasma en el
+  cual se detuvo en el suelo con el estado tan vivo y el
+                viento tan vivo en el suelo tan joven como el cual el estado de la mente tan joven
+  como el cual el fantasma se detuvo en el viento en el
+                suelo tan vivo y el estado de la mente tan vivo en el cual el cual el viento de la
+  mente tan vivo en el suelo tan joven se detuvo en el
+                cual el estado tan vivo en el estado tan vivo en el cual el cual el suelo tan vivo
+  en el cual el cual el estado de la mente de la mente de
+                la mente de la mente de la mente de la mente de la mente de la mente de la mente de
+  la mente de la mente de la mente de la mente de la
+                mente de la mente de la mente de la mente de la mente de la mente de la mente de la
+  mente de la mente de la mente de la mente de la mente
+                de la mente
+  [Remote] EN   Perhaps Hagenbach had sinned indiscretion in this examination of the unknown middle
+  distracted middle inquisitive but suddenly he noticed
+                that he returned his gaze in such an aggressive way face to face so openly resolved
+  to take the thing to the last extreme and to force the
+                other to withdraw his gaze that make him do so painful impression Hagenbach with a
+  painful impression set aside and began to walk along the
+                verges determined not to fix his attention again in a few moments and indeed he had
+  forgotten it well because the wandering aspect of his
+                mind had impressed him or by any other far or spiritual influence is that he soon
+  noticed a surprising illusion in his soul a kind of
+                restlessness an adventure towards the unknown soul so longed to look at the new and
+  unknown soul in such a certain state that he forgot to
+                see the soul so young and so unable to see the new feelings in his eyes and so
+  unknown soul as to the unknown soul in such a certain state
+                as to stop the sight of the new soul and so unknown to the soul as to the soul in
+  such a certain state of mind as to look at the unknown
+                soul and so young so unknown to the mind as to see the new feelings in such a
+  certain state.
+
+  ```
+  any explanation?
+
+● Classic decoder degeneration on a long input. Two compounding causes:
+
+  **1. The input is huge for a 600M-distilled model.** Voxtral didn't produce sentence-ending
+  punctuation for ~25-30 seconds of continuous audiobook prose — late-19th-century Spanish run-on
+  sentences are exactly the kind of input the model wasn't trained on. So `sent_raw` was ~200+
+  Spanish words / ~350+ tokens by the time the close timer fired. NLLB-200-distilled-600M's
+  effective good-quality input range is roughly 50-150 tokens; past that, the small distilled
+  decoder loses the encoder's positional grip and starts hallucinating from local n-gram statistics.
+
+  **2. No n-gram repeat constraint.** Look at `translate_dual` (asr-tui.py:340-342):
+  `translate_batch` is called with only `beam_size` and `max_decoding_length=512`. There's **no
+  `no_repeat_ngram_size`** — and that's the parameter that breaks repetition spirals. With it
+  missing, once the decoder gets stuck in `"de la mente"` it can keep emitting that trigram all the
+  way to 512 tokens. CTranslate2 supports `no_repeat_ngram_size` natively; setting it to 3 or 4
+  would terminate the spiral as soon as a trigram (resp. 4-gram) is repeated.
+
+  You can see the spiral phases in the ES output:
+  - ~70 words of plausible translation that mostly tracks the source.
+  - A degradation phase where it loops on "comenzó a caminar a lo largo de las veredas" (Voxtral
+  originally had "verjas" / railings; NLLB drifted to "veredas" / sidewalks and then re-translated
+  the same clause twice).
+  - Full collapse into `"de la mente"` × 30.
+
+  The EN output shows the same arc — coherent first half, then "unknown soul / certain state / new
+  soul" carousel.
+
+  Mitigations in order of effort:
+  - **Cheap fix**: pass `no_repeat_ngram_size=4` (or 3) into the `translate_batch` calls — kills the
+  spiral immediately, no quality cost.
+  - **Medium fix**: cap the input. If `sent_raw` exceeds, say, 60 words, split it at the last comma
+  before that and translate each piece separately, then concatenate. Loses some cross-clause context
+  but stays inside the model's sweet spot.
+  - **Heavy fix**: bump to NLLB-200-1.3B-distilled (a ~2.6 GB CT2-int8 model). Better long-input
+  handling, ~3× slower on CPU. Wouldn't fit on GPU alongside Voxtral, so still CPU.
+
+  Want any of those, or keep watching?
+
+❯ leave it alone.  now, i'm also hearing a lot of crackling on the bluetooth-attached phone, with a
+  pair of headsets plugged into samsung, so i don't think it's anything to do with the transcription
+  service on pony
+
+  i sounds like "xruns" - any way to check if bluetooth packets are being dropped, or if something
+  in the pipewire pipeline is dropping stuff?
+
+● Different problem entirely — samsung-side audio, not pony. Let me check what I can see from this
+  session first (I'm running as `claude`, and the BT/headset audio may be in your own user's
+  PipeWire session).
+
+● PipeWire for the phone/headset audio runs under the **`baccala`** user, not `claude`. Let me see
+  whether I can reach that session's socket at all.
+
+● I can't reach it from here — `/run/user/1000` is mode `700`, so the `claude` account is locked out
+  of `baccala`'s PipeWire session (where the phone/headset audio lives). You'll need to run the
+  checks in your own terminal as `baccala`. Here's what to run and what each tells you.
+
+  **First, the key distinction:** a phone *call* over Bluetooth uses **HFP/HSP** (the SCO link, mSBC
+  or CVSD codec — mono, narrow/wideband), *not* A2DP. SCO audio is inherently far more crackle-prone
+  than A2DP music streaming, both over the air and across the USB-HCI transport. So before chasing
+  PipeWire, confirm which profile is active — if it's HFP, the crackle may be the SCO link itself,
+  not your graph.
+
+  **1. xruns — the single best indicator** (run during the crackling):
+  ```
+  pw-top
+  ```
+  Watch the **ERR** column. It increments every time a node misses its deadline (an xrun). Note
+  *which* node climbs: the BT source, the ALSA headphone sink, or a loopback. `pw-top` also shows
+  each node's QUANT (quantum) and RATE — a too-small quantum on the BT node is a common underrun
+  cause. For a parseable snapshot instead of the live view: `pw-top -b -n 2`.
+
+  **2. Confirm the BT profile + see the whole graph:**
+  ```
+  wpctl status
+  pw-cli ls Node | grep -iE 'bluez|api.bluez|node.name'
+  ```
+  Look for `bluez_input`/`bluez_output` and the profile. If you see `headset-head-unit` / `HFP` /
+  `SCO`, you're on the call profile (expected for a call). `A2DP` would be music-only.
+
+  **3. PipeWire's own complaints** (it logs xruns and BT transport errors):
+  ```
+  journalctl --user -u pipewire -u wireplumber --since "10 min ago" | grep -iE
+  'xrun|underrun|overrun|suspend|error|sco|transport'
+  ```
+
+  **4. Bluetooth-link / SCO packet loss** (kernel + HCI level — these need `sudo`, which you have as
+  `baccala`):
+  ```
+  dmesg -w | grep -iE 'bluetooth|hci|sco|btusb'      # watch while it crackles
+  sudo btmon | grep -iE 'SCO|flush|complete'          # SCO packets / flushes over HCI
+  ```
+  Air-side packet loss shows up as gaps/retransmits in `btmon`; controller trouble shows up in
+  `dmesg` (resets, "SCO packet for unknown connection", btusb errors).
+
+  **5. If you want to localize playback-vs-tap:** temporarily stop the RTP send to pony and listen.
+  If the crackle vanishes, the loopback feeding RTP is back-pressuring the graph; if it persists,
+  it's the BT→headphone path and the RTP tap is innocent.
+
+  My prior: for a Bluetooth *phone call* the most likely cause is the HFP/SCO link (over-air loss or
+  USB-HCI SCO handling) rather than a PipeWire xrun — but `pw-top`'s ERR column will settle that in
+  a few seconds. Want me to write any of this into a small diagnostic script you can drop in
+  `~baccala/bin`, or are you good running them by hand?
+
+❯ well, i see this in journalctl:
+  ```
+  May 20 21:27:03 samsung wireplumber[1050187]: 0x6089400e7e50: (0 suppressed) out of buffers on
+  port 0 1
+  May 20 21:27:04 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:04 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:05 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:06 samsung wireplumber[1050187]: 0x6089400e7e50: (1 suppressed) out of buffers on
+  port 0 1
+  May 20 21:27:07 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:07 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:08 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:08 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:09 samsung wireplumber[1050187]: 0x6089400e7e50: (0 suppressed) out of buffers on
+  port 0 1
+  May 20 21:27:14 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:17 samsung wireplumber[1050187]: 0x6089400e7e50: (2 suppressed) out of buffers on
+  port 0 1
+  May 20 21:27:17 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:17 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:17 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:18 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:18 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:19 samsung wireplumber[1050187]: failed to write data: -104 (Connection reset by
+  peer)
+  May 20 21:27:22 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:23 samsung wireplumber[1050187]: 0x6089400e7e50: (0 suppressed) out of buffers on
+  port 0 1
+  May 20 21:27:23 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:25 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:30 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:30 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:34 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:35 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:36 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:37 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:47 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:27:48 samsung wireplumber[1050187]: sbc_decode failed: -3
+  May 20 21:31:05 samsung pipewire[1050180]: default: expected 3907468544 != timestamp 3907468288
+  May 20 21:31:05 samsung pipewire[1050180]: default: expected 3907475200 != timestamp 3907474944
+  May 20 21:31:05 samsung pipewire[1050180]: default: expected 3907474944 != timestamp 3789446851
+  May 20 21:31:05 samsung pipewire[1050180]: default: expected 3789447363 != timestamp 3907470592
+  May 20 21:31:05 samsung pipewire[1050180]: default: expected 3789447363 != timestamp 3907470592
+
+  ```
+
+● That's conclusive — and it corrects my earlier HFP guess. This is **A2DP (SBC codec), and
+  Bluetooth packets are being lost/corrupted over the air.** Not a PipeWire scheduling xrun, and
+  nothing to do with pony.
+
+  Reading the log:
+
+  - **`sbc_decode failed: -3`** (the dominant line) — the SBC decoder is being handed corrupt or
+  truncated A2DP frames and can't decode them. SBC is the A2DP music codec, so the phone is
+  streaming over A2DP, not an HFP/SCO call link as I'd assumed. A failed decode produces a
+  gap/garbage in the PCM output — that's the crackle you hear. Healthy A2DP essentially never logs
+  this; a steady stream of them means frames are arriving damaged.
+  - **`failed to write data: -104 (Connection reset by peer)`** — the A2DP/AVDTP stream actually
+  dropped for a moment. The L2CAP link reset. That's a hard link interruption, not a buffer hiccup.
+  - **`out of buffers on port 0 1`** — the BT source node starved its buffer pool. This is mostly a
+  *consequence* of the irregular, lossy input (frames not arriving on schedule), not an independent
+  CPU/scheduling problem.
+
+  So: yes, BT packets are being dropped. The cause is almost certainly **2.4 GHz RF**, and this
+  account has a documented history of exactly that on samsung (the QCA9377 adapter is finicky). In
+  rough order of impact:
+
+  1. **USB 3.0 interference** — the #1 cause of A2DP SBC corruption. USB 3.0 ports/hubs/cables
+  radiate broadband noise right in the 2.4 GHz band. If samsung's BT radio (or anything near it)
+  sits next to a USB 3.0 device — including the headset cable run, an external drive, a dock — move
+  it. This single thing fixes more A2DP crackle than anything else.
+  2. **Wi-Fi on 2.4 GHz** — if samsung is associated on the 2.4 GHz band, BT and Wi-Fi are fighting
+  for the same spectrum. Move samsung to 5 GHz Wi-Fi and the BT link usually cleans up.
+  3. **Distance / obstruction / antenna** — get the phone closer and in line-of-sight. Your notes
+  already flag samsung's BT as RF-sensitive.
+
+  To quantify the link while it's crackling (run as `baccala`, needs sudo):
+  ```
+  bluetoothctl info <phone-mac>          # shows RSSI / connection
+  sudo btmon | grep -iE 'RSSI|flush|reset|complete'
+  ```
+  A weak/fluctuating RSSI confirms the radio. Low RSSI + the SBC failures = over-air loss; strong
+  RSSI + SBC failures would instead point at USB-HCI corruption (still RF, but from USB3 leaking
+  into the controller).
+
+  Separately, those last lines —
+  ```
+  pipewire[1050180]: default: expected 3907468544 != timestamp 3907468288
+  ```
+  — are a **different** symptom: timestamp discontinuities on a node (note one value jumps to a
+  totally different base, `3789…` vs `3907…`). That smells like the RTP path to pony getting
+  out-of-order or clock-jumped packets, not the BT link. It happened ~4 min after the SBC burst, so
+  it may be unrelated. If you want, the `--trace`-style way to confirm is to stop the RTP send and
+  see if those `expected != timestamp` lines stop while the SBC failures continue — that'd cleanly
+  separate "BT link is lossy" (the crackle) from "RTP tap has a clock issue" (the timestamp
+  warnings).
+
+  Bottom line: the crackle is the A2DP radio link losing SBC frames. Fix the 2.4 GHz environment
+  (USB 3.0 proximity first, then 2.4 GHz Wi-Fi), not the audio graph.
+
+❯ there's no way to do cabled bluetooth, is there?  any kind of android developer thing?
+
+● Yes — there's a real one, and it's exactly the "Android developer thing" you're thinking of:
+  **scrcpy** (2.0+) forwards the phone's audio over the USB/ADB cable, no Bluetooth radio involved.
+  Let me check what's already on samsung.
+
+● `adb` is already installed (v34.0.4); **scrcpy is not**. scrcpy is the tool you want.
+
+  **What scrcpy does for you:** since v2.0 (early 2023) it forwards the phone's audio to the
+  computer over the USB/ADB cable. Audio-only invocation:
+  ```
+  scrcpy --no-video --audio-source=output
+  ```
+  That captures the phone's playback audio (media/app output) as a clean digital stream over USB —
+  zero 2.4 GHz radio, so no SBC decode failures, no crackle. It plays into your PipeWire graph just
+  like any app, so you'd tap it for the RTP→pony send exactly the way you tap the bluez source
+  today.
+
+  **The one important caveat:** Android blocks normal apps from capturing the `VOICE_CALL` stream
+  (privacy restriction). So:
+  - **Audiobook / media audio** (what you've been transcribing this session): works perfectly with
+  `--audio-source=output`.
+  - **Live cellular call audio**: scrcpy *has* `--audio-source=voice_call` (and
+  `voice_call_downlink`/`uplink`), but capturing those needs the `CAPTURE_AUDIO_OUTPUT` system
+  permission, which means a rooted or OEM-privileged device. On a stock phone it'll fail. So for
+  real phone calls over USB, scrcpy won't grab the call audio unless the phone is rooted.
+
+  **Installing it** (you'll need to do this — `claude` can't sudo): Debian/Ubuntu's apt `scrcpy` is
+  often older than 2.0 and has *no* audio support, so check `scrcpy --version` ≥ 2.0. If apt's is
+  too old, use `snap install scrcpy` or grab the official Linux release from the scrcpy GitHub
+  releases. Then enable **Developer Options → USB debugging** on the phone, plug in USB, confirm
+  `adb devices` sees it, and run the command above.
+
+  **Wiring it into the pipeline:** create a null sink (e.g. `phone_usb`), route scrcpy's stream to
+  it (`PULSE_SINK=phone_usb scrcpy …` or move the stream with `pw-link` / `wpctl`), then point your
+  existing RTP loopback at `phone_usb.monitor` instead of the bluez monitor. Same pattern you
+  already have, cleaner source.
+
+  **The other two options, for completeness:**
+  - **USB audio gadget mode** (phone presents itself as a USB sound card to the host) — almost no
+  stock Android phones support being a USB audio *source*. Not a real option.
+  - **Analog cable** — USB-C→3.5mm dongle out of the phone into samsung's line-in. Dead simple,
+  totally radio-free, and works for *anything* including live calls (it's just the phone's analog
+  output). Costs you one re-digitization, which is irrelevant for ASR. This is the robust fallback
+  if you need live call audio and the phone isn't rooted.
+
+  For your audiobook testing, scrcpy over USB is the clean win. For real phone-call transcription,
+  the analog cable is the only no-root path that captures call audio. Want me to sketch the
+  null-sink + RTP rewiring once you've got scrcpy installed?
+
+❯ i really want it for phone calls
+
+● Here's the honest fork, and one detail from your own logs that actually matters.
+
+  **The detail:** your crackle log showed `sbc_decode` — that's the **A2DP** codec. A2DP only ever
+  carries *media-routed* audio; the protected cellular voice-call stream is **not** carried over
+  A2DP (that'd be HFP/SCO, which uses CVSD/mSBC, not SBC). So whatever you're sending to samsung
+  today is already being routed as *media*, not as a protected call stream. That tells me one of two
+  things is true, and which one decides everything:
+
+  1. **The "calls" are VoIP** (WhatsApp, Signal, Telegram, FaceTime-over-Android, Zoom, etc.). Their
+  audio is app media, which is why it rides A2DP. → Good news: there's a decent chance `scrcpy
+  --no-video --audio-source=output` captures it over USB, because it's playback audio, not the
+  locked `VOICE_CALL` stream. It's worth just *trying* — some VoIP apps set
+  `allowAudioPlaybackCapture=false` and block it, many don't.
+
+  2. **They're real cellular/VoLTE calls** and you've got the phone set to route call audio to
+  Bluetooth as media somehow. → Then stock Android blocks app-level capture of that stream, and
+  scrcpy over USB **won't** get it without root.
+
+  So:
+
+  **If VoIP:** install scrcpy ≥2.0, enable USB debugging, and just run `scrcpy --no-video
+  --audio-source=output` with a call active. If you hear/capture it, you're done — clean digital
+  audio over the cable, no radio.
+
+  **If cellular, and rooting is on the table:** scrcpy 2.4+ has `--audio-source=voice_call` (also
+  `voice_call_downlink` / `voice_call_uplink`), which captures *both* sides of the call digitally
+  over USB. But it needs the `CAPTURE_AUDIO_OUTPUT` system permission → rooted or OEM-privileged
+  phone only. On a rooted phone this is the *best* possible answer: clean, digital, both directions,
+  over the cable.
+
+  **If cellular and no root:** the only no-root, radio-free path is **analog** — a USB-C→3.5mm DAC
+  (or the headphone jack if the phone has one) out of the phone into samsung's line-in. During a
+  call the phone routes the earpiece/downlink audio to the headset output, so you capture the far
+  party cleanly. Limitation: it's the earpiece mix (far end, possibly with your sidetone), not a
+  clean two-channel uplink/downlink split — but for ASR of the other party it's solid, and it
+  completely sidesteps Bluetooth.
+
+  Two quick questions so I point you at the right one:
+  - Are these **cellular/VoLTE** calls or **VoIP app** calls?
+  - Is **rooting the phone** acceptable, or does it need to stay stock?
+
+❯ it's VoIP - i guess - because the phone is set to do "Wi-Fi Calling"
+
+● Ah — that changes it, and unfortunately not in the direction you want. **Wi-Fi Calling is not a
+  VoIP app.** It's your *carrier's* native phone call carried over IMS/Wi-Fi instead of the cellular
+  tower (a.k.a. VoWiFi). From Android's point of view it goes through the telephony framework and
+  its audio is the protected **`VOICE_CALL` stream** — exactly the same lockdown as a normal
+  cellular call. The "VoIP" label only fits third-party apps (WhatsApp/Signal/Zoom), which Wi-Fi
+  Calling isn't.
+
+  So:
+
+  - **scrcpy `--audio-source=output` will not capture it.** The AudioPlaybackCapture API that backs
+  that mode explicitly excludes telephony / voice-communication audio. No-root, no-go.
+  - **There is no no-root way to capture native call audio digitally** on stock Android — not
+  scrcpy, not a `MediaRecorder VOICE_CALL` app (that's required `CAPTURE_AUDIO_OUTPUT` system
+  permission since Android 10, and many regions/OEMs disable call recording outright).
+
+  One correction on the earlier reasoning: the `sbc_decode` / A2DP you saw in the crackle log was
+  almost certainly your **audiobook test** (media → A2DP), *not* a real call. A genuine Wi-Fi call
+  routed to a Bluetooth device uses **HFP/SCO** (CVSD/mSBC), not A2DP/SBC. So the BT path you'd
+  actually use for live calls is the lower-quality SCO link — different from, and worse than, what
+  you've been testing on.
+
+  That leaves two real options for live Wi-Fi-call audio:
+
+  1. **Analog, no root (the practical one).** USB-C→3.5mm DAC (or the headphone jack) out of the
+  phone → samsung line-in. During a call the phone routes the earpiece/downlink to the wired headset
+  output, so you capture the **far party** cleanly, radio-free. Caveat: that's the earpiece feed —
+  you get the remote side well, but *not* a clean separate uplink of your own voice, so your
+  dual-stream `[Remote]`/`[Me]` split won't fully work from this single tap.
+
+  2. **Root + scrcpy (the ideal one).** On a rooted phone, `scrcpy --no-video
+  --audio-source=voice_call` (scrcpy ≥2.4) captures the call digitally over USB, and
+  `voice_call_downlink` / `voice_call_uplink` give you the two sides **separately** — which maps
+  perfectly onto your dual-stream design. Clean, digital, over the cable, both channels. The catch
+  is the root requirement.
+
+  So the question becomes: **is rooting this phone acceptable?** If yes, scrcpy's `voice_call`
+  source is the dream fit for your `[Remote]`/`[Me]` pipeline. If it has to stay stock, analog into
+  line-in is your only radio-free path, and it gets you the far party but not a clean both-sides
+  split.
+
+❯ i do not want to root the phone because then I can't get updatse
+
+● Then digital capture is out — that's the honest bottom line. scrcpy's `voice_call` source is the
+  only way to get the native call stream digitally, and it needs root. No root means no digital tap
+  of a Wi-Fi-Calling call, full stop.
+
+  So the no-root, radio-free path is **analog**, and it's actually workable:
+
+  **The tap:** a USB-C DAC dongle in the phone (or the headphone jack if it has one) → samsung's
+  line-in. Android treats a USB-C DAC as a wired headset, so during a Wi-Fi call it routes the
+  **downlink (far party)** to that dongle. You take the analog out into samsung's line-in. samsung's
+  ADC re-digitizes it — irrelevant for ASR quality.
+
+  **How it maps to your dual-stream `[Remote]`/`[Me]`:** this is the nice part. The analog tap gives
+  you the *far party* on one channel. Your *own* voice never appears in the downlink feed — but
+  you're sitting at samsung, so capture it from **samsung's own mic** as the second stream. So:
+  - `[Remote]` = samsung line-in (phone's downlink, the other person)
+  - `[Me]` = samsung mic (you talking)
+
+  That's a clean two-source split without root, and it feeds your existing dual-stream design
+  directly — two PipeWire sources, two RTP sends, exactly the structure you already have.
+
+  **One thing you'll need:** since the call audio now goes into line-in instead of your ear, add a
+  PipeWire loopback (line-in → your headphones) so you can actually hear and converse during the
+  call. Low-latency identity loopback, same caution as your earlier `module-loopback` notes
+  (rate/channels must match or it attenuates).
+
+  **Worth saying, though:** that `[Remote]`=downlink / `[Me]`=mic split is *exactly* what you'd also
+  get over Bluetooth HFP — samsung-as-handsfree receives the far party on SCO and supplies your mic
+  as uplink. Your crackle was an **RF problem** (USB-3 leakage + 2.4 GHz Wi-Fi contention), not a
+  problem with the path itself. So you've got two ways to kill the crackle:
+
+  1. **Go cabled** (USB-C DAC → line-in): surest defense against RF, costs you a dongle + an analog
+  re-digitization + a monitor loopback.
+  2. **Fix the RF** and keep wireless HFP: move samsung's BT radio away from USB-3 ports/cables,
+  push samsung's Wi-Fi to 5 GHz. No new hardware, no analog conversion — but RF fixes are sometimes
+  only *mostly* reliable.
+
+  If you want bulletproof, go cabled. If you'd rather not deal with dongles and loopback monitoring,
+  try the 5 GHz + USB-3-distance fix first and re-check `pw-top` ERR / the `sbc_decode` log — it may
+  just clear up. Which way do you want to go?
+
+❯ both samsung and the phone are on WiFi.  one's Ubuntu 24, the other's Android 15.  the wifi
+  hotspot is dual band.  can these two devices be set to force/prefer 5 Ghz?
+
+● Good instinct — and there's an extra reason it matters for samsung specifically: samsung's
+  Bluetooth is a **QCA9377**, which is a *combo* Wi-Fi+BT chip sharing one antenna. If its Wi-Fi is
+  on 2.4 GHz while BT is also on 2.4 GHz, the chip is doing in-radio coexistence (time-slicing one
+  antenna between the two) — that's one of the worst crackle causes there is. Moving samsung's Wi-Fi
+  to 5 GHz lets the chip run Wi-Fi on 5 and BT on 2.4 simultaneously. Could be your single biggest
+  win.
+
+  Let me look at what the hotspot actually exposes and what samsung is on right now.
+
+● Key results — and one is a pleasant surprise:
+
+  **samsung is already on 5 GHz.** Active link is channel 149 / 5745 MHz at −54 dBm (strong), on
+  `[REDACTED-SSID]`. Its QCA9377 is a PCIe Wi-Fi part (`ath10k_pci`) with the BT on USB (`0cf3:e500`),
+  and with Wi-Fi already on 5 GHz the chip is free to run BT on 2.4. **samsung is not your 2.4 GHz
+  problem.**
+
+  **Your hotspot uses one SSID with band steering, not split SSIDs.** Look at the scan:
+  `[REDACTED-SSID]` shows up as two BSSIDs that differ only in the last hex digit —
+  - `…DB:6F` chan 10 (2.4 GHz)
+  - `…DB:6E` chan 149 (5 GHz) ← the one samsung picked
+
+  Same name, both bands. There's no `[REDACTED-SSID]_5G` to select. That's "Smart Connect" / band
+  steering, and it's exactly why you can't just pick a band by SSID.
+
+  **The phone is almost certainly the real culprit — and Wi-Fi Calling makes it worse.** Think about
+  what that phone is doing during a call: pulling the call audio *in* over Wi-Fi (VoWiFi) **and**
+  pushing it *out* over Bluetooth to samsung. If the phone's Wi-Fi is on 2.4 GHz, its single 2.4 GHz
+  radio is simultaneously doing Wi-Fi Calling RX + BT audio TX on the same band — same-chip
+  coexistence collision on the *transmit* side. That produces exactly the corrupt-SBC-frame pattern
+  samsung logged. Getting the **phone** onto 5 GHz is the fix that matters most.
+
+  **The catch:** Android 15 stock has no reliable "force 5 GHz" toggle (that setting was removed
+  years ago), and with a single steered SSID you can't pick the band by joining a different network.
+  So the clean, reliable way is to **split the bands on the TP-Link**:
+
+  1. Log into the TP-Link admin (often `tplinkwifi.net` or `192.168.0.1`).
+  2. Find **Smart Connect** (Wireless settings) and **turn it off**. The radios then get separate
+  SSIDs — typically `[REDACTED-SSID]` (2.4) and `[REDACTED-SSID]_5G` (5).
+  3. Join the **phone** to the 5 GHz SSID. (samsung will reconnect to whichever; pin it to 5 — see
+  below.)
+
+  You own the hotspot, so this is the surest lever. Without splitting, your only AP-side alternative
+  is disabling the 2.4 GHz radio entirely, which kills 2.4 for everything else.
+
+  **Optional, to keep samsung pinned to 5 GHz** so steering can't drop it back to 2.4
+  (re-introducing the on-chip coex problem) — run in your `baccala` session (needs the polkit/sudo
+  prompt; `claude` can't):
+  ```
+  nmcli connection modify [REDACTED-SSID] 802-11-wireless.band a
+  nmcli connection up [REDACTED-SSID]
+  ```
+  `band a` = 5 GHz, `bg` = 2.4 GHz. Once the SSID is split you'd instead just pin samsung to the 5
+  GHz SSID's connection profile.
+
+  After the phone is on 5 GHz, re-check during a call: `journalctl --user -u wireplumber -f | grep
+  sbc_decode` — the failures should drop sharply if the phone's Wi-Fi/BT band collision was the
+  cause.
+
+❯ I don't want to hassle my housemates reconfiguring the WiFi.  I just tried turning off the phone's
+  WiFi during a phone call, and it worked fine.
+
+  what bt commands are there to show A2DP vs HFP/SCO, that kind of thing?
+
+● Nice — that confirms the diagnosis cleanly: the phone's 2.4 GHz Wi-Fi (Wi-Fi Calling RX) was
+  colliding with its BT audio TX on the same radio. Killing Wi-Fi during the call removes the
+  contention. No router reconfig needed.
+
+  For the profile/codec/transport question — let me show you what's connected right now and which
+  commands answer it.
+
+● Here's the live state plus the toolbox.
+
+  **What's connected right now:** your phone `[REDACTED-DEVICE]` (`[REDACTED-MAC]`), one
+  **ACL** link (handle 13), **no SCO**. The active media transport `fd27` is an A2DP **Audio Sink**
+  (`UUID 0000110b`), `State: idle`. So samsung is set up as an A2DP sink and nothing is streaming
+  this instant. No SCO = no HFP voice call active right now.
+
+  The phone advertises **both** audio roles (from the `info` UUID list):
+  - `Audio Source` (110a) + `Advanced Audio Distribution` (110d) → **A2DP** (media streaming, the
+  phone is the source)
+  - `Headset AG` (1112) + `Handsfree Audio Gateway` (111f) → **HSP/HFP** (the gateway role a phone
+  plays for calls)
+
+  So the same phone will use A2DP for media and *switch to* HFP/SCO for a call.
+
+  **The commands, by layer:**
+
+  *1. Supported profiles* — `bluetoothctl info <mac>`, read the UUID list (A2DP = "Advanced Audio
+  Distribution"/"Audio Source/Sink"; HFP/HSP = "Handsfree"/"Headset").
+
+  *2. What's live right now (the quick A2DP-vs-HFP tell)* — `hcitool con`:
+  - `ACL` = the data link; A2DP audio rides over it (and it's also just present whenever connected).
+  - `SCO` / `eSCO` = the synchronous voice channel — **only exists during an active HFP/HSP call.**
+  If you see SCO, you're on HFP. If you only see ACL, any audio is A2DP.
+
+  *3. The active A2DP transport — codec + streaming state* — via BlueZ D-Bus:
+  ```
+  busctl --system introspect org.bluez /org/bluez/hci0/dev_08_3F_21_73_AC_8A/fd27
+  org.bluez.MediaTransport1
+  ```
+  - `State`: `idle` / `pending` / `active` (`active` = streaming now)
+  - `Codec`: `0`=SBC, `2`=AAC, `255`=vendor-specific (aptX/LDAC/etc.)
+  - `UUID`: `…110a`=source, `…110b`=sink
+  - `Volume`: AVRCP absolute volume
+
+  *4. Ground truth at the HCI level (needs sudo)* — `sudo btmon`:
+  - It logs `Synchronous Connection Complete` + SCO packets when a call's HFP link comes up →
+  definitive A2DP-vs-SCO.
+  - It also logs the AVDTP `Set Configuration` with the negotiated A2DP codec when media starts.
+
+  *5. The PipeWire view (run in your `baccala` session — `claude` can't reach it)* — this is where
+  the *active profile* is clearest:
+  ```
+  wpctl status
+  pw-dump | grep -iE 'api.bluez5.profile|api.bluez5.codec|node.name'
+  ```
+  The node name and properties spell it out: `…a2dp-sink` with `api.bluez5.codec = sbc` vs
+  `…headset-head-unit` (HFP). `wpctl status` shows the device's selected profile directly.
+
+  **To catch the A2DP→HFP switch on a real call** (and finally settle whether your Wi-Fi calls go
+  over A2DP or HFP on this phone):
+  ```
+  watch -n1 hcitool con          # or:  sudo btmon
+  ```
+  Place a Wi-Fi call and watch. If a **SCO** line appears, the call uses **HFP** (narrowband-ish
+  voice link). If it stays **ACL-only** and `fd27`'s `State` flips to `active`, the phone is routing
+  the call over **A2DP** instead. That distinction matters: the `sbc_decode` crackle you logged
+  earlier was SBC = A2DP, which suggests either that capture was the audiobook (media) or this phone
+  really does route call audio over A2DP — the `watch` test will tell you which.
+
+❯ pw-dump: looks like JSON.  can you give me a jq command to query the relevent properties?
+
+● `pw-dump` is a JSON array of objects; the BlueZ audio info lives in `.info.props` of the
+  `bluez_output`/`bluez_input` nodes under `api.bluez5.*` keys. Focused query:
+
+  ```bash
+  pw-dump | jq -r '
+    .[]
+    | (.info.props // {}) as $p
+    | select($p["api.bluez5.profile"] or $p["api.bluez5.codec"] or $p["api.bluez5.transport"])
+    | "\($p["node.name"] // $p["device.name"])  profile=\($p["api.bluez5.profile"])
+  codec=\($p["api.bluez5.codec"])  transport=\($p["api.bluez5.transport"])
+  class=\($p["media.class"])"
+  '
+  ```
+
+  That prints one line per BlueZ node, e.g.:
+  ```
+  bluez_output.08_3F_21_73_AC_8A.1  profile=a2dp-sink  codec=sbc  transport=...  class=Audio/Sink
+  ```
+  `profile=a2dp-sink` (or `a2dp-source`) = A2DP; `profile=headset-head-unit`/`headset-audio-gateway`
+  = HFP/HSP. `codec=sbc`/`aac`/`aptx`/`sbc_xq` is the negotiated A2DP codec (HFP shows
+  `cvsd`/`msbc`).
+
+  Dump-everything fallback (every `api.bluez5.*` prop, grouped by object) if the focused one misses
+  something:
+
+  ```bash
+  pw-dump | jq -r '
+    .[]
+    | select((.info.props // {} | keys | any(startswith("api.bluez5"))))
+    | "=== \(.type) id=\(.id) ===",
+      (.info.props | to_entries[]
+        | select(.key | test("bluez5|node\\.name|media\\.class|device\\.api"))
+        | "  \(.key) = \(.value)")
+  '
+  ```
+
+  To watch the A2DP→HFP switch live during a call, drop the focused query into a file and `watch` it
+  (avoids nested-quote pain):
+
+  ```bash
+  cat > /tmp/btprof.sh <<'EOF'
+  pw-dump | jq -r '.[] | (.info.props // {}) as $p
+    | select($p["api.bluez5.profile"] or $p["api.bluez5.codec"])
+    | "\($p["node.name"])  profile=\($p["api.bluez5.profile"])  codec=\($p["api.bluez5.codec"])"'
+  EOF
+  watch -n1 bash /tmp/btprof.sh
+  ```
+
+  You'll see the line flip from `a2dp-sink / sbc` to `headset-head-unit / msbc` (or `cvsd`) the
+  moment a call grabs the HFP link — the PipeWire-side confirmation of the same thing `hcitool con`
+  shows as SCO appearing.
+
+❯ when I make a call I see this:
+
+❯ when I make a call I see this:
+  ```
+  baccala@samsung:~/Diary$ hcitool con
+  Connections:
+      > ACL [REDACTED-MAC] handle 13 state 1 lm CENTRAL AUTH ENCRYPT
+      > eSCO [REDACTED-MAC] handle 17 state 1 lm PERIPHERAL
+
+  ```
+
+● That settles it: **real calls use HFP, over an `eSCO` link** (handle 17, samsung as `PERIPHERAL` =
+  the hands-free/headset role). So the earlier `sbc_decode`/A2DP crackle was definitely the
+  **audiobook** (media), and live Wi-Fi calls take a different path entirely — the voice profile,
+  not A2DP.
+
+  Two good things about what you're seeing:
+  - **eSCO** (not legacy SCO) means the link supports **retransmissions** and **wideband speech
+  (mSBC)** — more robust and potentially higher quality than plain SCO.
+  - `lm PERIPHERAL` confirms samsung is the handsfree unit: the eSCO is bidirectional, so samsung
+  receives the far-party downlink *and* sends your mic back as uplink.
+
+  **The thing now worth checking — which HFP codec.** That sets your ASR quality ceiling, and it's
+  the "telephone-band Spanish" issue you'd parked:
+
+  - **mSBC** = wideband, 16 kHz — decent for ASR.
+  - **CVSD** = narrowband, 8 kHz — true telephone band, noticeably harder for Voxtral.
+
+  Run your jq query *during* a call:
+  ```bash
+  pw-dump | jq -r '.[] | (.info.props // {}) as $p
+    | select($p["api.bluez5.profile"] or $p["api.bluez5.codec"])
+    | "\($p["node.name"])  profile=\($p["api.bluez5.profile"])  codec=\($p["api.bluez5.codec"])"'
+  ```
+  You'll now see `profile=headset-head-unit  codec=msbc` (or `cvsd`). If it says `cvsd`, that's your
+  real-call audio quality — and it's the kind of input you'll want to validate Voxtral against
+  before trusting call transcripts.
+
+  `btmon` shows the same negotiation at the air level: the **Enhanced Setup Synchronous Connection**
+  command carries the air-coding (`Transparent` = mSBC, `CVSD` = narrowband) when the call's eSCO
+  comes up.
+
+  One practical note: eSCO rides 2.4 GHz too, so the phone-Wi-Fi-off trick you found applies the
+  same way during calls — eSCO's retransmissions mask *some* loss, but heavy Wi-Fi/BT contention on
+  the phone still degrades it.
+
+❯ bluez_input.08_3F_21_73_AC_8A.0  profile=headset-audio-gateway  codec=msbc
+  bluez_output.08_3F_21_73_AC_8A.1  profile=headset-audio-gateway  codec=msbc
+
+● `codec=msbc` — that's the headline, and it's the good outcome: **wideband HFP at 16 kHz**, not
+  narrowband CVSD. That's the best quality the HFP voice profile offers, and it's a much more
+  reasonable input for Voxtral than 8 kHz telephone-band would be. So your real-call audio quality
+  ceiling is wideband, both directions (input and output both show msbc).
+
+  One thing in that output is worth a second look, though: `profile=headset-audio-gateway`. That's
+  the **AG** role on samsung's side. For the usual "laptop receives a phone's call audio" setup I'd
+  have expected `headset-head-unit` (samsung as the HF/headset, phone as the AG). AG on samsung is
+  the reverse labeling — samsung presenting as the gateway. It still works (the eSCO is up, msbc
+  negotiated, audio is flowing), but it's unusual enough that I'd verify *which* node actually
+  carries the far party before trusting it.
+
+  Quick empirical check during a call — record a few seconds from the input node and listen:
+  ```bash
+  pw-record --target bluez_input.08_3F_21_73_AC_8A.0 /tmp/call.wav
+  # talk / let the far party talk, Ctrl-C, then:
+  pw-play /tmp/call.wav
+  ```
+  - If `/tmp/call.wav` has the **far party's** voice → that's your `[Remote]` source, capture it for
+  RTP exactly as planned.
+  - If it has **your own mic** instead, the roles are flipped from what you want and we'd need to
+  look at the WirePlumber bluez role config (`bluez5.roles` / which of head-unit vs audio-gateway is
+  preferred).
+
+  For reference on the naming: `headset-head-unit` = Linux acts as the headset (receives phone audio
+  — the normal capture setup); `headset-audio-gateway` = Linux acts as the phone/gateway (a headset
+  connects *to* it). The `bluez_input` source is your capturable far-party stream in either case,
+  but the AG label is enough of a surprise that the 10-second record-and-listen is worth doing
+  before you wire it into the pipeline.
+
+  So: wideband msbc is great news for call ASR; just confirm the input node is the remote party and
+  you've got a clean, radio-tolerant (phone-Wi-Fi-off) path to feed your dual-stream setup.
+
+❯ i've use the asr script on a phone call and the roles are correct
+
+● Excellent — that closes the loop. So the full picture now:
+
+  - **Real Wi-Fi calls** → HFP/eSCO, **msbc wideband (16 kHz)**, roles correct (`bluez_input` = far
+  party). The `headset-audio-gateway` label was a red herring — capture works as intended.
+  - **Crackle root cause** = the *phone's* single 2.4 GHz radio doing Wi-Fi Calling RX + BT audio TX
+  at once; turning the phone's Wi-Fi off during the call removes it. samsung was never the problem
+  (already on 5 GHz).
+  - The asr script runs on a live call end-to-end.
+
+  That also quietly knocks down part of the "telephone-band validation" item you'd had parked —
+  you've now run real wideband call audio through the pipeline, not just clean audiobook Spanish.
+  (Code-switched and genuinely degraded-link audio are still untested, but the basic real-call path
+  works.)
+
+  Let me save the BT call-capture findings to memory so a future session doesn't re-derive them.
+
+● Saved. Where things stand after this session:
+
+  - **asr-tui color fix** — ES/EN bodies and `⋯`/`—` placeholders now render in default white,
+  consistent across history and live blocks (commits `6316501`, `8b4c1ef`, pushed).
+  - **`--trace-emit`** diagnostic added for the pause/resume question (commit `9b4bf82`, pushed) —
+  still available next time a block "appears queued."
+  - **BT call-capture diagnosed and confirmed working** — real Wi-Fi calls run through the pipeline
+  at wideband msbc; crackle is the phone's Wi-Fi/BT coexistence, fixed by toggling the phone's Wi-Fi
+  off during calls. Findings saved to memory.
+
+  All three asr commits are pushed to `github.com/BrentBaccala/asr`; `git -C ~/asr pull` on pony to
+  pick them up.
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● First run. Kicking off session-ID detection in the background.
+
+● Now let me read the report-structure docs and write the report.
+
+● The session ID poller already completed. Let me grab it.
+
+● Session ID is `a81faaf1-083c-43ce-9763-682bca18e0d5` (top-level). Writing the report.
+
+● Now the compaction. Let me read the compaction docs.
+
+● Now the KG entry. Let me read the KG docs.
+
+● Let me check existing entity names for reuse before writing the KG.
+
+● Now writing the KG entry, reusing existing entity names where they match.
+
+● Let me validate the JSON, backfill the report's session line, and commit.
+
+● Three artifacts written and the `~/project` changes committed (`4830049`):
+
+  - **Report:** `~/project/reports/asr-tui-rendering-bt-call-capture.md`
+  - **Compaction:** `~/project/compactions/session-a81faaf1-083c-43ce-9763-682bca18e0d5.md`
+  - **KG:** `~/lightrag-history/incoming/session-a81faaf1-083c-43ce-9763-682bca18e0d5.json`
+  (uningested — drain runs separately)
+

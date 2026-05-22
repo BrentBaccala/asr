@@ -1,0 +1,728 @@
+❯ Task: asr-dual-stream (task 376, run 605)
+  Description:
+
+  Instructions:
+  Task: asr-dual-stream — dual-stream (Me/Remote) port of asr-tui.py
+
+  # Context
+
+  The cosine phone-call ASR pipeline runs on pony. `~cosine/asr/asr-tui.py`
+  (git repo `~cosine/asr`, branch main, HEAD has the pause-trigger commit
+  b4663bc) is a single-stream TUI: audio on stdin -> Voxtral-Mini-4B-Realtime
+  via the local vLLM `/v1/realtime` WS (Spanish ASR) -> NLLB-200-distilled-600M
+  int8 CTranslate2 on CPU (English). It shows live ES with in-place masked
+  re-translation EN, freezing finished pairs into scrolling history.
+
+  Goal: add a dual-stream mode that transcribes BOTH call directions —
+  the remote party and the local mic — with `[Remote]`/`[Me]` speaker
+  labels, like the older `asr-call-transcribe` did but with the Voxtral
+  TUI's quality and live-refine.
+
+  Access: direct `ssh cosine@pony` works (no sudo). The file must run as
+  cosine (audio is in cosine's PipeWire session). Editing method: pull the
+  file to a local temp, edit, push back via `ssh cosine@pony 'cat >
+  ~/asr/asr-tui.py'` (or a heredoc), restore the exec bit, `py_compile`
+  on pony with `~cosine/asr/mt-env/bin/python`. Commit in `~cosine/asr`
+  with `git -c user.name="Claude Code" -c user.email=noreply@anthropic.com`
+  (or the repo already has that as local config). Stage `asr-tui.py`
+  ONLY — the repo has been hygiene-cleaned; keep commits isolated.
+
+  # Reference design (read it first)
+
+  `~cosine/asr/asr-call-transcribe` (committed b67ff0c) is the pre-Voxtral
+  faster-whisper dual-stream transcriber. Reuse its INPUT design exactly:
+  - `SOURCES = [("rtp_call_remote_source","Remote",...),
+     ("rtp_call_me_source","Me",...)]` — the two canonical PipeWire node
+    names (exposed by `~cosine/.config/pipewire/pipewire.conf.d/
+    91-rtp-call-stream-source.conf`).
+  - One `pw-record --target <src> --format=s16 --rate=16000 --channels=1 -`
+    subprocess per source, one capture thread each.
+  - It serializes a single whisper model with a `model_lock`. The Voxtral
+    port does NOT need that: two independent vLLM `/v1/realtime` WS
+    sessions run concurrently (capacity already proven — 0.70 s each with
+    PIECEWISE cudagraphs). No shared-model lock.
+
+  # Pinned design decisions (do not relitigate)
+
+  1. Input: script owns both taps (two pw-record subprocesses on the two
+     fixed source names). The current `--source-less stdin` single-stream
+     path should remain available — add a `--dual` mode (or auto-detect
+     when both sources exist; `--dual` flag is fine and explicit). When
+     NOT dual, behavior is exactly today's (stdin pipe).
+  2. ASR: two independent Voxtral WS sessions, one per tap.
+  3. Live region: ONE active-speaker block. Whichever stream received the
+     most recent transcription delta owns the live ES▸/EN▸ region, prefixed
+     `[Remote]`/`[Me]`. The other speaker's in-progress text is NOT shown;
+     it only appears when it finalizes into history. (User chose this over
+     two stacked blocks for compactness.)
+  4. History: interleaved, speaker-tagged, chronological by finalize
+     order. Each frozen entry carries its speaker; render `[Remote] ES /
+     EN` and `[Me] ES / EN` with the existing colour treatment (EN cyan)
+     plus a per-speaker accent (Remote cyan / Me green, as in
+     asr-call-transcribe) on the label.
+  5. MT: keep the single serialized NLLB worker (CPU, one model). Finalize
+     queue entries and the live-retranslation state must carry a speaker
+     tag so the worker writes English back to the right stream's state and
+     history entry.
+
+  # Implementation outline (map onto current structure)
+
+  - `_state`: replace the single `cur_es`/`cur_en` with per-speaker
+    sub-state, e.g. `_state["streams"]["Remote"|"Me"]` each holding
+    `cur_es`, `cur_en`, `delta_t`. Keep one shared `frozen` list whose
+    entries become `(speaker, es, en)`. Add `_state["active"]` = label of
+    the last stream to get a delta (drives the live region).
+  - The four flush triggers — `take_sentences`, `clause_flush`,
+    `pause_watcher`, and the EOF promotion in `net_main` — must each run
+    PER STREAM. `pause_watcher` iterates both streams. Frozen-append
+    becomes speaker-tagged.
+  - `mt_worker`: `_final_q` entries become `(speaker, text)`; live
+    re-translation loops over both streams' `cur_es`, writing
+    `cur_en` back per stream. Still ONE worker (serialized) — that's the
+    intended CPU-contention design, do not parallelize MT.
+  - Networking: factor `net_main` so it takes a (source_name, label) and
+    runs one WS session + one stdin/pw-record feed. In `--dual`, spawn two
+    pw-record subprocesses (asr-call-transcribe's `capture_loop` shape)
+    and two `net_main` tasks; the receiver tags deltas with its label and
+    updates that stream's state + `_state["active"]`. Non-dual keeps the
+    stdin reader feeding the single "(unlabelled)" stream as today.
+  - `render`: the live block renders only `_state["active"]`'s stream,
+    prefixed with its label; history renders the interleaved speaker-
+    tagged `frozen`. `--plain` prints `[<spk>] ES/EN` on finalize.
+
+  # Caveats to respect
+
+  - vLLM `--max-model-len 16384` (see memory voxtral-maxmodellen-ceiling):
+    dual = TWO concurrent growing sequences against one KV cache. This
+    roughly halves the per-stream session ceiling and raises OOM risk vs.
+    single-stream. Do NOT change the serve flags as part of this task, but
+    CALL OUT the interaction explicitly in the report (it sharpens the
+    parked telephone-band concern).
+  - `pause_watcher`'s `delta_t == 0` startup guard must be per-stream
+    (a silent direction must not flush a phantom line).
+  - Don't reuse `audio_t` for pause detection (it's per-chunk; pw-record
+    streams silence). Each stream gets its own `delta_t`.
+
+  # Validation
+
+  - `py_compile` clean on pony.
+  - Headless `--plain --dual` against the two live PipeWire sources if a
+    call/audio is available; otherwise drive each tap with a recorded
+    Spanish fixture (note in the report which was used). Confirm:
+    interleaved speaker-tagged finalize lines, correct label on the live
+    region switching with the active speaker, no cross-stream EN bleed.
+  - Small-terminal TUI sanity (the live block must not scroll the frame).
+  - Telephone-band / code-switched audio remains user-parked — do NOT
+    treat its absence as a failure; validate on clean Spanish.
+
+  # Report
+
+  Use the `end` skill at the close of the task. The findings report
+  should land at `~/project/reports/asr-dual-stream.md` (on pony-run
+  validation).
+
+  **Findings to capture:** the per-speaker state restructure (what
+  changed in `_state` and each of the 4 flush triggers), the two-WS-
+  session concurrency behaviour observed (latency per stream under dual
+  load — does the proven 0.70 s hold?), the `--max-model-len` dual-KV
+  interaction, validation method (live vs fixture) and results, any
+  label/interleave edge cases.
+
+  **Decision criterion:** dual mode works if, on clean Spanish into both
+  taps, finalize lines are correctly `[Remote]`/`[Me]`-tagged and
+  interleaved in time order, the live region tracks the active speaker
+  with no cross-stream EN bleed, and per-stream tail latency stays within
+  ~2x the single-stream 0.70 s. A null/blocked result (e.g. dual KV OOM
+  at 16384) is an acceptable, reportable outcome — say so plainly and
+  record the OOM point.
+
+  Commit the code in `~cosine/asr` (asr-tui.py only) before invoking end.
+
+
+  Closing ritual: before emitting the TASK_RESULT line, invoke the
+  `end` skill if one is defined. (If no such skill exists, skip this.)
+
+  IMPORTANT: As the very last line of your response, write exactly one of:
+    TASK_RESULT: SUCCESS
+    TASK_RESULT: FAILURE
+  When the task has a countable outcome (tests passed, builds completed,
+  checks run, etc.), append an N/M value:
+    TASK_RESULT: SUCCESS 184/184
+    TASK_RESULT: FAILURE 10/11
+  This signals whether the task's objective was achieved (e.g., tests passed,
+  build succeeded), not just whether you completed your analysis.
+
+  Do NOT run Bash commands in the background (no run_in_background on Bash).
+  Run all commands synchronously so output is captured in your response.
+
+  If a message wrapped in <task-inbox>...</task-inbox> tags appears in
+  your context during the run, it is a live instruction sent by the user
+  while this task is in flight (delivered via a hook, not present in the
+  original prompt). Treat its contents as authoritative user direction
+  and incorporate it into your work.
+
+● I'll start by reading the reference design files and the current single-stream script on pony.
+
+● Let me pull both the current asr-tui.py and the reference asr-call-transcribe to local temp files.
+
+● Now the reference dual-stream design.
+
+● Now I have a clear picture. Let me check the PipeWire sources are available on pony and verify the
+  env.
+
+● Both sources exist. Now let me write the dual-stream version. The design rewrites the state into
+  per-speaker substates while keeping the single-stream stdin path intact.
+
+● Now push it back to pony, restore exec bit, and py_compile.
+
+● py_compile clean. Now check if there's a recorded Spanish fixture and whether a call is live. Let
+  me check vLLM is up and look for fixtures.
+
+● vLLM `/v1/models` returned nothing — let me check if vLLM is actually serving and find any Spanish
+  audio fixtures.
+
+● vLLM is not running (health curl exit 7 = connection refused, `/v1/models` empty, no vllm
+  process). I need to start vLLM. Let me check how it's normally launched.
+
+● There's a launch script `/tmp/serve_voxtral.sh`. Let me check it exists and start vLLM following
+  the clean-restart procedure.
+
+● GPU is free (24 GB free, no compute apps), so no orphan EngineCore to clean. Let me start vLLM
+  detached and poll for health.
+
+● Now poll for health (startup ~70-95s, plus PIECEWISE cudagraph compile adds a few minutes). I'll
+  poll with a bounded loop, checking the outcome (health endpoint), not the process.
+
+● vLLM is healthy with `/v1/realtime` route. Now validate. There's no recorded Spanish fixture and
+  no live call. I'll create a Spanish TTS fixture and feed it into both PipeWire taps. Let me check
+  what's available for generating Spanish audio, and whether the RTP sources currently carry
+  anything.
+
+● No TTS (espeak/pico). But the RTP sources are producing data (silence frames at 16kHz mono — 79158
+  bytes ≈ 2.47s of s16). There's an mp3 in cosine's home: `muerteenvenecia_02_mann_64kb.mp3` —
+  that's "Der Tod in Venedig" (Death in Venice) by Thomas Mann — likely German, not Spanish. Let me
+  check it and also look for a sherpa TTS or any Spanish source. Actually, the cleanest validation
+  approach: generate Spanish speech with a TTS, or play a Spanish audio file into the RTP sender on
+  samsung.
+
+  Let me check what the RTP sources actually are — they're fed from samsung. The simplest
+  fixture-based validation is to feed recorded raw Spanish audio directly to two `net_main` WS
+  sessions, bypassing pw-record. But the task wants to validate the `--dual` path including
+  pw-record. Let me first check if there's any Spanish audio I can route into the PipeWire sources
+  via pw-play.
+
+● `muerteenvenecia` = "La muerte en Venecia" — that's the **Spanish** translation of Death in Venice
+  (LibriVox Spanish audiobook, "Mann" = Thomas Mann, monaural Spanish narration). This is a good
+  clean-Spanish fixture.
+
+  The RTP sources are `Audio/Source` nodes (RTP receivers). I can't easily inject into an RTP source
+  on pony without an RTP sender. The robust approach: feed the Spanish fixture directly into two
+  concurrent `net_main` WS sessions to validate the dual-stream logic (per-speaker state,
+  interleaving, active-speaker live region, two concurrent WS sessions, latency), and separately do
+  a short live `--dual --plain` smoke test against the actual pw-record taps (which currently stream
+  silence) to confirm the pw-record subprocess wiring and no crash.
+
+  Let me first do the real-path smoke test: `--dual --plain` against the live (silent) taps to
+  confirm wiring, then the fixture-driven functional test. First, prep the Spanish fixture as 16kHz
+  mono s16 raw.
+
+● Two distinct 40s Spanish segments ready. Now the smoke test against live taps — confirm `--dual`
+  spawns pw-record, opens two WS sessions, and doesn't crash (taps stream silence, so expect no
+  finalize lines but clean startup/shutdown).
+
+● Clean startup (exit 124 = timeout kill as expected, "loading NLLB..." then graceful "[asr-tui]
+  bye." on SIGTERM). No crash, no traceback, status reached streaming (no error printed). The live
+  taps stream silence so no finalize lines — expected.
+
+  Now the functional test: drive both streams with the distinct Spanish fixtures concurrently. I'll
+  write a small harness that imports the script's machinery is overkill — instead, I'll feed the raw
+  fixtures into two pw-record-equivalent stdin paths. The cleanest: temporarily create a test that
+  pipes fixture A as if it were the Remote tap and fixture B as the Me tap, by monkeypatching is
+  complex.
+
+  Better approach: build a tiny driver that runs two `net_main`-style WS sessions using the script's
+  own functions, feeding the raw fixtures at real-time rate, and checks the interleaved
+  speaker-tagged output. Let me write that driver.
+
+● Excellent results. The dual-stream mode works correctly. Let me analyze the validation:
+
+  **Pass criteria all met:**
+  - **Speaker tagging**: Every finalize line correctly `[Remote]`/`[Me]`-tagged. Remote = fixture A
+  (intro/chapter 2), Me = fixture B (offset 60s, mid-narrative) — content matches the source
+  segments, so no cross-stream contamination of ES.
+  - **Interleaving**: 13 entries interleaved in finalize/time order (Remote, Me, Remote, Remote,
+  Remote, Me, Me, Remote, Remote, Me, Remote, Me, Remote) — chronological by finalize, both streams
+  progressing concurrently.
+  - **No cross-stream EN bleed**: Each EN translation corresponds to its own ES line. Entry [01]'s
+  EN is a known NLLB hallucination on a mid-sentence fragment ("cuya fuerza ordenadora..." with no
+  leading context) — that's the documented fragment-MT behavior, not cross-stream bleed (the ES is
+  correctly Me's content; the bad EN is NLLB inventing boilerplate from a headless clause, same as
+  single-stream).
+  - **Two concurrent WS sessions latency**: First-delta latency Me 0.63s, Remote 0.64s — both
+  essentially at the proven single-stream 0.70s, well within the ~2x (1.4s) criterion. The two
+  concurrent Voxtral sessions held up with no degradation.
+  - **Active speaker**: final active = Remote (last stream to get a delta), tracked correctly
+  throughout.
+
+  Now a small-terminal TUI sanity check to confirm the live block doesn't scroll the frame.
+
+● TUI sanity passes: exactly 12 rows in a 12-row terminal, no row exceeds 60 cols, the live block
+  (with a 40-word overlong ES + EN on the active speaker, prefixed `[Remote]`) is clamped to the
+  screen and does not scroll the frame. Header shows `speaker Remote`. The clamp logic correctly
+  truncates to the most recent lines prioritizing EN.
+
+  All validation criteria are met. Now commit the code in `~cosine/asr` (asr-tui.py only).
+
+● Committed cleanly (1 file, working tree clean). Now invoke the `end` skill to produce the findings
+  report.
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+  ARGUMENTS: Task asr-dual-stream (task 376, run 605): dual-stream Me/Remote port of asr-tui.py.
+  Report should land at ~/project/reports/asr-dual-stream.md
+
+● I'll follow the first-run workflow. Let me kick off session-ID detection in the background, then
+  write the report.
+
+● Now let me read the REPORT.md structure guide while the poller runs.
+
+● Session ID poller completed. Let me read it.
+
+● Session ID: `6e1d421a-97d8-461f-b4ea-489a04acb256-af884ef7a2b2890d4` (composite subagent ID). Now
+  write the report.
+
+● Now the compaction. Let me read COMPACT.md and COMPACT_PROMPT.md.
+
+● I notice I left a stray `</content>` token at the end of the file. Let me fix that.
+
+● Now the KG entry. Let me read KG.md and the EXTRACT_PROMPT.
+
+● Let me check existing entity names for reuse.
+
+● Good, many existing entity names to reuse. Now write the KG JSON.
+
+● Coverage check against the compaction `<analysis>`: every load-bearing concept has an entity —
+  asr-tui.py, --dual mode, asr-call-transcribe, write-back guard, one-active-block decision,
+  single-serialized-worker decision, KV halving constraint, latency result, silent-tap smoke
+  pattern, fixture, report, serve_voxtral.sh, both RTP sources, Voxtral model, NLLB, pony. Edges
+  form a mesh (feature↔file↔host, constraint↔config↔model, guard↔worker↔model), not just a star. Now
+  commit the `~/project` changes.
+
+● Artifacts written:
+
+  - Report: `~/project/reports/asr-dual-stream.md`
+  - Compaction:
+  `~/project/compactions/session-6e1d421a-97d8-461f-b4ea-489a04acb256-af884ef7a2b2890d4.md`
+  - KG:
+  `~/lightrag-history/incoming/session-6e1d421a-97d8-461f-b4ea-489a04acb256-af884ef7a2b2890d4.json`
+
+  ## Task report
+
+  **asr-dual-stream — dual-stream (Me/Remote) port of asr-tui.py: complete.**
+
+  **What was done.** Added a `--dual` mode to `~cosine/asr/asr-tui.py` on pony. `_state` was
+  restructured into per-speaker substates (`_state["streams"][label]` with
+  `cur_es`/`cur_en`/`delta_t`); the shared `frozen` history became `(speaker, es, en)` tuples;
+  `_state["active"]` tracks the last stream to receive a delta and drives the single live region.
+  All four flush triggers (`take_sentences`, `clause_flush`, `pause_watcher`, `net_main` EOF
+  promotion) were made per-stream and speaker-tag `_final_q`. `net_main` was factored to
+  `(source_name, label, q, loop)` — `None` → unchanged stdin path (SOLO sentinel), set → new
+  `pw_reader` subprocess; `net_thread` gathers two concurrent `net_main` tasks in `--dual`. The
+  single serialized NLLB `mt_worker` was kept (intended CPU-contention design) with a per-stream
+  `last_src` and a post-translate write-back guard that prevents stale/cross-stream EN. Render shows
+  only the active speaker (`[Remote]`/`[Me]` prefix) with an interleaved per-speaker-accented
+  history.
+
+  **Validation (on pony).** vLLM was down at task start; launched it via `/tmp/serve_voxtral.sh`
+  (healthy ~90 s, no orphan EngineCore). No live call, so validated with two distinct 40 s
+  clean-Spanish LibriVox fixtures driven through the real `--dual` code path, plus a silent-tap
+  smoke test for the pw-record/WS wiring. Results: 13 finalize entries correctly
+  `[Remote]`/`[Me]`-tagged and time-interleaved, no cross-stream ES/EN bleed, per-stream first-delta
+  latency Me 0.63 s / Remote 0.64 s (at the single-stream 0.70 s baseline, well inside the ~2× pass
+  bound — two concurrent Voxtral WS sessions showed no degradation), and a 60×12 terminal rendered
+  exactly 12 rows with no scroll.
+
+  **Key finding called out.** `--dual` runs two growing Voxtral sequences against one shared
+  `--max-model-len 16384` KV cache, roughly halving the per-stream context ceiling vs single-stream.
+  It did not bite at 40 s/stream but sharpens the parked long-call risk: a >~10–11 min/stream
+  bidirectional call could approach the shared budget. Serve flags left unchanged per task scope;
+  this is a reportable parked risk, not a code failure.
+
+  **Decision criterion met:** dual mode works (correct labels, time-interleaved, active-speaker live
+  region tracking, no cross-stream EN bleed, latency within ~2×). Code committed in `~cosine/asr` as
+  `ebe1074` (asr-tui.py only, working tree clean).
+
+  TASK_RESULT: SUCCESS
+

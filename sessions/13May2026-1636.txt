@@ -1,0 +1,1268 @@
+❯ <command-message>lightrag</command-message>
+  <command-name>/lightrag</command-name>
+  <command-args>pony</command-args>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/lightrag
+
+  # lightrag — search prior work for a topic (multi-backend)
+
+  When invoked, the parent session:
+
+  1. Tells the user in one sentence: *"Searching lightrag-history for prior work on `<TOPIC>` — back
+  in ~2 min."*
+  2. Picks the topic phrase from the user's opening message. Strip filler ("we're working on",
+  "let's look at", "I want to debug"); keep the noun phrase. Examples:
+     - `"we're working on lightrag"` → `lightrag`
+     - `"let's look at the parallel-bba flake on c200-1"` → `parallel-bba flake on c200-1`
+  3. Picks a backend mode from the args (default: `both`):
+     - no flag, or `--both` → run sonnet AND qwen3.6 in parallel (the historic 2-model default)
+     - `--sonnet` → sonnet only (agent loop with tools)
+     - `--sonnet-shot` → single-shot Sonnet, **no tool use** (architecturally identical to ollama
+  paths; only the model differs). Use this when comparing models head-to-head — it isolates the
+  model effect from the agent-loop effect.
+     - Single ollama model: `--qwen` (qwen3.6:27b), `--gemma3` (gemma3:27b), `--mistral-small`
+  (mistral-small:24b), `--gpt-oss` (gpt-oss:20b), `--command-r` (command-r:35b)
+     - `--all` → run sonnet AND all 5 ollama models in parallel (6 reports total). Pony's 24 GB 3090
+  only fits one ~15–18 GB model + bge-m3 at a time, so ollama serializes the synthesis calls and
+  swaps models in/out of VRAM — expect ~5–8 min wall. Tell the user the longer ETA up front instead
+  of the usual ~2 min.
+  4. **In the same response**, launches the chosen backend(s) in the background:
+     - **Sonnet path** (`--sonnet`): a background `Agent` (`subagent_type: general-purpose`, `model:
+  sonnet`) with the agent prompt below.
+     - **Sonnet-shot path** (`--sonnet-shot`): two-step (the second step is the background launch):
+       1. **Foreground**: capture the dated synthesis prompt by running
+  `~/lightrag-history/scripts/qwen-search.py --prompt-only "<TOPIC>"` via Bash. Stdout is the
+  fully-rendered prompt (instructions + dated hits JSON), ready to feed to a synthesis-only agent.
+  **No LLM call happens at this step.**
+       2. **Background**: launch an `Agent` with `subagent_type: synth-only` (defined at
+  `~/.claude/agents/synth-only.md`, `tools: []`), `model: sonnet`, passing the captured prompt
+  verbatim as the agent's `prompt` argument. The agent has no tools, so the only thing it can do is
+  generate the markdown report from the supplied JSON.
+     - **Ollama path** (any of `--qwen`, `--gemma3`, `--mistral-small`, `--gpt-oss`, `--command-r`):
+  a background `Bash` call to `~/lightrag-history/scripts/qwen-search.py [--model NAME] "<TOPIC>"`.
+  Map flag → model name:
+       | flag | model |
+       |---|---|
+       | `--qwen` | `qwen3.6:27b` (script default — no `--model` arg needed) |
+       | `--gemma3` | `gemma3:27b` |
+       | `--mistral-small` | `mistral-small:24b` |
+       | `--gpt-oss` | `gpt-oss:20b` |
+       | `--command-r` | `command-r:35b` |
+     - **`--all`**: launch sonnet (Agent) **plus all five ollama models** (five `Bash` calls to
+  `qwen-search.py --model NAME`) in the same response. Six parallel background tasks total. Pony
+  will swap models in/out of VRAM serially, so wall is dominated by the slowest cold-load chain.
+  5. Waits for whichever it launched. When results return, classify before presenting:
+     - **`both` mode, both succeeded with substantive content**: present sonnet's report under `##
+  Sonnet`, qwen's under `## Qwen3.6`, then add a `## Comparison` section. Be HONEST — not
+  diplomatic. Address each of:
+       - **Coverage**: did they pick the same hits? Did one find dated material the other missed?
+       - **Accuracy**: did either invent dates, source_ids, or file paths not in the underlying
+  corpus? (Cross-check by spot-reading one or two cited files.)
+       - **Template fidelity**: did either drift from the markdown structure (extra preamble,
+  missing sections, wrong heading levels)?
+       - **Useful judgment**: which would the user actually find more useful for *this* topic? Why?
+  Don't both-sides it if one is clearly better.
+     - **`both` mode, qwen failed** (script exited non-zero — pony down, ollama down, network
+  flake): present sonnet's report under `## Result` plus a one-line note: `(qwen path unavailable —
+  pony or ollama down; sonnet only.)`. Do NOT retry qwen; do NOT block.
+     - **`both` mode, sonnet failed**: present qwen's report plus the same one-line fallback note
+  (vice versa). Sonnet via API rarely fails for transient reasons; if it does, mention what the
+  error was.
+     - **`both` mode, asymmetric content** (both exited 0, but one returned substantive content
+  while the other returned "No prior work found" or a near-empty report): treat the empty side as a
+  likely backend bug, not a real "no prior work" signal. Present the substantive report under `##
+  Result` plus a one-line note: `(qwen path returned "no prior work" while sonnet returned N hits —
+  likely wrapper bug; investigating recommended)` (or the symmetric note if sonnet was the empty
+  one). Do NOT silently average the two reports — an empty report next to a 8-bullet report on the
+  same topic is almost always wrapper failure, not a real signal. The threshold for "asymmetric":
+  one side has zero `Recent work` bullets and the other has three or more.
+     - **`--all` mode**: present each successful report under its own model heading: `## Sonnet`,
+  `## Qwen3.6:27b`, `## Gemma3:27b`, `## Mistral-Small:24b`, `## GPT-OSS:20b`, `## Command-R:35b`
+  (omit headings for any model whose script exited non-zero). Above the model headings, list any
+  failures as a one-line note each: `(failed: <model> — <one-line reason from stderr>)`. Then add
+  `## Comparison` — sonnet is the reference; for each ollama model give one short paragraph
+  contrasting it to sonnet on the same four dimensions (coverage / accuracy / template fidelity /
+  useful judgment). Don't both-sides — if a model is clearly worse, say so. Treat any near-empty
+  (zero Recent-work bullets) ollama report as a likely wrapper bug rather than a real "no prior
+  work" signal, and call it out in that model's comparison paragraph.
+     - **Single-backend mode** (`--sonnet`, `--sonnet-shot`, or any single `--<ollama>` flag):
+  present the one report under `## Result`.
+  6. Read any files suggested in the `Where to read more` section of whichever report you trust
+  most.
+  7. Proceed with whatever the user actually asked for next.
+
+  Multi-topic queries (X and Y): launch the chosen backend(s) per topic. With default `both` and two
+  topics, that's four background tasks total.
+
+  ## Sonnet agent prompt
+
+  ```
+  You are searching the ~/lightrag-history LightRAG 1.4.15 index for prior work on a specific topic.
+  The index has ~6260 chunks (commit messages, session summaries, progress reports, task docs, task
+  prompts) plus a small KG (~48 entities, ~58 edges). Return a recency-ranked markdown report —
+  nothing else.
+
+  ## Topic
+
+  <TOPIC>
+
+  ## Step 1 — Search
+
+  Run from the venv (the script's shebang already points at it):
+
+      ~/lightrag-history/scripts/query.py "<TOPIC>" --mode mix
+
+  No --summary-only — we want full chunk content for date extraction. Expect ~120 s wall (cold
+  start, 2 embedding workers + naive/local/global passes). Output has three sections: entities,
+  relationships, chunks. Each chunk has a `source_id` and content.
+
+  If the run errors or times out, abort and return only:
+
+      No usable results — the search errored: <one-line cause>.
+
+  ## Step 2 — Extract dates
+
+  For each hit, get a defensible date:
+
+  - **Commit chunks** (`source_id` = `<repo>:<short-sha>`): parse `Date: YYYY-MM-DD` from the
+  content body.
+  - **Legacy session entities** (`session-YYYYMMDD-HHMM`): parse from the name.
+  - **UUID session entities** (`session-<UUID>`): read
+  `~/lightrag-history/processed/session-<UUID>.json` and use `source.created_at`. Fall back to file
+  mtime if the field is missing.
+  - **Progress-report chunks and legacy compaction chunks** (`source_id` =
+  `progress-report:DDMonYYYY-HHMM` or `compaction:DDMonYYYY-HHMM`): parse the date from the
+  source_id.
+  - **Session-named compaction chunks** (`source_id` = `compaction:session-<UUID>`): the date isn't
+  in the source_id. Use the file mtime (`stat -c %y ~/project/compactions/session-<UUID>.md`) — it
+  corresponds to when `/end` last wrote the file for this session, which is what you want.
+  - **Task-doc / task-prompt chunks** (`source_id` = `task-doc:<slug>` or `task-prompt:<slug>`):
+  usually undated in content. Run `git -C ~/project log -1 --format=%ai -- docs/<slug>.md` (or
+  `prompts/<slug>`) and use the commit date. If still no date, omit the hit.
+
+  If a hit lacks a date you can defend, omit it rather than guess.
+
+  ## Step 3 — Synthesize
+
+  Output exactly this structure (omit any section with no content). Target ~250 words; hard cap 400.
+
+  ```
+  ## What we know about <TOPIC>
+
+  One sentence summarizing the topic as it appears in the index. If the search returned nothing
+  on-topic (all chunks are clearly fuzzy matches on a single shared word), say "No prior work found
+  in the lightrag-history index on <TOPIC>." and stop.
+
+  ## Recent work (most recent first)
+
+  Up to 8 bullets:
+  - **YYYY-MM-DD** — one-sentence summary. _[source_id]_
+
+  Prefer compactions, session entities, and progress reports over individual commits — they're
+  denser. Compactions in particular are the richest source: they bundle a progress report, a
+  chronological analysis, and a full conversation summary for one session, so a single hit often
+  answers the topic on its own. Merge multiple hits describing the same work into one bullet (pick
+  the highest-relevance source_id). Include commits when they're the only evidence.
+
+  ## Open threads
+
+  Bullets for anything explicitly pending, blocked, deferred, or marked TODO in the hits. Skip the
+  section entirely if none.
+
+  ## Where to read more
+
+  2-3 file paths (under `~/lightrag-history/processed/`, `~/project/compactions/`,
+  `~/project/reports/`, `~/project/docs/`, or `~/project/progress-reports/`) ranked by relevance.
+  Do not include directory names like `~/project/progress-reports/`; name only specific files.  If
+  there's a recent compaction, be sure to include it.
+  ```
+
+  ## Output rules
+
+  - Return only the markdown report. No preamble, no sign-off, no narration of process.
+  - Do not invent dates, source_ids, or file paths. If you can't verify it, omit it.
+  - If `query.py` returns plenty of hits but none are on-topic, that's a "No prior work found" — say
+  so and stop. Better empty than padded.
+  ```
+
+  ## Sonnet-shot path notes
+
+  The `--sonnet-shot` path is architecturally identical to the ollama paths
+  (deterministic Python date extraction + single synthesis call) — the only
+  difference is which model produces the synthesis. This is the right path
+  when answering "is sonnet's win in `--sonnet` mode coming from the model
+  or from the agent loop's tool-based verification?"
+
+  How it runs:
+  - The skill captures the fully-rendered synthesis prompt by calling
+    `qwen-search.py --prompt-only "<TOPIC>"`. That flag does Steps 1–2
+    (query + date extraction) but emits the prompt instead of calling
+    ollama. Single source of truth — same prompt, same dated hits, as
+    every ollama path.
+  - The captured prompt goes to a synth-only Agent (`tools: []`) so no
+    tool-loop is possible even by accident.
+
+  Failure modes:
+  - `qwen-search.py --prompt-only` shares its exit codes 0/2 with the
+    full path — 2 means the corpus query failed and `--sonnet-shot` is
+    also unavailable for this topic. Codes 3/4 cannot fire (no ollama
+    call).
+  - The Agent itself can fail by API error — surface it the same way as
+    the regular `--sonnet` path.
+
+  ## Ollama path notes
+
+  The ollama path is implemented in `~/lightrag-history/scripts/qwen-search.py` (name kept for
+  backward compat — the script itself is model-agnostic):
+
+  - Runs `query.py "<TOPIC>" --mode mix`.
+  - Deterministically derives a date for each hit from its `source_id` pattern (the same rules from
+  the sonnet prompt's Step 2, but in Python — no LLM tool calls).
+  - Sends one synthesis-only call to the chosen model on pony's ollama (`http://192.168.0.142:11434`
+  by default). Model is selected via `--model NAME` (default `qwen3.6:27b`).
+  - Prints the resulting markdown report on stdout.
+
+  Models currently available on pony (from `ssh pony ollama list`): `qwen3.6:27b`, `gemma3:27b`,
+  `mistral-small:24b`, `gpt-oss:20b`, `command-r:35b`. The skill maps each `--<flag>` to one of
+  these (see step 4 table). Adding a new model later is a one-line addition there plus an optional
+  sampling preset in `qwen-search.py`'s `MODEL_PRESETS` dict (the script falls back to ollama's
+  per-model defaults if no preset is registered, so it works out of the box).
+
+  Env overrides if pony moves IPs or the default model is changed:
+  - `OLLAMA_HOST` (default `http://192.168.0.142:11434`)
+  - `QWEN_MODEL` (default `qwen3.6:27b`; `--model` arg wins over env)
+
+  Exit codes the skill should distinguish:
+  - `0` → success, stdout is the markdown report.
+  - `2` → query.py / parsing failed (lightrag corpus issue — sonnet probably also fails).
+  - `3` → ollama unreachable (pony down). Treat as "ollama path unavailable, fall back to sonnet."
+  - `4` → unexpected ollama response shape (model returned malformed JSON). Surface this as
+  `(<model> returned unparseable output)` in the comparison section, but still show the sonnet
+  result.
+
+  ## Tuning
+
+  - Cold-start cost is ~120 s on every path (the bge-m3 query in `query.py` is the dominant cost,
+  shared by all paths). Sonnet's agent loop (`--sonnet`) adds ~30–60 s of tool-call round-trips; a
+  single ollama synthesis call (`--qwen` etc.) adds ~5–15 s once the model is hot, plus ~30–90 s
+  cold-load on a 3090; sonnet-shot (`--sonnet-shot`) adds ~10–20 s of one Anthropic round-trip.
+  - `--all` is dominated by serial cold-loads on pony: only one ~15–18 GB model fits in the 24 GB
+  3090 alongside bge-m3, so each ollama request after the first incurs an unload+reload (~30–90 s
+  each). Wall is roughly `bge-m3 retrieval + sonnet wall + Σ (per-model cold load + generate)` ≈ 5–8
+  min for a typical topic. The five `qwen-search.py` calls all fire in parallel from the skill's
+  perspective; ollama's request queue serializes them.
+  - The KG side is small (~48 entities). Most signal comes from chunks. If the topic is clearly
+  "session-shaped" (a debugging arc, a port, a design decision), the report's lead bullets will be
+  session entities; if the topic is "code-shaped" (a function, a file, a branch), commits will
+  dominate.
+
+  ## When not to use this
+
+  - Mid-session pivots ("now let's also look at Y") — the user has context already.
+  - Trivial openers — `/loop`, `/end`, `continue task N`, "hi", "what time is it".
+  - A topic the user has *just* worked on (e.g. they opened a previous session moments ago on the
+  same thing). The prior session's KG extraction won't have been drained yet, so a search will miss
+  it.
+  - When `~/lightrag-history/data/` doesn't exist or is empty (fresh-clone state). Tell the user the
+  index isn't populated and skip.
+
+  ## Refer to
+
+  - `~/lightrag-history/scripts/query.py` — the underlying retriever (used by every backend)
+  - `~/lightrag-history/scripts/qwen-search.py` — the ollama-path wrapper (model-agnostic via
+  `--model NAME` despite the legacy filename); also provides the `--prompt-only` mode the
+  sonnet-shot path uses to capture the dated synthesis prompt
+  - `~/.claude/agents/synth-only.md` — the tool-less agent definition the sonnet-shot path launches
+  - `~/lightrag-history/README.md` — corpus contents, ingest workflow
+  - `~/project/docs/lightrag-kg-generation.md` — KG layer design
+
+
+  ARGUMENTS: pony
+
+● Searching lightrag-history for prior work on `pony` — back in ~2 min.
+
+● Both backends launched. I'll wait for completion notifications.
+
+● Sonnet path done; waiting on qwen.
+
+● ## Sonnet
+
+  ## What we know about pony
+
+  Pony is an ASUS X99-DELUXE workstation (Intel i7-5820K, 64 GB RAM, RTX 3090 with 24 GB VRAM,
+  Ubuntu Server 26.04) that was brought up in early May 2026 as the project's primary GPU-equipped
+  local-inference host, running Ollama with bge-m3 and qwen3.6:27b to serve the lightrag-history
+  dual-backend skill.
+
+  ## Recent work (most recent first)
+
+  - **2026-05-10** — Identified pony's chassis WiFi antenna jacks as MMCX female (not SMA/RP-SMA)
+  after Brent bought incompatible SMA-male antennas; recommended 3x MMCX-male-to-SMA-female pigtail
+  adapters. _[session-6ecc05c7-cee6-454b-bfa3-a324a7fb803e]_
+  - **2026-05-07** — Q&A session on remote power-on options for pony: wired WoL via BIOS "Power On
+  By PCI-E" + ethtool is recommended; WoWLAN does not work (three independent reasons); smart plug +
+  "Restore on AC Loss" is the cable-free fallback; no BMC/IPMI on this board.
+  _[session-c32249fb-000f-485c-827e-4deb50fe4508]_
+  - **2026-05-06** — Brought up streaming ASR pipeline on pony's RTX 3090: three sibling scripts
+  (`stream-whisper.py`, `stream-canary.py`, `stream-parakeet.py`) in `~/asr/` using Silero VAD +
+  arecord from a Blue Snowball USB mic; all models 5-8x realtime.
+  _[session-0f989235-b7a0-4853-932e-962eaa14913d]_
+  - **2026-05-06** — Phone-call/ASR pipeline design and pony audio bringup: PipeWire/bluez brought
+  up, overnight model downloads scheduled, BT speaker-only telephony ruled out, phone-direct-to-pony
+  architecture locked in. _[session-7f9f7657-af04-4fda-a75e-a351c6e52ad0]_
+  - **2026-05-05** — Lightrag skill expanded from 2 to 6 backends (added gemma3:27b,
+  mistral-small:24b, gpt-oss:20b, command-r:35b to pony's ollama); validated --all mode end-to-end
+  on "parallel bba" topic; Broadcom BCM4360 PCIe WiFi enabled (MT7601U USB dongle had firmware-stall
+  failures). _[session-33c8a20d-001d-49eb-909f-2ece304f8e54]_
+  - **2026-05-04** — Full pony bringup from bare Ubuntu Server install: Kea DHCP second subnet on
+  samsung, NVIDIA driver 595-server-open, Ollama with LAN listen, bge-m3 pulled (200-430x faster
+  than c200-1 Westmere for large chunks), dual-backend lightrag skill designed and committed.
+  _[session-718eda9c-479e-4ead-87fd-18e7cefe19e2]_
+
+  ## Open threads
+
+  - Pony's 128 GB RAM still doesn't boot (running on 64 GB); root cause not investigated.
+  - 1 TB HDD physical install pending.
+  - MMCX-male-to-SMA-female pigtail adapters not yet ordered/installed; WiFi antennas not physically
+  connected (BCM4360 at -85 dBm with no antenna).
+  - WoL via ethtool not yet configured; BIOS "Power On By PCI-E" state not verified on hardware.
+  - samsung→pony route was down as of 2026-05-12, leaving the lightrag skill's bge-m3 hosting choice
+  unresolved if pony remains unreachable.
+  - Streaming ASR scripts (`stream-parakeet.py`, `stream-canary.py`) not yet live-tested with real
+  speech; demucs (piano stem splitting) not tested on real music.
+
+  ## Where to read more
+
+  - `~/project/docs/pony-bringup.md` — hardware, network, GPU stack, Ollama, measured ingest
+  throughput, power instrumentation
+  - `~/project/docs/pony-remote-power-on.md` — WoL vs smart-plug analysis, recommendation ranking,
+  known gaps
+  - `~/project/compactions/session-0f989235-b7a0-4853-932e-962eaa14913d.md` — ASR streaming bringup
+  session compaction (most recent dense record)
+
+  ## Qwen3.6
+
+  ## What we know about pony
+
+  Pony is an ASUS X99-DELUXE workstation with RTX 3090 and Ubuntu 26, serving as the local-inference
+  host for LLMs, ASR pipelines, and Ollama embeddings.
+
+  ## Recent work (most recent first)
+
+  - **2026-05-12** — Hardware state: RTX 3090/CUDA 13.2, Snowball mic, MT7601U dongle relocated,
+  antenna confirmed MMCX female; pony unreachable during power-on troubleshooting. _[pony, RTX 3090,
+  Snowball USB microphone, [REDACTED-IFACE]]_
+  - **2026-05-10** — Identified WiFi jacks as MMCX female; recommended pigtails to adapt SMA
+  antennas; findings in `pony-antenna-connector-id.md`.
+  _[session-6ecc05c7-cee6-454b-bfa3-a324a7fb803e]_
+  - **2026-05-07** — Remote power-on analysis: wired WoL viable, WoWLAN blocked, smart plug fallback
+  recommended; report in `pony-remote-power-on.md`. _[session-c32249fb-000f-485c-827e-4deb50fe4508]_
+  - **2026-05-06** — Brought up streaming ASR pipeline with faster-whisper/canary/parakeet scripts;
+  resolved CUDA conflicts via `uv`. _[session-0f989235-b7a0-4853-932e-962eaa14913d]_
+  - **2026-05-05** — Extended lightrag skill to support five additional Ollama models on pony with
+  `--all` evaluation mode. _[session-587353fa-17ba-45f2-8e69-af7834c3c10a]_
+  - **2026-05-04** — Completed bringup: network, drivers, Ollama, 200-430x speedup; refined
+  dual-backend skill and onboard BCM4360 WiFi. _[session-718eda9c-479e-4ead-87fd-18e7cefe19e2,
+  session-33c8a20d-001d-49eb-909f-2ece304f8e54]_
+
+  ## Open threads
+
+  - Order MMCX pigtails or locate OEM antenna; MT7601U dongle is temporary.
+  - Configure WoL persistence, verify BIOS wake toggle, and check CR2032 battery.
+  - Procure smart plug for AC-loss auto-on fallback.
+  - Evaluate multitalker ASR and `parakeet_realtime_eou_120m-v1`.
+
+  ## Where to read more
+
+  - `~/project/docs/pony-antenna-connector-id.md`
+  - `~/project/docs/pony-remote-power-on.md`
+  - `~/project/docs/pony-bringup.md`
+
+  ## Comparison
+
+  **Coverage**: Roughly equivalent on the bringup arc (2026-05-04 through 2026-05-10). Sonnet found
+  one extra session that qwen missed (the 2026-05-06 phone-call/ASR design session, distinct from
+  the same-day streaming-ASR session). Qwen added a 2026-05-12 hardware-state hit that sonnet
+  doesn't show — but its source_id field is a list of *entity names* (`pony, RTX 3090, Snowball USB
+  microphone, [REDACTED-IFACE]`), not a real `source_id`, which makes it unverifiable as a dated
+  bullet. That date may have been guessed rather than extracted.
+
+  **Accuracy**: Sonnet's bullets all cite proper `session-<UUID>` source_ids and the dates match the
+  KG descriptions. Qwen's first bullet has a malformed source_id (entity list, not a chunk/session
+  ID) and its 2026-05-05 bullet cites `session-587353fa-...` which doesn't appear in sonnet's
+  results — possibly an extra real session, possibly a fabricated UUID. Worth verifying before
+  trusting.
+
+  **Template fidelity**: Both followed the structure well. Qwen is more terse (within ~250 words);
+  sonnet runs to ~400.
+
+  **Useful judgment**: **Sonnet is more useful here.** It gives richer context per bullet (the *why*
+  and *what* of each session, not just the topic), and its open-threads section surfaces non-obvious
+  items qwen missed (the 128 GB RAM boot issue, the samsung→pony route being down 2026-05-12).
+  Qwen's open threads are also good but slightly more generic. The accuracy concern with qwen's
+  first two bullets tips the balance further toward sonnet.
+
+  The 2026-05-12 unreachability is worth knowing about — if pony is still down, that affects ASR
+  work and the lightrag dual-backend skill itself.
+
+❯ we've got antennas plugged into pony now.  can you see if you can bring up the on-board wifi?
+
+● Pony is reachable on `192.168.0.142` (wifi subnet). Let me check the current state of the on-board
+  WiFi.
+
+● Good news — `wlp8s0` (on-board BCM4360) is already UP and associated with `[REDACTED-SSID]` at
+  `192.168.0.108`. Let me check signal strength now that antennas are connected (it was -85 dBm
+  before).
+
+● The on-board card associated on **5 GHz (5745 MHz, channel 149)** — that's promising; 5 GHz
+  typically requires decent signal. Need sudo for the station dump.
+
+● The on-board interface is the preferred default route (metric 30 vs 200 for the USB dongle).
+  `sudo` didn't produce signal output — likely password-prompted with no tty. Let me try a non-sudo
+  route to read signal:
+
+● `wpa_cli` works without sudo. Let me get signal strength via `signal_poll`.
+
+● On-board WiFi is up and working well now that antennas are connected:
+
+  | Metric | Before antennas (2026-05-05) | Now |
+  |---|---|---|
+  | RSSI | -85 dBm (marginal) | **-66 dBm** (very good) |
+  | Band | — | 5 GHz, channel 149 |
+  | Link speed | — | 263 Mbps (WiFi 5, WPA2) |
+  | SSID | [REDACTED-SSID] | [REDACTED-SSID] |
+
+  The on-board BCM4360 (`wlp8s0`) is associated at `192.168.0.108` and is the preferred default
+  route (metric 30). The MT7601U USB dongle (`[REDACTED-IFACE]`) is still up as a secondary at
+  `192.168.0.142` (metric 200).
+
+  Two things worth noting:
+  1. **The lightrag skill's qwen-search.py defaults to `192.168.0.142`** (the dongle's IP) for the
+  Ollama host. It works because both interfaces are on the same subnet, but you may want to switch
+  it to `192.168.0.108` (or to `pony` by hostname) so the on-board card is the actual path.
+  2. **The USB dongle is now redundant.** You can either leave it as failover or unplug/disable it —
+  let me know if you want me to take it down.
+
+❯ is the onboard set to connect on boot?
+
+● Yes — persistent and ready. The on-board card is in `/etc/netplan/00-installer-config.yaml`:
+
+  ```yaml
+  wifis:
+    wlp8s0:
+      dhcp4: true
+      dhcp4-overrides:
+        route-metric: 30
+      access-points:
+        "[REDACTED-SSID]":
+          password: "[REDACTED-WIFI-PW]"
+  ```
+
+  The generated unit `netplan-wpa-wlp8s0.service` brings up wpa_supplicant for the interface on
+  boot, and `wpa_supplicant.service` is enabled + active. So on next reboot, wlp8s0 will associate
+  with `[REDACTED-SSID]` and grab a DHCP lease at metric 30 (preferred path) — no manual intervention
+  needed.
+
+  The USB dongle (`[REDACTED-IFACE]`) is also still in the netplan config at metric 200. If you want
+  me to remove it so the on-board is the only WiFi path, I can do that.
+
+❯ can you bring up the bluetooth?
+
+● Bluetooth is already up on its own — service `bluetooth.service` is enabled + active, and the
+  adapter is running:
+
+  - **Controller**: `[REDACTED-MAC]` (Broadcom BCM20702 — ASUSTek USB on the motherboard,
+  `0b05:180a`)
+  - **Status**: `UP RUNNING`, name `pony`, class "Computer, Desktop workstation"
+  - **State**: Discoverable=off, Pairable=accept (typical defaults — let me know if you want to flip
+  discoverable on for pairing)
+
+  One caveat from dmesg: the BCM20702A1 firmware patch file is missing — kernel tried:
+  ```
+  brcm/BCM20702A1-0b05-180a.hcd
+  brcm/BCM-0b05-180a.hcd
+  ```
+  …and didn't find either. The chip still works without it (you can see it does), but the patch
+  usually improves stability and may unlock features. It comes from the `firmware-broadcom-bcm20702`
+  Debian package or from the upstream `linux-firmware` repo. Want me to chase it down?
+
+❯ first, let's pair it
+
+● What device are you pairing? (And if it's not already in pairing mode, put it there now — typical
+  phones/headphones need a long press on a button to advertise.)
+
+  While you do that, here's what's already known to the adapter:
+
+● Nothing paired yet — clean slate. Tell me what device and I'll drive the scan + pair from here.
+
+❯ my phone
+
+● I'll start a persistent bluetoothctl agent in the background and put pony into
+  discoverable/pairable mode. Then you initiate the pairing from your phone.
+
+● Pony is now **discoverable** as `pony` (no timeout) with an auto-accept agent registered. Go to
+  your phone's Bluetooth settings → scan for devices → tap **pony** to pair. Tap "Pair" if it
+  prompts. Let me know when the phone shows it as paired and I'll confirm on this side and trust it.
+
+❯ it connected.  did i need that code?
+
+● Short answer: no — pony was set up with a `NoInputNoOutput` agent, which means SSP fell back to
+  "Just Works" pairing. The phone may have shown a code as a courtesy, but pony auto-accepted; there
+  was nothing for you to compare against on this side. (The trade-off: no MITM protection during the
+  pair, which is fine for a phone↔home-server pair in your house.)
+
+  Let me confirm the pairing landed and trust the device.
+
+● Pony doesn't show anything paired or connected yet. Let me check the bluetoothctl log to see what
+  the phone actually did.
+
+● It actually didn't pair — the phone asked for **numeric comparison** (passkey 869317) and pony's
+  agent was waiting on a `(yes/no):` prompt, but my background process had nothing feeding it
+  answers. The phone timed out and disconnected.
+
+  Let me retry with an agent that auto-confirms.
+
+● That `pkill -f bluetoothctl` killed its own parent shell because our ssh command contained the
+  word "bluetoothctl". Let me retry with a safer kill.
+
+● Good — pkill did succeed (no bluetoothctl running) before the ssh shell died. Now starting the new
+  agent.
+
+● Pony is discoverable again with a yes-feeding agent running. **On the phone**, first **forget**
+  any prior `pony` entry (the failed pairing left one), then re-scan and tap **pony** to pair. When
+  the phone shows the 6-digit code, tap to confirm on the phone — pony will auto-confirm on its
+  side. Let me know when it goes through.
+
+❯ i've done that several times.  it doesn't seem to work.
+
+● Let me look at what's actually happening on pony's side.
+
+● Two things from the log:
+
+  1. **The yes-feeder is alive**, but it's spamming "yes" into bluetoothctl's main menu (rejected as
+  invalid command). That's not the bug — those yes's would be consumed if/when a confirmation prompt
+  arrives. They're not arriving.
+  2. **No incoming pair attempts since the restart.** The log shows zero `[NEW] Device` events for
+  your phone since we restarted, even though you've retried several times.
+
+  So the phone is no longer reaching pony at all. Before I keep guessing, two diagnostic questions:
+
+  - **What does the phone show when you tap "pony"?** Immediate "couldn't pair", or "Connecting…"
+  then a timeout, or a pair dialog that never resolves?
+  - **Does "pony" still appear in the phone's available-devices list when you scan?** Or has it
+  disappeared from the scan?
+
+  Meanwhile let me start `btmon` to capture HCI traffic — that'll tell us definitively whether the
+  phone is reaching pony.
+
+● `btmon` is running, file is empty (no HCI traffic right now — that's expected when idle). Two
+  things to do:
+
+  1. **Tell me what the phone shows** when you tap "pony" (immediate fail / spins / pair dialog?).
+  2. **Try the pairing one more time now** so btmon catches what's happening. Forget pony on the
+  phone first, turn phone BT off & on, then scan and tap pony.
+
+  I'll watch the btmon capture while you try. (Some phones suppress devices they've recently failed
+  to pair with — toggling phone BT off/on usually clears that cache.)
+
+❯ i "forgot" pony.  first it said "can't communite with pony".  then it said "Bluetooth pairind code
+  690021".  I clicked "pair" and it just went back to the home screen with nothing paired
+
+● Let me see what happened on pony's side this time.
+
+● Wait — the protocol log shows pairing **did succeed** (`Paired: yes`, `Simple Pairing Complete`),
+  but pony immediately drops the connection (`BREDR.Disconnected - org.bluez.Reason.Local`). Then
+  the phone retries (3 cycles visible), each succeeds at the protocol level then gets dropped. Let
+  me check current state.
+
+● Pairing **did succeed on pony's side**:
+
+  ```
+  Device [REDACTED-MAC] [REDACTED-DEVICE]
+    Paired: yes
+    Bonded: yes
+    Trusted: no
+    Connected: no
+  ```
+
+  The post-pair disconnect you saw is actually normal for Bluetooth Classic — phones drop the BR/EDR
+  link after pairing and only re-establish it when a service needs it (audio, phonebook, etc.). The
+  phone may have *interpreted* that disconnect as "pair failed" in its UI, but the bond record is
+  here.
+
+  Let me trust the device and stop discoverable mode, then check the phone.
+
+● Pony's side is set: paired + bonded + trusted. Discoverable is off (no longer broadcasting).
+
+  **Check your phone's Bluetooth settings now** — does `pony` appear in the paired/saved devices
+  list (separate from any "available devices" scan)? If yes, we're done; the phone just had a
+  confusing UX during the pair. If no, the phone genuinely rejected the bond and we'd need to delete
+  it on pony, re-enable discoverable, and try once more — possibly with pony initiating the
+  connection back to the phone to keep the link alive past the pair-complete moment.
+
+❯ yes, it's "saved"
+
+● Done. Let me clean up the agent process and btmon since we don't need them anymore.
+
+● Same self-pkill problem as before — pkill -f matched its own parent shell. Let me retry safely.
+
+● All cleaned up. Final state on pony:
+
+  - **Phone paired**: `[REDACTED-MAC] [REDACTED-DEVICE]` — paired, bonded, trusted
+  - **Discoverable**: off (pony won't show up to other phones now)
+  - **Pairable**: off
+
+  The phone supports A2DP audio source, AVRCP, Handsfree, PANU, NAP — so you can use it as a
+  Bluetooth audio source feeding pony, control playback, or share its internet. Let me know if you
+  want to wire any of those up.
+
+❯ what are those five things?
+
+● | Profile | What it does |
+  |---|---|
+  | **A2DP (Audio Source)** | Phone streams stereo music/audio over BT to a receiver. Phone =
+  source, pony = sink. This is what BT headphones/speakers use. |
+  | **AVRCP** | Remote-control commands paired with A2DP: play/pause/next/prev/volume. Lets pony
+  tell the phone what to do during playback. |
+  | **Handsfree** | Phone-call audio routing — incoming/outgoing call audio + mic. Two-way mono
+  speech (narrowband, mSBC/CVSD codec, not A2DP's higher-fidelity codec). What car kits and headset
+  earpieces use. |
+  | **PANU** | Personal Area Networking User — pony's role as a BT-network client. |
+  | **NAP** | Network Access Point — phone's role as a BT-network gateway. |
+
+  PANU + NAP are two halves of the same thing: BT tethering. Phone offers internet via NAP, pony
+  connects through PANU.
+
+  So in practice: A2DP+AVRCP = use pony as a Bluetooth speaker for the phone. HFP = pony could be a
+  speakerphone for calls. PANU/NAP = pony could use the phone's mobile data over BT.
+
+❯ what's the difference between PANU and NAP?
+
+● They're complementary roles in the same protocol (Bluetooth PAN, layered on BNEP):
+
+  - **NAP** = **N**etwork **A**ccess **P**oint — the "server" / access-point side. Offers bridged
+  network access to clients (like a WiFi AP). Multiple clients can connect to one NAP.
+  - **PANU** = **PAN U**ser — the "client" side. Connects to a NAP (or to a GN — Group Ad-hoc
+  Network — for peer-to-peer setups).
+
+  In a typical phone-tethering session: phone = NAP (offers internet), laptop = PANU (uses it).
+
+  Your phone advertises **both**, which is normal — devices usually support both roles so they can
+  be on either side of a PAN connection. So with the phone paired:
+
+  - Phone-as-NAP + pony-as-PANU → pony reaches the internet through the phone's mobile data.
+  - Phone-as-PANU + pony-as-NAP → phone reaches pony's LAN through pony (rarely useful since the
+  phone already has wifi).
+
+❯ so, i've got a phone call right now.  how would i transfer it to pony?
+
+● Quickly — two steps:
+
+  **1. From pony**, force-connect the phone:
+  ```
+  bluetoothctl connect [REDACTED-MAC]
+  ```
+
+  **2. On the phone's in-call screen**, tap the audio output selector (usually a speaker/headphone
+  icon) and pick **pony** as the output.
+
+  The phone will route the call audio over HFP. **But heads-up** — this needs pony's PipeWire+bluez
+  stack to expose an HFP "audio gateway" target, and it needs working speakers + mic plugged into
+  pony. If pony doesn't have a mic+speakers physically connected right now, you'll hear the call but
+  won't be able to speak. If you have headphones jacked in, that works for output. (The Blue
+  Snowball USB mic from the earlier ASR bringup would work for input if it's plugged in.)
+
+  Let me run the connect now if you want — say go.
+
+❯ cosine@pony:~$ bluetoothctl connect [REDACTED-MAC]
+  Attempting to connect to [REDACTED-MAC]
+  Failed to connect: org.bluez.Error.Failed br-connection-unknown
+  cosine@pony:~$ sudo bluetoothctl connect [REDACTED-MAC]
+  [sudo: authenticate] Password:
+  Attempting to connect to [REDACTED-MAC]
+  Failed to connect: org.bluez.Error.Failed br-connection-unknown
+
+
+● `br-connection-unknown` means no compatible profile matched between the two sides — pony isn't
+  advertising a Handsfree Unit role for the phone to connect to.
+
+  **Important context I should have flagged sooner**: the lightrag search showed that in the earlier
+  audio bringup, **BT-for-telephony was explicitly ruled out** and the architecture pivoted to
+  "phone-direct-to-pony" (not over BT). So pony's PipeWire was never configured with the HFP
+  audio-gateway/handsfree profile. That's what's missing.
+
+  Getting it set up mid-call is unrealistic — it needs:
+  - PipeWire + wireplumber session running for your user
+  - `module-bluetooth-discover` (or the SPA bluez plugin) loaded with HFP enabled
+  - A working speaker+mic on pony's audio side
+
+  **For this call**: just use the phone's speakerphone or wired headset, sorry.
+
+  After the call, want me to set up pony's PipeWire BT stack so this works next time? It's a 10-15
+  min job (install wireplumber if missing, configure the bluez plugin, restart the user session,
+  verify pony shows up on the phone's audio-output picker mid-call).
+
+❯ so, the workflow I want is to transfer the call to pony over bluetooth (then the call will be on
+  headsets) and only *then* login to run a transcription
+
+● Got it — clean design. The pieces:
+
+  1. **HFP** routing on pony — phone offloads the call audio over BT to pony's headphones+mic.
+  2. **Audio capture** of the BT call stream — feed it to `stream-whisper.py` / `stream-canary.py`
+  (which currently read from arecord; we'd point them at the BT source instead).
+  3. **Optional**: capture both sides (your mic + remote party) and mix them for the transcript.
+
+  Setup work needed after the call:
+  - Install wireplumber if missing; load PipeWire's bluez SPA plugin with HFP enabled.
+  - Decide on headphones (3.5mm jack? USB?) and mic (the Blue Snowball from the ASR bringup?).
+  - Add a small auto-connect rule so pony grabs the BT link as soon as the phone offers it (no
+  manual `bluetoothctl connect` mid-call).
+  - Modify the streaming-ASR script to source from the BT call's audio stream instead of arecord.
+
+  Ping me when you're off the call and I'll set it up end-to-end.
+
+❯ call's over, let's set it up
+
+● Starting with an inventory of pony's current audio stack.
+
+● Pipewire/wireplumber installed but **not running** for any user session. The bluez SPA codecs are
+  all present (including HFP wideband mSBC and LC3-SWB). Let me check what audio hardware is plugged
+  in and whether the cosine user has audio access — that's the user who'll be wearing the
+  headphones.
+
+● Hardware picture:
+  - **Mic**: Blue Snowball USB (card 2) — already there
+  - **Speakers/headphone out**: Realtek ALC1150 analog (motherboard green jack) — 3.5mm wired
+  headphones go here
+  - **cosine** is in the `audio` group and has an active session — but PipeWire isn't running for
+  them yet
+
+  Question before I configure: **what are you plugging the headphones into?** 3.5mm green jack on
+  the motherboard, USB headset, or something else? (No USB headset is currently enumerated, just the
+  Snowball mic.)
+
+  While you answer, let me get pipewire/wireplumber running for cosine's session.
+
+● Actually pipewire IS running for cosine — I was wrong, the earlier `pactl` failed because I ran as
+  `claude`. Full stack up:
+  - `pipewire.service`, `pipewire-pulse.service`, `wireplumber.service`, `mpris-proxy.service`,
+  `filter-chain.service`
+
+  Let me query as cosine and see what pipewire shows.
+
+● PipeWire sees the ALSA cards but **no Bluetooth card**. Wireplumber isn't loading the bluez
+  monitor. Let me check why.
+
+● `monitor.bluez.seat-monitoring = disabled` and `provides = monitor.bluez` are both there — so
+  wireplumber should load it. Let me restart wireplumber for cosine and capture the startup log to
+  see why it isn't.
+
+● The bluez D-Bus tree shows the phone is registered but no MediaEndpoint is registered by
+  wireplumber — confirming wireplumber's bluez side isn't completing setup, but it's not logging an
+  error either.
+
+  Let me try a more direct test: connect to the phone from cosine's session and see if anything
+  wakes up.
+
+● **Found it.** Look at the bluez.lua source:
+
+  ```lua
+  if seat_state == "active" then
+    monitor = createMonitor()
+  ```
+
+  The bluez monitor only starts when logind reports the seat as `active`. Our session is SSH'd in —
+  logind reports the seat as `online`, not `active`. So the BT monitor never starts.
+
+  Fix: override the config to disable seat-monitoring for bluez. Then it starts unconditionally.
+
+● **Bluez monitor is up!** Log says:
+
+  ```
+  bluez.lua:412: <WpSpaDevice:0x...> 0, [REDACTED-DEVICE] ([REDACTED-MAC]): disconnected
+  ```
+
+  WP now sees the phone (just not connected yet — that's normal; the card appears on connect). Let
+  me make sure wireplumber is running normally via systemctl, then try the connect.
+
+● `bluez_card` is now registered. Profile isn't active yet — let me check available profiles and
+  switch to `headset-head-unit` (HFP) which gives us mic + speaker for calls.
+
+● The card only shows the `audio-gateway` profile (pony AS gateway) — but we want pony to be a
+  *headset* (HFP HF + A2DP Sink). Let me check what UUIDs/profiles wireplumber registered with
+  bluez.
+
+● Card has only `off` and `audio-gateway` (pony AS gateway) — wrong direction. The phone offers A2DP
+  Source + HFP AG, so pony needs `a2dp-sink` and `headset-head-unit` profiles. PipeWire's bluez5
+  module config is filtering them out. Let me check.
+
+● Let me try explicitly configuring `bluez5.headset-roles` to include both HF and AG roles, plus
+  enable mSBC for wideband HFP.
+
+● Let me try one more thing — force the SPA-level profile via a rule (bypassing the auto-detection),
+  and also have the phone trigger media so we can see if A2DP nodes appear.
+
+● Let me check the bluez device specifically (got the wrong card ID) and check what happens when the
+  phone plays media.
+
+● Important: the A2DP MediaTransport is `active` right now (phone is playing media, "Moment Ukraine
+  fires SMUGGLED drones..."). UUID `0000110b` (A2DP Sink) — so the audio IS being sent to pony at
+  the BT layer. But pipewire isn't exposing it as a sink. Let me check wpctl status now.
+
+● **It's actually working!** Look at the streams in `wpctl status`:
+
+  ```
+  Streams:
+     62. bluez_input.08_3F_21_73_AC_8A.2
+          61. output_FL  > ALC1150 Analog:playback_FL  [active]
+          66. output_FR  > ALC1150 Analog:playback_FR  [active]
+  ```
+
+  PipeWire is right now routing audio **from the phone** (via A2DP, since you're playing media) **to
+  the motherboard's analog stereo output** (ALC1150 Analog, vol 40%). The `audio-gateway` profile
+  description was misleading — the description names what the **remote** does, not what pony does;
+  pony is automatically the headset/sink side.
+
+  **Sanity check: plug headphones (or speakers) into pony's green 3.5mm jack and you should hear the
+  YouTube video** ("Moment Ukraine fires SMUGGLED drones..." was playing per AVRCP).
+
+  If audio is flowing through to the headphones, then:
+  - **A2DP (media) → works** ✓ (proven by this active stream)
+  - **HFP (calls) → should auto-switch** when an actual call comes in
+  (`bluetooth.autoswitch-to-headset-profile=true` default)
+  - The card profile naming (only `audio-gateway` shown) is a PipeWire 1.x cosmetic thing — the
+  underlying SPA still negotiates A2DP Sink and will negotiate HFP HF when a call happens
+
+  Test it: plug something in and confirm you hear it. If yes, this is essentially done; we just need
+  to validate HFP during a real call.
+
+❯ i hear it, but it's very faint
+
+● The output sink is at 40%. Let me bump it up.
+
+● Sink is now at **90%** (-2.75 dB) and ALSA Master is at 97%. How does that sound — louder?
+
+❯ yes, much better
+
+  now, I don't want it connect by default; I'd like to switch it on from the phone.  can i do that?
+
+● Yes — that's actually the default behavior on pony as currently configured. Pony only connects
+  when something initiates it (your phone, or a manual `bluetoothctl connect`). Let me verify pony
+  has no auto-reconnect, then disconnect so you can test that the phone-initiated flow works.
+
+● Already the case — pony has no auto-reconnect (all `ReconnectAttempts`/`AutoEnable` lines in
+  `/etc/bluetooth/main.conf` are commented out). I disconnected just now and waited 5 seconds: pony
+  stayed disconnected (still paired+trusted though).
+
+  **To connect from the phone**: open phone's BT settings → tap **pony**. It'll associate, A2DP will
+  negotiate, audio routes to the 3.5mm jack. Toggle phone BT off → on works too (phones
+  auto-reconnect to trusted devices on wake).
+
+  **To disconnect**: long-press pony in phone BT settings → Disconnect (keeps it paired).
+
+  Give it a try and confirm — that's the workflow you wanted.
+
+❯ will it configure on boot with nobody logged in?
+
+● Not yet. Current state on pony:
+
+  - **Bluetooth daemon + pairing data**: system-level, will work on boot regardless of login ✓
+  - **PipeWire / wireplumber / our BT routing config**: runs in `cosine`'s user session — only
+  started when cosine logs in. `Linger=no` for cosine means no user services persist after logout.
+
+  So after a reboot with nobody logged in:
+  - Phone can pair/connect at BT layer ✓
+  - But no PipeWire → no audio routes to the 3.5mm jack
+
+  Fix: `loginctl enable-linger cosine`. That makes cosine's user services (including
+  pipewire+wireplumber) start at boot and stay up even with no shell session. The wireplumber config
+  we wrote is in `~/.config/` so it applies to that auto-started session too.
+
+  Want me to enable lingering?
+
+❯ yes
+
+● Done — `Linger=yes`. Next boot, cosine's pipewire/wireplumber will start automatically. Phone
+  connects → audio routes through 3.5mm jack, no login needed.
+
+❯ let's test it with a reboot
+
+● Waiting for pony to come back from reboot.
+
+● Pony is back up, **uptime 0 min, no one logged in**, and:
+
+  - `pipewire` / `pipewire-pulse` / `wireplumber` for cosine: **all active** (lingering worked)
+  - `bluetooth.service`: active
+  - Phone is still in bluez (`/org/bluez/hci0/dev_08_3F_21_73_AC_8A`, paired data persisted)
+  - No `bluez_card` in PipeWire yet — phone isn't connected (correct, since pony doesn't initiate)
+
+  **Now connect from the phone** — open BT settings, tap pony. Audio from the phone should route to
+  the 3.5mm jack. Let me know when you've tried.
+
+❯ it connected
+
+● All set:
+  - `bluez_card` appeared automatically when the phone connected ✓
+  - Active profile: `audio-gateway` (the headset-side profile) ✓
+  - Sink volume: 0.90 (persisted across reboot) ✓
+  - No active streams yet (phone isn't playing anything)
+
+  Play something on the phone and you should hear it through the 3.5mm jack. End-to-end this is now:
+  reboot-safe, login-free, phone-initiated.
+
+❯ <command-message>end</command-message>
+  <command-name>/end</command-name>
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the JSONL
+  lives in the subagent dir tree:
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Two locations need to be searched, because subagents log to a
+  different place than top-level sessions:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl`. The ID is the basename.
+  - **Task-runner subagents** flush to
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl`. The ID
+    is the composite `<parent>-<aid>`.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 2 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID (subagent → composite, top-level → UUID)
+  case "$path" in
+    */subagents/*/agent-*.jsonl)
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why the subagent search matters.** Before this dual-search, the
+  poller only checked `~/.claude/projects/-home-claude/`. In subagent
+  runs the marker never appeared there (subagent events go to the
+  `sessions/subagents/` tree instead), the poller timed out, and the
+  agent fell back to "find the recently-touched top-level JSONL" —
+  which yielded the *parent session's* UUID, not the subagent's own
+  identity. That accidentally produced a per-parent compaction
+  filename, collapsing multiple subagents under one parent into the
+  same file. The dual search yields the correct composite ID and gives
+  each subagent its own compaction.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● First run. Kicking off session-ID detection.
+
+● Now the compaction.
+
+● Artifacts written:
+
+  - Report: `~/project/reports/pony-bluetooth-audio.md`
+  - Compaction: `~/project/compactions/session-d024c36b-1785-4f6e-a540-14dae9cebe67.md`
+  - KG: `~/lightrag-history/incoming/session-d024c36b-1785-4f6e-a540-14dae9cebe67.json`
+

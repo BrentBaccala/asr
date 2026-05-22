@@ -1,0 +1,962 @@
+❯ yesterday we did a lot of work on the asr tool
+
+● I'll search for what we did yesterday on the ASR tool.
+
+● Let me read the recent compactions from yesterday to see what we did.
+
+● Yes — yesterday (2026-05-19) was a big ASR day. Three sessions across the day, all on `~/asr` (the
+  pony-deployed pipeline):
+
+  **Early May 19 — finished the initial TUI buildout** (session `213c3247`)
+  - Voxtral(GPU) → NLLB-600M-int8(CPU) cascade with live Spanish + inline English
+  - `asr-tui.py` with ANSI alt-screen, pressure-based clause flush, masked re-translation
+  - Latency tuned 0.88 s → 0.39 s via `transcription_delay_ms` 480→240
+
+  **Mid-day — `asr-dual-stream` (task 376, run 605)** (session `6e1d421a`)
+  - Added `--dual` mode: concurrent Remote/Me streams from the two PipeWire RTP taps
+  - Per-speaker substates, one active-speaker live block, single serialized NLLB worker, interleaved
+  tagged history
+  - Committed as `ebe1074`; per-stream first-delta latency Me 0.63 s / Remote 0.64 s under dual load
+
+  **Evening into early May 20 — public-release + deployment hardening** (session `f08d0019`)
+  - Confirmed the `--max-model-len 16384` vLLM crash; built **Silero-VAD-driven WS auto-recycle** so
+  the cap is effectively unreachable
+  - Made the repo **public at github.com/BrentBaccala/asr**, rewrote README for public audience,
+  refreshed `phone-call-asr-pipeline.md`
+  - UX polish: per-stream audio liveness dots (`Remote ●  Me ●`), recycle counters, session-age,
+  three-line Live/ES/EN per stream with marker-MT, batched dual MT (~40% faster), Ctrl-L reset,
+  scrollback
+  - Added systemd user unit `voxtral.service` (with `Restart=on-failure` + PATH fix for the `ninja`
+  cudagraph bug); deliberately *not* enabled at boot
+  - Consolidated `~/asr` (moved deps out of `~/asr.bak/`, pruned unused venvs, reclaimed ~14 GB),
+  extracted `INSTALL.md` from README
+
+  Nothing actively broken at end of yesterday. Parked items: telephone-band / code-switched
+  validation (needs real-call fixture), and a `voxtral-idle.timer` for auto-idle-stop was sketched
+  but not built.
+
+  What's on for today?
+
+❯ you find a bug in vLLM?
+
+● Sort of — we confirmed a crash that's at least bad behavior in vLLM, but didn't file it upstream.
+  We worked around it.
+
+  **What it is.** vLLM's `--max-model-len` is supposed to be a sequence-length cap, but hitting it
+  doesn't end the sequence cleanly. The decode produces one token *past* the limit, then
+  `_bookkeeping_sync` in `vllm/v1/worker/gpu_model_runner.py` fires an `AssertionError`:
+
+  ```
+  Sampled token IDs exceed the max model length.
+  Total number of tokens: 16385 > max_model_len: 16384
+  ```
+
+  That assertion **kills the entire EngineCore**, not just the offending sequence. APIServer then
+  shuts down cleanly. From the client side: WS closes with no error frame, `:8000/health` returns
+  000, GPU goes idle, needs full `systemctl restart`. Confirmed live on 2026-05-19 21:28.
+
+  **Why it's a bug (not just a config issue).** The limit should be enforced as a stop condition —
+  sample-and-truncate, or refuse-to-sample, ending that sequence with a finish reason. Instead it's
+  an `assert` that fires *one token over* and takes down the whole engine including any other
+  concurrent sessions. Classic off-by-one-meets-fatal-assertion.
+
+  **Pre-crash tell.** Throughput halves (~21 → ~11–14 tok/s) as sequence grows — that's just
+  O(n)-per-token attention with no rolling window, not memory pressure (KV cache stayed at 31.8%).
+  So the crash is preceded by a noticeable lag buildup if you're watching.
+
+  **What we did about it.** Worked around it from the client: Silero-VAD-driven per-stream WS
+  auto-recycle (`9a361ee` in `~/asr`) — each phone-call side recycles at natural silences (≥800 ms),
+  so the cap is effectively unreachable. Backstop force-recycles at 1100 s if someone genuinely
+  never pauses.
+
+  We did *not* file an upstream issue. Want me to put one together? The repro is small (run
+  `Voxtral-Mini-4B-Realtime` with a tiny `--max-model-len`, feed it long enough audio).
+
+❯ check first to see if it's been reported as an existing upstream issue
+
+● There's a strong candidate — let me read it.
+
+● Yes — already reported, multiple times. We don't need to file a new one.
+
+  **Closest matches (all open):**
+
+  - **#38428** (2026-03-28, `sh1man`) — "V1 Engine: EngineDeadError (AssertionError) on
+  max_model_len overflow during realtime audio streaming." Same model
+  (`Voxtral-Mini-4B-Realtime-2602`), same assertion at `gpu_model_runner.py:_bookkeeping_sync`, same
+  root-cause analysis in a follow-up comment. The cleanest match.
+  - **#39996** (2026-04-16, `BioAGI-Moretti`) — "Fatal AssertionError: Encoder KV cache fails to
+  evict tokens, exceeding max_model_len in long-lived WebSocket sessions." Voxtral-Mini, RTX 3090,
+  `--max-model-len 16384`, and the assertion message is **byte-identical to ours**: `Total number of
+  tokens: 16385 > max_model_len: 16384`. They were streaming silence into a `/v1/realtime` always-on
+  bot — same scenario class as a quiet phone line, hence the same crash.
+  - **#40302** (2026-04-19) — generalizes it: "admission check missing" for max_model_len overflow.
+  - **#38233** — adjacent: Voxtral encoder_cache saturation on 16 GB GPUs.
+
+  All four are still **open**, no fix landed yet. The upstream consensus (from the #38428 comment)
+  matches our diagnosis: the `assert end_idx <= self.max_model_len` should be replaced with a clean
+  path that finishes the offending request with `finish_reason="length"` and keeps the engine alive
+  — possibly preceded by a scheduler-side admission check that accounts for multimodal placeholder
+  insertion before scheduling the chunk.
+
+  So our crash on 2026-05-19 is a confirmed instance of a known, still-unfixed bug. Our VAD
+  auto-recycle is exactly the "client-side mitigation" #38428's commenter recommended.
+
+  Want me to add a comment to **#39996** (the closer scenario match) confirming we hit it on the
+  same model + same `max_model_len` value, and link our VAD-recycle workaround? Could be useful for
+  whoever picks the bug up — they get a third independent repro plus a working client-side
+  mitigation pattern.
+
+❯ 38428 has a proposed fix.  take a look
+
+● Read it. It's a one-file 14-line patch, but I don't think it actually works.
+
+  **PR #38483** by `machov` — open since 2026-03-29 (~7 weeks, no human review yet,
+  `REVIEW_REQUIRED`).
+
+  **The diff** (`gpu_model_runner.py`): replaces the assertion with an if-branch that:
+  1. Adds `req_idx` to `invalid_req_indices` (and the async set when async scheduling is on).
+  2. For the sync path, calls `valid_sampled_token_ids[req_idx].clear()`.
+  3. `continue`s past bookkeeping for that request.
+
+  PR author's claim: "scheduler infrastructure already handles `FINISHED_LENGTH_CAPPED` which maps
+  to `FinishReason.LENGTH`, so this change integrates seamlessly."
+
+  **The hole** — the `gemini-code-assist` bot flagged it on day one and the comment hasn't been
+  addressed:
+
+  > the current implementation causes requests to hang indefinitely because the scheduler never
+  receives the final tokens needed to trigger a completion status. It is recommended to truncate the
+  sampled tokens to fit the limit rather than clearing them, ensuring the request finishes
+  gracefully.
+
+  That looks right to me. The `FINISHED_LENGTH_CAPPED` path in vLLM fires when a request *sees* its
+  `num_tokens` cross `max_model_len` after a sampled token is appended — but this patch never
+  appends the overflow token (it clears it for sync, doesn't write it at all in either branch). So
+  the request lingers in the batch as "invalid" with no terminating token, no
+  `finish_reason="length"` emitted to the client, and on the next step the same overflow condition
+  recurs. From a `/v1/realtime` WS client's view: the engine no longer crashes, but the stream hangs
+  and the WS never gets a clean close — arguably worse than the crash, since you don't even get a
+  reconnect signal.
+
+  The fix the bot suggests — **truncate** the sampled IDs to fit (`num_sampled_ids =
+  self.max_model_len - start_idx`, write that prefix into the input batch as normal, let the
+  existing finish-reason machinery do its job) — is the right shape. PR author hasn't responded.
+
+  **Other concerns** in the PR as-submitted:
+  - "Validated the fix logic with a simulation test" — no real-engine repro test, no test added to
+  the suite.
+  - The async branch *only* adds to the set, doesn't even clear tokens, so async behavior is
+  inconsistent with sync (the bot's hang-forever critique applies equally to both, just by different
+  mechanisms).
+  - Doesn't address the deeper bug in #40302 / the #38428 follow-up comment: the *scheduler-side
+  admission check* for multimodal placeholder insertion. Catching it at sample-time still wastes a
+  step on a request that the scheduler shouldn't have batched in that shape.
+
+  **Verdict.** A real fix in spirit (assert→graceful), but a buggy implementation that the
+  maintainers correctly haven't merged. Our VAD-recycle workaround sidesteps both the crash and this
+  PR's hang behavior, so we're fine to wait. Posting on #39996 with our independent repro is still
+  worthwhile; piling onto #38483 to second the bot's truncate-not-clear point would also help
+  unstick it.
+
+❯ 39996 also has a PR
+
+● This one is substantively better than #38483.
+
+  **PR #40072** by `ianliuy` — 159 add / 1 del across 2 files (`scheduler.py` + a new unit-test
+  file). Opened 2026-04-16, still `REVIEW_REQUIRED`, no human review, no merge.
+
+  **Approach.** Where #38483 patched the *symptom* in `gpu_model_runner.py:_bookkeeping_sync`,
+  #40072 patches the *cause* in `vllm/v1/core/sched/scheduler.py` — preventing the overflow request
+  from being scheduled in the first place. Three layers:
+
+  1. **`_handle_stopped_request`** — after `_update_request_as_session` extends a session with new
+  streaming input, if `request.num_tokens >= max_model_len`, set `FINISHED_LENGTH_CAPPED` and
+  return. Includes a logger.warning. This is the path that fires on every chunk continuation for a
+  long-lived `/v1/realtime` session.
+  2. **`add_request`** — same check when a `WAITING_FOR_STREAMING_REQ` session receives a new chunk;
+  calls `finish_requests(..., FINISHED_LENGTH_CAPPED)` to remove cleanly.
+  3. **WAITING scheduling loop** — adds the `min(num_new_tokens, max_model_len - 1 -
+  num_computed_tokens)` clamp (mirroring the existing RUNNING-path guard at line 415–416 that the PR
+  author correctly identifies as missing from the WAITING path), and replaces the bare `assert
+  num_new_tokens > 0` with `if num_new_tokens <= 0: self.finish_requests(...); continue`.
+
+  **Tests added.** Three real unit tests (not "simulation"):
+  - `test_streaming_session_max_model_len_cap_via_handle_stopped`
+  - `test_streaming_session_max_model_len_cap_via_add_request`
+  - `test_streaming_session_length_capped_waiting_request_does_not_block_queue` — a direct
+  regression for head-of-line blocking, including the assertion that `output.finished_req_ids ==
+  {capped.request_id}` and the tail request still gets scheduled.
+
+  **Gemini-bot review.** The bot flagged "using a break statement … causes head-of-line blocking."
+  Looking at the current diff the author uses `continue` (not `break`) at the right point, *and*
+  added the explicit HOL-no-blocking test. So either Gemini was reviewing an earlier revision or got
+  confused — the concern is addressed in the current state.
+
+  **Substantive critique I'd raise.** Two minor things, but they shouldn't be blockers:
+
+  1. **Off-by-one in the `>=` check.** The two new guards use `request.num_tokens >=
+  self.max_model_len`. The assertion that actually crashes is `end_idx <= self.max_model_len` (so a
+  length of exactly `max_model_len` is legal). Finishing at `>=` may shave one token of legitimate
+  capacity. The WAITING-loop clamp uses `max_model_len - 1 - num_computed_tokens`, so all three
+  sites are consistent in being one-token conservative, but it's worth a note. (The assertion-side
+  fix in #38483 would use `>`.)
+  2. **No `logger.warning` on the WAITING-loop `finish_requests` path** — the other two sites log,
+  this one doesn't. Cosmetic, but it means a silent "request finished length-capped" if it ever
+  fires through the WAITING path instead of the streaming-update paths.
+
+  **Verdict.** This is the structural fix the bug deserves — it identifies the actual missing guard
+  (the WAITING path lost the RUNNING path's `max_model_len` clamp), patches all three scheduler
+  entry points where a streaming session can grow past the cap, and ships regression tests including
+  the HOL-blocking case. #38483 is patching the wrong layer; #40072 should be the one to land.
+
+  **For us:** worth commenting on **#39996** (the issue, which #40072 fixes) with our independent
+  Voxtral-Mini-4B-Realtime / `--max-model-len 16384` repro at 2026-05-19 — three independent reports
+  of the same bug on the same model + same cap value, and a PR sitting open for 5 weeks with no
+  human review, is the kind of signal that bumps maintainer attention. We can also point at the
+  VAD-recycle client-side workaround for anyone who needs to ship before #40072 merges. Want me to
+  draft that comment?
+
+❯ what's the failing check on that PR?
+
+● Two checks failing on #40072, neither is a substantive code/test failure:
+
+  **1. `DCO`** — `ACTION_REQUIRED`. The Developer Certificate of Origin bot — at least one commit on
+  the branch is missing a `Signed-off-by:` trailer. Fixed by the author with `git commit --amend -s`
+  (or `git rebase --signoff`) and a force-push. Pure contributor-onboarding paperwork; no code
+  change.
+
+  **2. `pre-run-check`** (workflow: `pre-commit`) — `FAILURE` at the **"Check PR label and author
+  merge count"** step, which fails in 1 second. That's vLLM's gating workflow for first-time /
+  low-merge-count contributors: PRs from authors with few prior merges to the repo require a
+  maintainer to label the PR with something like `ready` (or whatever vLLM uses for "OK to run full
+  CI") before the heavy CI lanes spin up. `ianliuy` is presumably a first-time contributor (the
+  author handle doesn't appear elsewhere in the vLLM commit history I can see from this PR's
+  context), so the gate blocks until a maintainer labels it.
+
+  **What this means.** The "failing checks" are not about the code — they're "needs DCO sign-off"
+  and "needs maintainer to label as runnable." The actual unit-test suite, lint, and integration
+  tests **have not even attempted to run** on this PR. That's also why "no human review in 5 weeks"
+  — the gate keeps the PR off the maintainer radar; no automated lane fires, no review request bot
+  pings, the PR just sits there.
+
+  This is itself another reason a comment on **#39996** (the issue) bumping the PR with an
+  independent repro is worthwhile — it can prompt a maintainer to triage, label, and unblock CI,
+  which then lets the unit tests actually run and demonstrate the fix works. The substantive review
+  concerns I raised (the `>=` off-by-one, the missing log warning on the WAITING path) are easy
+  author follow-ups *once* the PR is actually being looked at.
+
+❯ draft the comment for #39996
+
+● Here's a draft. I'll show it for your review before posting anything.
+
+  ---
+
+  > ### Third independent repro — same model, same cap, same assertion
+  >
+  > We hit this on **2026-05-19 21:28 UTC** running the same model
+  (`mistralai/Voxtral-Mini-4B-Realtime-2602`) on an RTX 3090 with `--max-model-len 16384`, in a live
+  phone-call transcription pipeline (continuous PCM-over-WS to `/v1/realtime`, one session per call
+  direction). The assertion text matched yours byte-for-byte:
+  >
+  > ```
+  > AssertionError: Sampled token IDs exceed the max model length.
+  > Total number of tokens: 16385 > max_model_len: 16384
+  > ```
+  >
+  > ...originating at the same `gpu_model_runner.py:_bookkeeping_sync` site, taking the EngineCore
+  down and shutting APIServer cleanly. Same end-state from the client side: WS closes with no error
+  frame, `:8000/health` returns 000, GPU goes idle, full restart required.
+  >
+  > **Pre-crash signature also reproduces.** Per-step generation throughput dropped from ~21 tok/s
+  early-session to ~11–14 tok/s in the run-up to the cap, while GPU KV cache usage stayed flat at
+  ~31.8% throughout — confirming the cap is a pure sequence-length limit (O(n) attention per step on
+  a monotonically-growing seq), not a memory-pressure failure. Visible at the client as
+  steadily-accumulating lag in the minutes before the crash.
+  >
+  > **#40072 looks like the right shape of fix.** Patching the scheduler so the overflow request is
+  never scheduled (`_handle_stopped_request`, `add_request`, and reinstating the `max_model_len`
+  clamp on the WAITING path that the RUNNING path already has) addresses the structural cause;
+  #38483's `_bookkeeping_sync` patch catches it too late and the gemini-bot's "hangs forever"
+  critique on that PR looks correct. #40072 is currently sitting behind the first-time-contributor
+  `pre-run-check` gate with no maintainer label — would be useful to get it unblocked so the test
+  suite can actually run.
+  >
+  > **Client-side mitigation for anyone who needs to ship before #40072 lands.** We worked around it
+  with Silero-VAD-driven per-stream WS auto-recycle: a watcher fires a clean session reset whenever
+  silence ≥ 800 ms AND nothing is in-flight AND session age ≥ 10 s, with a 1100 s backstop for the
+  never-pauses case. Phone-call sides are mostly silent individually, so each side recycles at every
+  natural pause and the 16384-token cap is effectively unreachable. Cost: ~0.3 ms per 32 ms VAD
+  frame on CPU (~1% of real-time per stream); ~300 ms audio gap during reconnect. The
+  Voxtral-Realtime model card itself recommends `≥45000` for a 1-hour meeting and defaults to
+  131072, which is the deeper tell that the realtime session is one monotonically-growing sequence
+  rather than a rolling window — auto-recycle is a substitute for the rolling-window semantics that
+  aren't actually there.
+  >
+  > Code: [`asr-tui.py` recycle path at commit
+  `9a361ee`](https://github.com/BrentBaccala/asr/blob/main/asr-tui.py) — search for
+  `recycle_watcher`. The VAD-driven scheme silently disables if `silero-vad` / `onnxruntime` aren't
+  installed, so it's a no-op for anyone not using it.
+  >
+  > ---
+  > *This comment was researched and written by an AI assistant (Claude) on behalf of Brent Baccala
+  (cosine@freesoft.org), based on hitting the bug live in a phone-call ASR pipeline and reading PRs
+  #38483 and #40072 against the issue.*
+
+  ---
+
+  A few things to confirm before I post:
+
+  1. **Pre-crash throughput numbers** (~21 → ~11–14 tok/s, KV at 31.8%) come from the
+  `voxtral-maxmodellen-ceiling` memory file from session `872162d1` — let me know if you want me to
+  re-verify them against the original log before posting, or if you remember them differently.
+  2. **Repo link.** I'm linking the file at `BrentBaccala/asr`, branch `main`, commit `9a361ee`. The
+  repo's been public since this past week per memory — confirm that's still the public-facing URL
+  you want surfaced.
+  3. **Tone re: PR #38483.** I called out the bot's "hangs forever" critique. That's accurate but
+  lightly critical of `machov`'s patch. If you'd rather just point at #40072 without comparing, easy
+  to soften.
+  4. **Anything to add or cut?** Could trim the workaround section if you want it tighter — three
+  paragraphs is on the long side for an issue comment, but the workaround is the part that helps
+  other affected users right now.
+
+  Want me to post as-is, revise, or hold?
+
+❯ before "#40072 looks like the right shape of fix", add an explanation that we've got two PRs that
+  address the same issue (we don't have that now, right?)
+
+  to "Client-side mitigation", note that our mitigation address a separate issue - the response
+  speed degrades with longer context sizes, and nothing in these issues/PRs do anything to address
+  that
+
+  re-draft and show me again
+
+● Updated draft:
+
+  ---
+
+  > ### Third independent repro — same model, same cap, same assertion
+  >
+  > We hit this on **2026-05-19 21:28 UTC** running the same model
+  (`mistralai/Voxtral-Mini-4B-Realtime-2602`) on an RTX 3090 with `--max-model-len 16384`, in a live
+  phone-call transcription pipeline (continuous PCM-over-WS to `/v1/realtime`, one session per call
+  direction). The assertion text matched yours byte-for-byte:
+  >
+  > ```
+  > AssertionError: Sampled token IDs exceed the max model length.
+  > Total number of tokens: 16385 > max_model_len: 16384
+  > ```
+  >
+  > ...originating at the same `gpu_model_runner.py:_bookkeeping_sync` site, taking the EngineCore
+  down and shutting APIServer cleanly. Same end-state from the client side: WS closes with no error
+  frame, `:8000/health` returns 000, GPU goes idle, full restart required.
+  >
+  > **Pre-crash signature also reproduces.** Per-step generation throughput dropped from ~21 tok/s
+  early-session to ~11–14 tok/s in the run-up to the cap, while GPU KV cache usage stayed flat at
+  ~31.8% throughout — confirming the cap is a pure sequence-length limit (O(n) attention per step on
+  a monotonically-growing seq), not a memory-pressure failure. Visible at the client as
+  steadily-accumulating lag in the minutes before the crash.
+  >
+  > **There are currently two open PRs trying to fix this — #38483 and #40072 — and the choice
+  between them is non-obvious for a drive-by reader, so it's worth spelling out.** They patch
+  different layers:
+  >
+  > - **#38483** replaces the assertion in `gpu_model_runner.py:_bookkeeping_sync` with a branch
+  that adds the overflowing request to `invalid_req_indices` and clears its sampled tokens. The
+  `gemini-code-assist` review on that PR flagged a real problem the author hasn't responded to:
+  clearing the tokens means no terminating token is ever appended, so the `FINISHED_LENGTH_CAPPED`
+  path never fires and the request hangs indefinitely instead of completing with
+  `finish_reason="length"`. The engine no longer crashes, but the WS hangs — arguably worse than the
+  original bug, since the client doesn't even get a reconnect signal.
+  > - **#40072** patches `vllm/v1/core/sched/scheduler.py` at three sites
+  (`_handle_stopped_request`, `add_request`, and the WAITING-path scheduling loop) so the overflow
+  request is never scheduled in the first place. It correctly identifies that the WAITING path is
+  missing the `max_model_len` clamp that the RUNNING path already has, and ships real unit tests
+  including a regression test for head-of-line blocking.
+  >
+  > **#40072 is the structurally right fix** — it addresses the cause (scheduler doesn't account for
+  monotonic encoder-token accumulation in streaming sessions) rather than the symptom in the model
+  runner. #40072 is currently sitting behind the first-time-contributor `pre-run-check` gate with no
+  maintainer label, which is why the real test suite hasn't run on it. Would be useful to get it
+  unblocked.
+  >
+  > **Client-side mitigation for anyone who needs to ship now — and a separate issue neither PR
+  addresses.** We worked around the crash with Silero-VAD-driven per-stream WS auto-recycle: a
+  watcher fires a clean session reset whenever silence ≥ 800 ms AND nothing is in-flight AND session
+  age ≥ 10 s, with a 1100 s backstop for the never-pauses case. Phone-call sides are mostly silent
+  individually, so each side recycles at every natural pause and the 16384-token cap is effectively
+  unreachable. Cost: ~0.3 ms per 32 ms VAD frame on CPU (~1% of real-time per stream); ~300 ms audio
+  gap during reconnect.
+  >
+  > Worth flagging: **the auto-recycle also addresses something neither PR fixes — the pre-crash
+  throughput degradation.** Both PRs gracefully terminate a session that has reached
+  `max_model_len`, but neither does anything about generation speed halving (~21 → ~11–14 tok/s)
+  over the minutes leading up to the cap. That slowdown is inherent to per-step attention being O(n)
+  on a monotonically-growing sequence, and it produces visible lag and degraded interactive
+  responsiveness well before the crash threshold. Recycling sessions at natural silences keeps each
+  session short enough that per-step attention cost stays in the fast regime, so the recycle scheme
+  is worth keeping even after #40072 (or whatever lands) ships — it's solving
+  response-latency-vs-context-length, not just crash-vs-no-crash. The Voxtral-Realtime model card
+  itself recommends `≥45000` for a 1-hour meeting and defaults to 131072, which is the deeper tell
+  that the realtime session is one monotonically-growing sequence rather than a rolling window —
+  bumping the cap doesn't help the slowdown, it just defers it.
+  >
+  > Code: [`asr-tui.py` at
+  `BrentBaccala/asr`](https://github.com/BrentBaccala/asr/blob/main/asr-tui.py) — search for
+  `recycle_watcher`. Silently disables if `silero-vad` / `onnxruntime` aren't installed, so it's a
+  no-op for anyone not using it.
+  >
+  > ---
+  > *This comment was researched and written by an AI assistant (Claude) on behalf of Brent Baccala
+  (cosine@freesoft.org), based on hitting the bug live in a phone-call ASR pipeline and reading PRs
+  #38483 and #40072 against the issue.*
+
+  ---
+
+  Changes from the prior draft:
+
+  1. **New "There are currently two open PRs..." paragraph** before the verdict, naming both PRs and
+  explaining what each does and why one is better than the other. The previous draft only mentioned
+  #38483 in passing inside the verdict; this is now an explicit comparison.
+  2. **Client-side mitigation section split into two paragraphs**: the first explains the
+  crash-mitigation use; the second explicitly flags that the auto-recycle *also* addresses the
+  pre-crash response-latency degradation, which neither PR fixes (and which a larger
+  `--max-model-len` doesn't fix either, just defers).
+  3. **The mention of the model card's recommended `≥45000`** moved into the second mitigation
+  paragraph since it now reinforces the "bumping the cap doesn't fix the slowdown" point, rather
+  than being a standalone aside.
+
+  Same three open questions as before still apply (the throughput numbers from the prior session's
+  memory file, the repo URL, the tone on #38483). Anything else to revise?
+
+❯ post it
+
+● Posted: https://github.com/vllm-project/vllm/issues/39996#issuecomment-4501076797
+
+❯ draft a comment on #40072 to nudge the maintainers.  include your two recommendations
+
+● Quick correction before drafting: re-checking the diff, my "off-by-one in the `>=` check"
+  observation was wrong. The PR's `request.num_tokens >= max_model_len` is correct — at exactly
+  `max_model_len`, the next sampling step necessarily produces `end_idx = max_model_len + 1` which
+  trips the assertion, so finishing at `==` is right (no token of legitimate capacity is shaved). I
+  conflated "the assertion passes at `end_idx == max_model_len`" with "more tokens can still be
+  added at `num_tokens == max_model_len`," which isn't the same thing.
+
+  So the two recommendations are:
+
+  1. **`logger.warning` consistency** — the new `_handle_stopped_request` and `add_request` paths
+  both log a warning when length-capping fires; the WAITING-loop `finish_requests` path doesn't.
+  Easy consistency fix.
+  2. **Scope clarification** — the PR description should note that this fixes the *crash*, not the
+  *pre-crash throughput degradation* (per-step attention being O(n) on a monotonically-growing seq).
+  Users with long-running sessions will still see generation speed halve over the minutes before the
+  cap. That's a real downstream pain point not addressed here, and worth flagging so users know the
+  fix doesn't end all "long session" concerns.
+
+  Draft:
+
+  ---
+
+  > Bumping this PR — it's been sitting at `REVIEW_REQUIRED` for ~5 weeks behind the
+  first-time-contributor `pre-run-check` gate, with no maintainer label to unblock CI. A maintainer
+  label would let the real test suite run on it and probably move things forward.
+  >
+  > For context on triage priority: this PR fixes a bug with multiple independent reports of the
+  same crash signature on `Voxtral-Mini-4B-Realtime-2602` at `--max-model-len 16384` — I posted a
+  third repro on #39996 ([comment
+  link](https://github.com/vllm-project/vllm/issues/39996#issuecomment-4501076797)) from a
+  phone-call transcription pipeline hitting the bug live on 2026-05-19. The related PR #38483
+  patches the symptom at the wrong layer (its `gemini-code-assist` review caught a hangs-forever
+  flaw that hasn't been addressed), so #40072 is currently the only viable path to a real fix.
+  >
+  > Substantive read of the diff: the three-site approach in `scheduler.py` is the structurally
+  right shape — patching the cause (scheduler doesn't account for monotonic encoder-token
+  accumulation in streaming sessions) rather than the assertion site in `gpu_model_runner.py`. The
+  identification that the WAITING path is missing the `max_model_len` clamp that the RUNNING path
+  already has is clean. Real unit tests, including the regression for head-of-line blocking, look
+  good. The `gemini-code-assist` review's `break`-vs-`continue` concern is already addressed in the
+  current diff.
+  >
+  > Two minor follow-ups that would be nice but aren't blockers:
+  >
+  > 1. **Add a `logger.warning` on the WAITING-loop `finish_requests` path** for consistency. The
+  two streaming-update sites (`_handle_stopped_request`, `add_request`) both log with the request ID
+  and the over-cap token count, which is useful for diagnosing "where did my session go" in
+  production. The WAITING-loop path currently length-caps silently. Same one-line warning pattern
+  would round it out.
+  >
+  > 2. **Scope note in the PR description**: it would be worth clarifying that this fixes the crash
+  but not the pre-crash response-latency degradation. Per-step generation throughput halves (~21 →
+  ~11–14 tok/s in the reports on #39996) over the minutes leading up to the cap, which is inherent
+  to attention being O(n) per step on a monotonically-growing sequence and isn't addressed by
+  gracefully terminating at the cap. Users with truly long-running sessions will still want a
+  client-side recycle / windowing strategy on top of this fix; a sentence in the PR description to
+  that effect would set expectations and steer affected users toward the right mental model. (This
+  isn't a critique of the fix's scope — terminating gracefully is exactly what the PR should do —
+  just a documentation suggestion so the next user reading this thread doesn't think the fix solves
+  their lag problem.)
+  >
+  > Happy to help with either if useful.
+  >
+  > ---
+  > *This comment was researched and written by an AI assistant (Claude) on behalf of Brent Baccala
+  (cosine@freesoft.org), based on hitting the underlying bug live in a phone-call ASR pipeline and a
+  close read of the diff against the issue.*
+
+  ---
+
+  Post as-is, revise, or hold? Couple of things you might want to tweak:
+
+  - The opening "Bumping this PR" is direct but possibly too blunt for a first comment from a
+  stranger; could soften to "Wanted to flag this PR for maintainer attention."
+  - The reference to PR #38483 being at "the wrong layer" repeats what I already said on #39996 —
+  could trim since maintainers reading both will see it twice. But it does usefully frame why #40072
+  should be the one to land.
+  - "Happy to help with either if useful" — could drop if you'd rather not volunteer.
+
+❯ what other verbs could we use other than "bumping"
+
+● Options, roughly in order of how well they fit a public PR-comment register:
+
+  - **Flagging** — "Flagging this PR for maintainer attention." Common in PR/issue culture,
+  professional, slightly more formal than bumping. My pick.
+  - **Surfacing** — "Surfacing this PR for maintainer attention." Conveys "bringing into visibility"
+  rather than "asking you to look again." Reads as helpful rather than impatient.
+  - **Nudging** — "Nudging on this PR." Friendly, gentle, possibly the closest in tone to "bumping"
+  without the slight whiff of stale-thread complaint.
+  - **Pinging** — "Pinging the maintainers on this PR." Casual dev-speak, fine in chat but slightly
+  informal for a first public comment from a stranger.
+  - **Highlighting** / **Calling attention to** — More verbose, work but feel a touch corporate.
+
+  "Bumping" specifically carries a connotation in forum/issue culture of "this has been ignored,
+  please look" — which is technically what we mean, but is also the verb most likely to read as
+  mildly impatient or entitled coming from someone who isn't the PR author. "Flagging" or
+  "Surfacing" remove that connotation while keeping the action clear. "Nudging" softens further.
+
+  Want me to go with **flagging**, or pick a different one?
+
+❯ i like "pinging" - just "Pinging this PR..."
+
+● Posted: https://github.com/vllm-project/vllm/pull/40072#issuecomment-4501128777
+
+❯ now, one minor quibble - in the first comment, you wrote "We hit this on 2026-05-19 21:28 UTC".
+  was it UTC or EDT?
+
+● You're right — that was EDT, not UTC. Local timezone is `America/New_York`; the memory timestamp
+  `2026-05-19 21:28` was unqualified, almost certainly logged from the local clock. In UTC, that's
+  `2026-05-20 01:28`. I wrote "UTC" wrongly in the #39996 comment.
+
+  Let me fix it.
+
+❯ [Request interrupted by user]
+
+❯ have you changed it yet?
+
+● Yes — the PATCH went through at 2026-05-20T17:59:18Z. Let me verify the body reads correctly now.
+
+● Confirmed — the live comment now reads **"2026-05-19 21:28 EDT (2026-05-20 01:28 UTC)"**, giving
+  both the local time (as originally recorded) and the UTC equivalent for international readers.
+  https://github.com/vllm-project/vllm/issues/39996#issuecomment-4501076797
+
+  I should also fix the memory file so future-me records the timezone correctly going forward.
+
+● Done — public comment fixed, and the memory file's timestamp now carries both timezones so this
+  doesn't bite next time.
+
+❯ just drop the UTC is parens - I see it as clutter
+
+● Done. Comment now reads just **"2026-05-19 21:28 EDT"**, both on GitHub and in the memory file.
+
+❯ good work!
+  /end
+
+❯ Base directory for this skill: /home/claude/.claude/skills/end
+
+  # end — closing ritual: report + compaction + KG
+
+  Three artifacts, three audiences:
+
+  | Artifact | Audience | Path |
+  |----------|----------|------|
+  | Findings report | The human (Brent) | `~/project/reports/<slug>.md` |
+  | Compaction summary | A future Claude picking the session back up |
+  `~/project/compactions/session-<ID>.md` |
+  | Knowledge-graph entry | The LightRAG search engine |
+  `~/lightrag-history/incoming/session-<ID>.json` |
+
+  The compaction and KG file are named by session ID, so re-running
+  `end` in the same session lands on the same paths — useful both for
+  detecting re-runs (common when the user keeps adding work after an
+  earlier `/end`) and for keeping each session's debrief in one place.
+
+  **Session ID format.** `<ID>` is normally the 36-char session UUID,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21`. When `end` runs inside
+  a task-runner subagent, the subagent's JSONL lives at
+  `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` and the
+  session ID becomes the **composite** `<parent-UUID>-<aid>` (54 chars,
+  e.g. `72f1d8c2-18c8-4deb-9f3e-11a49f361f21-a03e8c071b2ad7f97`). Each
+  subagent run thus gets its own compaction; multiple subagents under
+  the same parent don't collide. Detection is automatic — see Step 1
+  of the first-run workflow.
+
+  Three sibling docs in this skill directory hold the per-artifact
+  detail; read each when the workflow below tells you to:
+
+  - `REPORT.md` — structure and style for the findings report.
+  - `COMPACT.md` — the compaction file's two-part layout.
+  - `COMPACT_PROMPT.md` — the `<analysis>` + `<summary>` template
+    for the compaction's second half.
+  - `KG.md` — extraction refinements on top of
+    `~/lightrag-history/EXTRACT_PROMPT.md`.
+
+  ## First run vs re-run
+
+  This skill is idempotent within a session. On a first invocation it
+  produces three artifacts; on a re-run (the user kept working after
+  an earlier `/end`) it UPDATES those artifacts rather than producing
+  duplicates.
+
+  **Detect the case before doing anything else:**
+
+  - If you remember invoking `/end` earlier in the same conversation,
+    this is a **re-run**. You already know the session UUID — skip
+    the marker dance and proceed to "Re-run procedure" below.
+  - If you're not sure (context was compacted, this is a continuation
+    session), look for a compaction file with a recent mtime:
+    ```bash
+    find ~/project/compactions -name 'session-*.md' -mmin -120 -printf '%T+ %f\n'
+    ```
+    If exactly one matches, use its UUID. If multiple match (rare,
+    only when concurrent sessions overlap) or zero match, fall back
+    to the first-run workflow's marker dance.
+  - Otherwise this is a **first run**; follow "First-run workflow"
+    below.
+
+  ## Re-run procedure
+
+  You're updating, not creating. The hard part is enumerating what's
+  new since the last `/end`; the file IO that follows is mechanical.
+
+  ### Step 1 — verify the session ID hasn't changed
+
+  For a top-level (36-char UUID) session:
+  ```bash
+  find ~/.claude/projects/ -maxdepth 2 -name "<ID>.jsonl" -print -quit
+  ```
+
+  For a subagent composite ID (`<parent>-<aid>`, 54 chars), the live
+  JSONL is under `~/.claude/projects/` (the backup under
+  `~/project/sessions/subagents/` only exists post-`--complete`, so
+  check both):
+  ```bash
+  parent=${ID:0:36}; aid=${ID:37}
+  { test -f ~/.claude/projects/*/${parent}/subagents/agent-${aid}.jsonl \
+    || test -f ~/project/sessions/subagents/${parent}/agent-${aid}.jsonl; } \
+    && echo same-session
+  ```
+
+  If the file exists, you're still in the same session and the ID is
+  good. If it doesn't (rare — session was migrated), fall back to the
+  first-run workflow's marker dance to derive the new ID, then proceed.
+
+  ### Step 2 — read the existing compaction
+
+  Path: `~/project/compactions/session-<ID>.md`. Pull two things
+  out:
+
+  - **Reports written.** The progress-report half should list the
+    report file(s) the previous `/end` produced. Could be one;
+    could be several (sessions can split into focused reports —
+    e.g. `pony-bringup.md` + `lightrag-dual-backend-design.md` on
+    the same session). Note all of them; each gets updated below.
+  - **Boundary.** The compaction's `<analysis>` block stops at some
+    point in the conversation. Anything past that point is "new
+    work" to fold in.
+
+  ### Step 3 — enumerate the new work
+
+  Hold the list in your head before touching files. Ask:
+
+  - What did the user ask for since the last `/end`?
+  - What did you build, decide, measure, or discover?
+  - Which files were edited or created?
+  - Which commits landed in which repos?
+  - Which previous "open items" or "known gaps" got resolved?
+  - Were there corrections to the previous `/end`'s claims —
+    anything that turned out to be wrong and should be set right?
+
+  ### Step 4 — update each existing report in-place
+
+  Per `REPORT.md`'s "Re-running in the same session" rule. Fold new
+  material into the right Findings / Recommendations / Known Gaps
+  subsections; expand the Summary if the bottom line shifted; mark
+  resolved gaps as resolved; do **not** tack on "Update since last
+  run" sections — keep the report structure coherent so a fresh
+  reader sees one document, not a diary.
+
+  If new work covers a topic that doesn't fit any existing report,
+  write a **new** report rather than cramming it into a
+  near-relevant one. Add the new path to the list you'll report at
+  the end.
+
+  ### Step 5 — overwrite the compaction cumulatively
+
+  Per `COMPACT.md`'s re-run rule. The reader is a future Claude; they
+  only need the latest snapshot covering the whole session through
+  now, not a diff log.
+
+  ### Step 6 — update the KG
+
+  If still in `~/lightrag-history/incoming/`, overwrite — the drain
+  hasn't run yet, so no LightRAG state has been touched. If already
+  in `processed/` (drain ran), follow `KG.md`'s post-drain
+  delta-style rule.
+
+  **Coverage check** still applies (same as first-run): re-read the
+  just-updated compaction's `<analysis>` block and confirm
+  enumeration parity with the KG. If the new work added 5 substantive
+  concepts to the analysis but the KG only grew by 1 entity, you've
+  under-extracted.
+
+  ### Step 7 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: re-run update — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 8 — report the paths
+
+  One line per report (could be 1, could be 3+ for multi-report
+  sessions), one for the compaction, one for the KG. Nothing else.
+
+  ---
+
+  ## First-run workflow
+
+  The session ID is needed for the compaction and KG filenames but
+  not for the report's filename. So:
+
+  1. Kick off session-ID detection in the background.
+  2. Write the report (no session ID needed for the path; use a
+     placeholder for the `**Session:**` line).
+  3. Wait for the session ID to arrive (if it hasn't already).
+  4. Use the session ID to write the compaction and KG files.
+  5. Backfill the placeholder in the report.
+
+  ### Step 1 — kick off session-ID detection (background)
+
+  The session ID isn't an env var. Detection works by emitting a
+  random marker, waiting for it to flush to a `.jsonl` file, then
+  grepping the session directories to find the match. The flush takes
+  a few seconds, so do it in background.
+
+  Subagents log to a different place than top-level sessions, and the
+  poller must hit the location Claude Code writes **in real time**
+  (while this skill is still running inside the subagent), not a
+  backup copy that only appears after the subagent exits:
+
+  - **Top-level sessions** flush to
+    `~/.claude/projects/<bucket>/<UUID>.jsonl` (depth 2 under
+    `~/.claude/projects/`). The ID is the basename.
+  - **Task-runner subagents** flush, in real time, to
+    `~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl`
+    (depth 4 under `~/.claude/projects/`). The ID is the composite
+    `<parent>-<aid>`. Note the `<parent>` directory is *above*
+    `subagents/`. A backup hardlink at
+    `~/project/sessions/subagents/<parent>/agent-<aid>.jsonl` is
+    created by `task_runner.py --complete` — but that runs only
+    *after* the subagent exits, so it does **not** exist yet while
+    `end` is running. The poller must therefore search the live
+    `~/.claude/projects/` tree, not the backup tree.
+
+  ```bash
+  # Foreground: emit marker
+  marker="SID_$(openssl rand -hex 8)"; echo "$marker"
+  ```
+
+  Then launch the poller via Bash with `run_in_background: true`
+  (replacing `<MARKER>` with the value just emitted):
+
+  ```bash
+  until path=$( { \
+          find ~/.claude/projects/ -maxdepth 4 -name '*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+          find ~/project/sessions/subagents/ -maxdepth 2 -name 'agent-*.jsonl' -mmin -2 \
+               -exec grep -l "<MARKER>" {} + 2>/dev/null; \
+        } | head -1); \
+        [ -n "$path" ]; do sleep 2; done
+  # Translate path to session ID. Three possible shapes:
+  #   ~/.claude/projects/<bucket>/<parent>/subagents/agent-<aid>.jsonl  (live subagent — parent
+  ABOVE subagents/)
+  #   ~/project/sessions/subagents/<parent>/agent-<aid>.jsonl           (post-complete backup —
+  parent BELOW subagents/)
+  #   ~/.claude/projects/<bucket>/<UUID>.jsonl                          (top-level session)
+  case "$path" in
+    */subagents/agent-*.jsonl)            # live subagent: <parent>/subagents/agent-<aid>.jsonl
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      parent=$(basename "$(dirname "$(dirname "$path")")")
+      echo "${parent}-${aid}" ;;
+    */subagents/*/agent-*.jsonl)          # backup hardlink: subagents/<parent>/agent-<aid>.jsonl
+      parent=$(basename "$(dirname "$path")")
+      aid=$(basename "$path" .jsonl); aid=${aid#agent-}
+      echo "${parent}-${aid}" ;;
+    *) basename "$path" .jsonl ;;
+  esac
+  ```
+
+  The bash run ID lets you check the output later via `BashOutput`.
+
+  **Why this layout matters.** The marker the subagent emits is
+  written only to the subagent's own JSONL — the live one under
+  `~/.claude/projects/<bucket>/<parent>/subagents/`, four levels deep.
+  An earlier version of this poller capped the first `find` at
+  `-maxdepth 2` (so it never reached depth-4 subagent files) and
+  relied on the second `find` over `~/project/sessions/subagents/`
+  for subagents. But that backup tree is populated by
+  `--complete` *after* the subagent exits, so during the `end` run it
+  is empty: the poller timed out and the agent fell back to "find the
+  recently-touched top-level JSONL" — which yielded the *parent
+  session's* UUID, not the subagent's own identity, collapsing
+  multiple subagents under one parent into the same compaction
+  filename. Searching `~/.claude/projects/` to `-maxdepth 4` reaches
+  the live subagent JSONL and yields the correct composite ID, giving
+  each subagent its own compaction. The two `case` arms disambiguate
+  the live layout (`<parent>/subagents/agent-*.jsonl`, parent above)
+  from the backup layout (`subagents/<parent>/agent-*.jsonl`, parent
+  below); the backup `find` is kept as a harmless fallback for re-runs
+  that happen after `--complete`.
+
+  ### Step 2 — write the report
+
+  Follow `REPORT.md` (in this skill directory) for the structure and
+  style rules. Pick a `<slug>` for the file (`<topic>-report.md`,
+  `<topic>-analysis.md`, etc.). Write to `~/project/reports/<slug>.md`.
+
+  If a report was already written earlier in this session (the
+  findings doc the task was set up to produce), skip the report
+  and go straight to step 3.
+
+  **Re-run detection.** If `~/project/reports/<slug>.md` already
+  exists, follow `REPORT.md`'s "Re-running in the same session" rule
+  — update the existing report rather than overwrite it. Verifying
+  the match needs the session ID, so in this case wait for step 3 to
+  complete before writing. (For the common fresh-report case, you can
+  write immediately; just use `_(pending)_` for the `**Session:**`
+  header line and backfill in step 5.)
+
+  ### Step 3 — collect the session ID
+
+  Read the bash run's output (`BashOutput`). If the loop has exited,
+  you'll see the UUID; if it hasn't, wait briefly and check again.
+  Don't proceed past this step without a session ID.
+
+  ### Step 4 — write the compaction and KG files
+
+  #### Compaction summary (for a future Claude)
+
+  Path: `~/project/compactions/session-<ID>.md`. Structure and content
+  per `COMPACT.md` (in this skill directory) — progress-report half
+  on top, `---`, then the `<analysis>` + `<summary>` blocks following
+  `COMPACT_PROMPT.md` (also in this directory).
+
+  If the file already exists, this is a re-run — overwrite with a
+  cumulative summary covering the whole session through now (the
+  reader is a future Claude; they only need the latest snapshot).
+
+  You don't need to list the user's instructions verbatim — the full
+  transcript is retrievable from the task runner or the session jsonl
+  when needed. Capture the *essence* in section 1 of the compaction.
+
+  #### Knowledge-graph entry (for the search engine)
+
+  Path: `~/lightrag-history/incoming/session-<ID>.json`. Schema and
+  per-field guidance per `~/lightrag-history/EXTRACT_PROMPT.md` (the
+  canonical spec). Density and entity-type refinements per `KG.md`
+  (in this skill directory) — tightens the bare EXTRACT_PROMPT
+  defaults to encourage richer extraction (calibrate against the
+  compaction's analysis block; include when hesitating; soft entity
+  types like `pattern`, `failure-mode`, `constraint`, `gotcha` are
+  first-class). Re-run handling per `KG.md`'s "Re-extracting in the
+  same session" section — overwrite if still in `incoming/`,
+  delta-style if already drained.
+
+  **Coverage check before reporting paths.** Read the compaction
+  `<analysis>` block you wrote in the previous sub-step. For each
+  substantive technical concept named there (machines, files,
+  patterns, decisions, failure modes, constraints, reports, …),
+  confirm there's an entity for it in the KG. For each pair of
+  concepts the session explicitly connected, confirm there's an
+  edge. If you find gaps, add them before moving on. The failure
+  mode this catches is "wrote a 22-concept compaction, then a
+  7-entity KG" — where the compaction faithfully recorded the
+  session but the KG silently lost most of the searchable material.
+  Enumeration mismatch is the signal; numeric thresholds are not
+  required.
+
+  ### Step 5 — backfill the report's session ID
+
+  If you wrote the report fresh in step 2 with a `_(pending)_`
+  placeholder, edit `~/project/reports/<slug>.md` to replace it with
+  the real `<ID>` (either a 36-char UUID for top-level sessions or
+  the 54-char composite for subagents). Skip this step if the report
+  was an in-place update (re-run case — already has the real ID) or
+  was skipped entirely (a report was already written earlier in the
+  session).
+
+  ### Step 6 — commit the `~/project` changes
+
+  The report(s) and compaction live in `~/project`; commit them so
+  the session's debrief is preserved in git rather than left as
+  loose working-tree edits the user has to chase down later. The KG
+  file lives in `~/lightrag-history` (separate repo) — leave that
+  to the user or a later commit step; this skill only handles
+  `~/project`.
+
+  ```bash
+  cd ~/project && git add docs/<slug>.md [docs/<other-slug>.md ...] \
+                            compactions/session-<ID>.md \
+    && git commit -m "<topic>: report + compaction — session-<ID>"
+  ```
+
+  Use a commit message that names what the session was about — not
+  "end skill artifacts" or similar. For a multi-report session,
+  either summarise the topic shared across reports or list the
+  report slugs in the message.
+
+  ### Step 7 — report what you wrote
+
+  Print the paths — one line per report (usually one; could be more
+  if you split a session into focused reports), one for the
+  compaction, one for the KG. Nothing else.
+
+
+● Starting the closing ritual. Kicking off session-ID detection in the background while I write the
+  report.
+
+● Session ID: `8c6795bf-fbb0-41f8-aef5-3a1f82e4b8cf`. Writing the report.
+
+● Backfilling the session ID and reading the compaction/KG instructions.
+
+● Now writing the KG entry.
+
+● Three artifacts written:
+
+  - **Report:** `~/project/reports/vllm-maxmodellen-upstream-triage.md`
+  - **Compaction:** `~/project/compactions/session-8c6795bf-fbb0-41f8-aef5-3a1f82e4b8cf.md`
+  - **KG:** `~/lightrag-history/incoming/session-8c6795bf-fbb0-41f8-aef5-3a1f82e4b8cf.json`
+
+  Committed to `~/project` as `21a8558`.
+

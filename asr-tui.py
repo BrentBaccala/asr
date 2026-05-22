@@ -11,7 +11,7 @@ translation, in a terminal UI.
             --channels=1 - | ~/asr/asr-tui.py          # the TUI
   ... | ~/asr/asr-tui.py --plain                        # headless log
 
-  # dual-stream (script owns both taps — [Remote]/[Me] labelled):
+  # dual-stream (script owns both taps — [Remote]/[Local] labelled):
   ~/asr/asr-tui.py --dual                                # the TUI
   ~/asr/asr-tui.py --dual --plain                        # headless log
 
@@ -21,11 +21,11 @@ distilled-600M int8 (CTranslate2, CPU) for English.
 
 In --dual mode the script spawns two pw-record subprocesses on the two
 canonical PipeWire source names (rtp_call_remote_source = Remote,
-rtp_call_me_source = Me, as in asr-call-transcribe) and runs two
+rtp_call_me_source = Local, as in asr-call-transcribe) and runs two
 independent Voxtral /v1/realtime WS sessions concurrently. Each stream
 keeps its own in-progress ES/EN; finalized pairs interleave in one
 speaker-tagged scrolling history. The live region shows BOTH streams
-stacked ([Remote] then [Me]), always present and refining
+stacked ([Remote] then [Local]), always present and refining
 independently — no active-speaker switching (a silent channel's
 sporadic deltas must not flip the panel).
 
@@ -81,10 +81,10 @@ FROZEN_CAP = 300
 SAMPLE_RATE = 16000
 
 # Dual-stream sources: (PipeWire node name, label, label ANSI accent).
-# Matches asr-call-transcribe (Remote cyan / Me green).
+# Matches asr-call-transcribe (Remote cyan / Local green).
 DUAL_SOURCES = [
     ("rtp_call_remote_source", "Remote", "1;36"),  # cyan
-    ("rtp_call_me_source",     "Me",     "1;32"),  # green
+    ("rtp_call_me_source",     "Local",  "1;32"),  # green
 ]
 # Single-stream sentinel label (stdin path).
 SOLO = "(solo)"
@@ -107,7 +107,7 @@ ap.add_argument("--beam", type=int, default=1,
 ap.add_argument("--dual", action="store_true",
                 help="dual-stream: the script owns both taps "
                      "(rtp_call_remote_source=Remote, "
-                     "rtp_call_me_source=Me) via two pw-record "
+                     "rtp_call_me_source=Local) via two pw-record "
                      "subprocesses + two Voxtral WS sessions. Without "
                      "this, audio is read from stdin (single stream).")
 ap.add_argument("--mask", type=int, default=MASK_K,
@@ -227,7 +227,7 @@ def _new_stream_state():
         "recycle_count": 0,
         # Wall time of the last audio chunk this stream's _ws_session
         # sent to vLLM. Per-stream so the header can show audio
-        # liveness per channel ('Remote ● Me ●') and surface a
+        # liveness per channel ('Remote ● Local ●') and surface a
         # single-stream pw-record failure.
         "audio_t": 0.0,
     }

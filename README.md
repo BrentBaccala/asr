@@ -5,7 +5,7 @@ A terminal UI (`asr-tui.py`) that transcribes audio in real time using
 transcription into **Spanish and English** with
 **NLLB-200-distilled-600M** (CTranslate2 int8, CPU). Designed for live
 two-channel phone-call transcription with separately-labelled
-`[Remote]` and `[Me]` streams, but the single-stream path works with
+`[Remote]` and `[Local]` streams, but the single-stream path works with
 any local or piped audio source.
 
 Three views per channel render in the live panel:

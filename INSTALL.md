@@ -74,15 +74,34 @@ Takes ~5 minutes. Skip this entirely for transcription-only use.
 ## The fastText language-id model (optional)
 
 Per-sentence source-language detection uses fastText `lid.176`. The
-`fasttext-langdetect` wrapper downloads its own model on first use, so
-nothing extra is needed there. If you instead use raw `fasttext-wheel`,
-fetch the ~917 KB model and point `FASTTEXT_LID_MODEL` at it (or drop it
-at `~/asr/models/lid.176.ftz`):
+`fasttext-langdetect` wrapper downloads its own model (~126 MB) on first
+`detect()` call. If you instead use raw `fasttext-wheel`, fetch the
+~917 KB model and point `FASTTEXT_LID_MODEL` at it (or drop it at
+`~/asr/models/lid.176.ftz`):
 
 ```bash
 curl -L -o ~/asr/models/lid.176.ftz \
     https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
 ```
+
+> **NumPy 2.x caveat (important).** `fasttext-langdetect` pulls
+> `fasttext 0.9.3`, whose `predict()` calls `np.array(obj, copy=False)`
+> — which **raises** `ValueError: Unable to avoid copy…` under NumPy ≥ 2.0
+> (the default in current environments, including this `mt-env`). The
+> install *succeeds* but detection crashes on first use. Patch the three
+> occurrences in the installed `fasttext` to the NumPy-2 idiom:
+>
+> ```bash
+> F=$(~/asr/mt-env/bin/python -c 'import fasttext,os; print(os.path.join(os.path.dirname(fasttext.__file__),"FastText.py"))')
+> sed -i 's/np\.array(\([A-Za-z0-9_]*\), copy=False)/np.asarray(\1)/g' "$F"
+> ```
+>
+> Verify:
+> `~/asr/mt-env/bin/python -c "from ftlangdetect import detect; print(detect(text='hola mundo')['lang'])"`
+> should print `es`. The patch lives in the venv site-package, so
+> **re-apply it after any `fasttext` reinstall** (or pin a
+> NumPy-2-compatible fasttext fork). Without detection, translation
+> still works — it just falls back to `default_src_lang`.
 
 ## vLLM as a systemd user service
 

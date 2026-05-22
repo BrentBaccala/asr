@@ -320,6 +320,26 @@ unit, and recreating the alternative venvs for the reference scripts
 
 ## PipeWire setup for the dual-stream RTP path
 
+[PipeWire](https://pipewire.org/) is the audio (and video) server that
+underpins most current Linux desktops, and its real strength is routing.
+Everything — every application stream, microphone, speaker, Bluetooth
+device — is a node in a graph, and you can connect, split, and re-route
+those nodes arbitrarily, live, while audio is flowing. If you know JACK,
+the low-latency pro-audio server, PipeWire will feel like a natural
+successor: it adopted JACK's graph model (and speaks its protocol), then
+folded PulseAudio's everyday mixing and device handling in on top — to my
+mind, essentially **JACK v3** that also happens to be your ordinary
+desktop sound system.
+
+The useful consequence here is that a node in that graph need not be
+local hardware. PipeWire ships RTP send/receive modules, so any source
+or sink — the monitor of your laptop's speakers, your microphone — can
+be streamed straight out over the network as UDP. That is exactly how
+`freesoft-asr` gets fed in the phone-call setup: a PipeWire laptop taps
+its own audio and dumps it across the LAN to a server (where the GPU
+lives) running the transcriber, so the machine doing the *listening*
+can be nowhere near the machine doing the *transcribing*.
+
 The dual-stream design assumes the two audio channels arrive as
 **RTP streams** from a sender host — e.g. a desktop with a phone
 paired over Bluetooth that taps the analog sink monitor (remote-party

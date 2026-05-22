@@ -88,6 +88,11 @@ DUAL_SOURCES = [
 ]
 # Single-stream sentinel label (stdin path).
 SOLO = "(solo)"
+# Sentinel "speaker" for a non-transcript marker row in `frozen` (e.g.
+# the Ctrl-W "transcript written" notice). Rendered as a single dim
+# line instead of the Live/ES/EN triplet; its chunk_id never matches an
+# incoming chunk, so the translation-backfill path skips it.
+NOTICE = "(notice)"
 
 ap = argparse.ArgumentParser(
     # Auto-appends "(default: ...)" to every option's help line so the
@@ -1103,6 +1108,87 @@ def _clear_history():
             break
 
 
+def _fmt_transcript(frozen, live_snap, dual):
+    """Render a frozen snapshot (+ the in-flight live region) to plain
+    text for the Ctrl-W dump. Mirrors the on-screen Live/ES/EN layout
+    without ANSI; lines are left unwrapped so the saved file is a
+    lossless record (let the reader wrap). `live_snap` is a list of
+    (label, cur_live, cur_es, cur_en)."""
+    def prefixes(spk):
+        head = "" if (spk == SOLO or not dual) else f"[{spk}] "
+        return head + "Live ", head + "ES   ", head + "EN   "
+    def field(val):
+        if val is None:
+            return "⋯"          # pending translation
+        if val == "":
+            return "—"          # marker-split placed content elsewhere
+        return val
+    out = []
+    for spk, raw, es, en, _cid in frozen:
+        if spk == NOTICE:
+            out.append(f"    ── {raw} ──")
+            out.append("")
+            continue
+        lp, ep, ne = prefixes(spk)
+        out.append(lp + raw)
+        out.append(ep + field(es))
+        out.append(ne + field(en))
+        out.append("")
+    live = [(lbl, cl, ce, cen) for lbl, cl, ce, cen in live_snap
+            if cl or ce or cen]
+    if live:
+        out.append("(live, in progress)")
+        for lbl, cl, ce, cen in live:
+            lp, ep, ne = prefixes(lbl)
+            out.append(lp + cl)
+            if ce:
+                out.append(ep + ce)
+            if cen:
+                out.append(ne + cen)
+            out.append("")
+    return "\n".join(out)
+
+
+def _write_transcript():
+    """Ctrl-W: dump the entire running transcript to DDMonYYYY-HHMM.txt
+    in cwd, then drop a notice row into the live transcript marking the
+    write point. Same-minute repeats get a -2/-3 suffix so a second
+    Ctrl-W within the minute doesn't clobber the first."""
+    now = time.localtime()
+    base = time.strftime("%d%b%Y-%H%M", now)
+    path = base + ".txt"
+    n = 2
+    while os.path.exists(path):
+        path = f"{base}-{n}.txt"
+        n += 1
+    dual = STREAMS != [SOLO]
+    with _lock:
+        frozen = list(_state["frozen"])
+        live_snap = [(lbl,
+                      _state["streams"][lbl]["cur_live"],
+                      _state["streams"][lbl]["cur_es"],
+                      _state["streams"][lbl]["cur_en"])
+                     for lbl in STREAMS]
+    header = (f"ASR transcript\n"
+              f"Written: {time.strftime('%d %b %Y %H:%M:%S %Z', now)}\n"
+              + "=" * 50 + "\n\n")
+    body = _fmt_transcript(frozen, live_snap, dual)
+    hhmmss = time.strftime("%H:%M:%S", now)
+    try:
+        with open(path, "w") as f:
+            f.write(header + body + "\n")
+        msg = f"transcript written to {path} at {hhmmss}"
+    except OSError as e:
+        msg = f"transcript write FAILED at {hhmmss}: {e}"
+    # Mark the write point in the running transcript regardless of
+    # outcome (a failed write is worth seeing in-band too).
+    with _lock:
+        cid = _state["next_chunk_id"]
+        _state["next_chunk_id"] += 1
+        _state["frozen"].append((NOTICE, msg, None, None, cid))
+        _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
+
+
 # SGR mouse event:  CSI <  B ; X ; Y  M/m   (M=press, m=release)
 _MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
@@ -1141,6 +1227,10 @@ def input_reader(fd):
             b0 = buf[:1]
             if b0 == b"\x0c":             # Ctrl-L: clear history
                 _clear_history()
+                buf = buf[1:]
+                continue
+            if b0 == b"\x17":             # Ctrl-W: dump transcript to file
+                _write_transcript()
                 buf = buf[1:]
                 continue
             if b0 in (b"q", b"Q"):
@@ -1363,6 +1453,12 @@ def render():
                         for i, ln in enumerate(wrapped)]
             hist = []
             for spk, raw, es, en, _cid in frozen:
+                if spk == NOTICE:
+                    # Dim standalone marker row (Ctrl-W write point).
+                    for ln in wrap("── " + raw + " ──", max(8, cols)):
+                        hist.append(CSI + "2m" + ln + CSI + "0m")
+                    hist.append("")
+                    continue
                 if spk == SOLO:
                     live_tag = live_raw = "Live "
                     es_tag   = es_raw   = "ES   "

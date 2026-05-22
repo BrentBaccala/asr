@@ -55,6 +55,10 @@ ES/EN.
   history pane. Live region keeps updating regardless.
 - **Ctrl-L** clears the history and recycles the WS sessions (frees
   the vLLM KV cache for both streams immediately).
+- **Ctrl-W** writes the entire running transcript to
+  `DDMonYYYY-HHMM.txt` in the current directory (a same-minute repeat
+  gets a `-2`/`-3` suffix) and drops a dim "transcript written …"
+  marker into the history at that point.
 - **VAD-driven auto session recycle** (silero-vad) — each stream's
   WS closes/reopens during natural silences, bounding its session
   length to speaker-continuous-talk-time rather than the call's

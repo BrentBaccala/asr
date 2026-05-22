@@ -1,43 +1,49 @@
 #!/home/cosine/asr/mt-env/bin/python
 """
-asr-tui — live Spanish transcription with an in-place refining English
-translation, in a terminal UI.
+freesoft-asr — live streaming speech recognition with an in-place
+refining inline translation, in a terminal UI.
 
-  ssh cosine@pony
-  export XDG_RUNTIME_DIR=/run/user/$(id -u)
+  # default (no args): transcribe whatever's playing on the default
+  # sink's monitor; transcription only (no translation) unless a
+  # config / flag asks for target languages:
+  freesoft-asr
 
-  # single-stream (stdin pipe — unchanged behaviour):
-  pw-record --target rtp_call_remote_source --format=s16 --rate=16000 \
-            --channels=1 - | ~/asr/asr-tui.py          # the TUI
-  ... | ~/asr/asr-tui.py --plain                        # headless log
+  # single-stream from stdin (any 16 kHz mono S16LE source):
+  pw-record --target SOME_SOURCE --format=s16 --rate=16000 \
+            --channels=1 - | freesoft-asr --source -
+  freesoft-asr --source - --plain                    # headless log
 
-  # dual-stream (script owns both taps — [Remote]/[Local] labelled):
-  ~/asr/asr-tui.py --dual                                # the TUI
-  ~/asr/asr-tui.py --dual --plain                        # headless log
+  # dual-stream preset (the author's RTP phone-call setup —
+  # rtp_call_remote_source=Remote, rtp_call_me_source=Local):
+  freesoft-asr --dual
+  freesoft-asr --dual --plain
 
-Pipeline (unchanged from the headless scripts): audio -> Voxtral-Mini-
-4B-Realtime via the local vLLM /v1/realtime WS (Spanish); NLLB-200-
-distilled-600M int8 (CTranslate2, CPU) for English.
+  # emit a fully-commented default config you can edit:
+  freesoft-asr --write-config
 
-In --dual mode the script spawns two pw-record subprocesses on the two
-canonical PipeWire source names (rtp_call_remote_source = Remote,
-rtp_call_me_source = Local, as in asr-call-transcribe) and runs two
-independent Voxtral /v1/realtime WS sessions concurrently. Each stream
-keeps its own in-progress ES/EN; finalized pairs interleave in one
-speaker-tagged scrolling history. The live region shows BOTH streams
-stacked ([Remote] then [Local]), always present and refining
-independently — no active-speaker switching (a silent channel's
-sporadic deltas must not flip the panel).
+Pipeline: audio -> Voxtral-Mini-4B-Realtime via a vLLM /v1/realtime WS
+(raw transcription, language auto-detected by Voxtral); optionally
+NLLB-200-distilled-600M int8 (CTranslate2, CPU) translates each
+completed sentence into one or more configured target languages. The
+source language of each sentence is auto-detected with fastText
+(lid.176) unless pinned per-stream/globally with src_lang.
 
-What's new vs stream-voxtral-translate.py: the English for the
-*in-progress* sentence is re-translated continuously from the full
-Spanish-so-far (full context -> no fragment garbage) and shown with the
-last few words masked (the unstable tail). It refines in place in a
-fixed pane instead of scrolling, so low-latency EN is possible without
-churn. On sentence end the pair freezes into scrolling history.
+Sources are configurable (config file + CLI). Each source is a stream
+with its own label, accent colour, optional src_lang override, and a
+LIST of target languages (tgt_langs). A stream with no target languages
+is transcription-only. The live region shows every active stream
+stacked, always present and refining independently — no active-speaker
+switching (a silent channel's sporadic deltas must not flip the panel).
 
-Audio is on stdin (single-stream) or owned subprocesses (dual), so the
-TUI renders via ANSI to the terminal (stdout) and never reads stdin for
+Configuration is a TOML file at $XDG_CONFIG_HOME/freesoft-asr/
+config.toml (default ~/.config/freesoft-asr/config.toml), overridable
+with --config PATH. Precedence: built-in defaults < config file < CLI
+flags. `--write-config` emits a commented default config that
+round-trips.
+
+Audio is read from stdin (--source -), the default sink monitor, or
+named PipeWire nodes via owned pw-record subprocesses, so the TUI
+renders via ANSI to the terminal (stdout) and never reads stdin for
 keys; quit with Ctrl-C (terminal is restored).
 """
 import argparse
@@ -56,115 +62,418 @@ import sys
 import termios
 import threading
 import time
+import tomllib
 import tty
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import websockets
-import ctranslate2
 import numpy as np
-from transformers import AutoTokenizer
-try:
-    import torch
-    from silero_vad import load_silero_vad
-    _SILERO_AVAILABLE = True
-except ImportError:
-    _SILERO_AVAILABLE = False
 
-HOST, PORT = "127.0.0.1", 8000
-MODEL = "mistralai/Voxtral-Mini-4B-Realtime-2602"
-NLLB_DIR = os.path.expanduser("~/asr/models/nllb-600m-ct2")
+APP_NAME = "freesoft-asr"
+
 CHUNK = 2048 * 2
 SENT_RE = re.compile(r'(.+?[.!?…]+["»”\'\)\]]*)(?:\s+|$)', re.S)
-MASK_K = 2              # words of the live EN/ES tail to hide (unstable)
+MASK_K = 2              # words of the live translation tail to hide (unstable)
 FROZEN_CAP = 300
 SAMPLE_RATE = 16000
 
-# Dual-stream sources: (PipeWire node name, label, label ANSI accent).
-# Matches asr-call-transcribe (Remote cyan / Local green).
-DUAL_SOURCES = [
-    ("rtp_call_remote_source", "Remote", "1;36"),  # cyan
-    ("rtp_call_me_source",     "Local",  "1;32"),  # green
+# --dual preset: the author's RTP phone-call sources. Expands to two
+# [[source]] streams (Remote cyan / Local green) each translating into
+# Spanish + English — i.e. the historical hardcoded behaviour.
+DUAL_PRESET = [
+    {"target": "rtp_call_remote_source", "label": "Remote",
+     "accent": "1;36", "src_lang": None,
+     "tgt_langs": ["spa_Latn", "eng_Latn"]},          # cyan
+    {"target": "rtp_call_me_source", "label": "Local",
+     "accent": "1;32", "src_lang": None,
+     "tgt_langs": ["spa_Latn", "eng_Latn"]},          # green
 ]
-# Single-stream sentinel label (stdin path).
+# Accent palette auto-assigned to sources that don't set `accent`.
+ACCENT_PALETTE = ["1;36", "1;32", "1;33", "1;35", "1;34", "1;31"]
+# Default sink-monitor capture sentinel (D2): pw-record with
+# stream.capture.sink=true and no explicit --target.
+MONITOR = "monitor"
+# Single-stream sentinel label (used when there's exactly one unlabelled
+# source — render then omits the "[label] " prefix entirely).
 SOLO = "(solo)"
 # Sentinel "speaker" for a non-transcript marker row in `frozen` (e.g.
 # the Ctrl-W "transcript written" notice). Rendered as a single dim
-# line instead of the Live/ES/EN triplet; its chunk_id never matches an
-# incoming chunk, so the translation-backfill path skips it.
+# line instead of the Live/translation rows; its chunk_id never matches
+# an incoming chunk, so the translation-backfill path skips it.
 NOTICE = "(notice)"
 
+# FLORES-200 lang code -> short display label for the translation rows.
+# Anything not listed falls back to the first 2-3 chars of the code,
+# upper-cased (e.g. 'deu_Latn' -> 'DEU' if not mapped).
+LANG_LABEL = {
+    "eng_Latn": "EN", "spa_Latn": "ES", "fra_Latn": "FR",
+    "deu_Latn": "DE", "ita_Latn": "IT", "por_Latn": "PT",
+    "rus_Cyrl": "RU", "zho_Hans": "ZH", "jpn_Jpan": "JA",
+    "kor_Hang": "KO", "ara_Arab": "AR", "nld_Latn": "NL",
+    "pol_Latn": "PL", "tur_Latn": "TR", "vie_Latn": "VI",
+    "hin_Deva": "HI", "ukr_Cyrl": "UK", "cat_Latn": "CA",
+}
+# Translation-row body colours, cycled across a stream's targets.
+ROW_COLORS = ["33", "36", "35", "32", "34", "31"]   # ANSI SGR codes
+
+# fastText (lid.176) two-letter ISO code -> the FLORES-200 NLLB code we
+# set as the tokenizer src_lang. Detection runs once per completed
+# sentence (D8). Only the languages likely to appear are mapped;
+# anything unmapped falls back to the configured default_src_lang.
+FT_TO_NLLB = {
+    "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn",
+    "de": "deu_Latn", "it": "ita_Latn", "pt": "por_Latn",
+    "ru": "rus_Cyrl", "zh": "zho_Hans", "ja": "jpn_Jpan",
+    "ko": "kor_Hang", "ar": "ara_Arab", "nl": "nld_Latn",
+    "pl": "pol_Latn", "tr": "tur_Latn", "vi": "vie_Latn",
+    "hi": "hin_Deva", "uk": "ukr_Cyrl", "ca": "cat_Latn",
+}
+
+
+def lang_label(code: str) -> str:
+    """Short display label for a FLORES-200 lang code."""
+    if code in LANG_LABEL:
+        return LANG_LABEL[code]
+    return code.split("_")[0][:3].upper()
+
+
+# ---------------- configuration ----------------
+# Built-in defaults — the single source of truth for every setting.
+# Config file overlays these; CLI flags override both. The keys are the
+# snake_case mirrors of the CLI flag names.
+DEFAULTS = {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "model": "mistralai/Voxtral-Mini-4B-Realtime-2602",
+    "nllb_dir": os.path.expanduser("~/asr/models/nllb-600m-ct2"),
+    "beam": 1,
+    "mask": MASK_K,
+    "line_flush": True,
+    "min_clause": 25,
+    "pause_ms": 1500,
+    "sentence_close_ms": 3000,
+    "auto_recycle_silence_ms": 800,
+    "auto_recycle_min_s": 10.0,
+    "auto_recycle_backstop_s": 1100.0,
+    # Global language defaults; a [[source]] inherits these unless it
+    # overrides. Empty tgt_langs => transcription-only (D3).
+    "src_lang": None,            # None => auto-detect per sentence (D8)
+    "tgt_langs": [],             # global default targets (empty = none)
+    "default_src_lang": "eng_Latn",   # fastText-unavailable fallback (D8)
+    # Sources: list of {target,label,accent,src_lang,tgt_langs}. Empty
+    # here (and no --dual / --source) => the default-sink monitor (D2).
+    "sources": [],
+}
+
+
+def _xdg_config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(
+        "~/.config")
+    return os.path.join(base, APP_NAME, "config.toml")
+
+
+def load_config(path: str) -> dict:
+    """Built-in defaults overlaid by the TOML at `path` (if it exists).
+    Returns a fresh dict; does NOT apply CLI flags (that's done after
+    parsing, so the CLI always wins). Unknown top-level keys are kept
+    (harmless) but a malformed file raises with a clear message."""
+    cfg = dict(DEFAULTS)
+    cfg["sources"] = [dict(s) for s in DEFAULTS["sources"]]
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        # [[source]] arrays-of-tables land under the "source" key.
+        srcs = data.pop("source", None)
+        for k, v in data.items():
+            cfg[k] = v
+        if srcs is not None:
+            cfg["sources"] = [dict(s) for s in srcs]
+    return cfg
+
+
+DEFAULT_CONFIG_TEXT = '''\
+# freesoft-asr configuration (TOML). Location:
+#   $XDG_CONFIG_HOME/freesoft-asr/config.toml
+#   (default ~/.config/freesoft-asr/config.toml; override with --config).
+# Precedence: built-in defaults < this file < command-line flags.
+# Every key below is the snake_case mirror of the matching --flag.
+
+# ---- vLLM Voxtral endpoint ----
+host  = "127.0.0.1"          # --host
+port  = 8000                 # --port
+model = "mistralai/Voxtral-Mini-4B-Realtime-2602"   # --model
+
+# ---- NLLB translation model (CTranslate2 int8, CPU) ----
+# Only loaded if at least one source has a non-empty tgt_langs.
+nllb_dir = "~/asr/models/nllb-600m-ct2"             # --nllb-dir
+beam     = 1                 # --beam : NLLB beam width (1 = greedy)
+mask     = 2                 # --mask : words of the live tail to hide
+
+# ---- global language defaults (a [[source]] inherits these) ----
+# src_lang: pin the SOURCE language (a FLORES-200 code, e.g. "spa_Latn")
+#   to disable per-sentence fastText auto-detection. Leave it unset (or
+#   "") to auto-detect each completed sentence's language.
+# src_lang = "spa_Latn"
+# tgt_langs: default list of target languages to translate INTO. Empty
+#   means transcription-only. A target equal to the detected/declared
+#   source is skipped automatically.
+tgt_langs = []               # e.g. ["spa_Latn", "eng_Latn"]
+# Fallback source language used only when fastText is unavailable AND no
+# src_lang is pinned (graceful degrade — a stderr warning is printed).
+default_src_lang = "eng_Latn"
+
+# ---- visual chunking / pause behaviour ----
+line_flush         = true    # --line-flush / --no-line-flush
+min_clause         = 25      # --min-clause
+pause_ms           = 1500    # --pause-ms (short pause: visual chunk)
+sentence_close_ms  = 3000    # --sentence-close-ms (long pause: close)
+
+# ---- VAD-driven WS auto-recycle (frees vLLM KV cache at silences) ----
+auto_recycle_silence_ms  = 800     # --auto-recycle-silence-ms (0 = off)
+auto_recycle_min_s       = 10.0    # --auto-recycle-min-s
+auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
+
+# ---- sources (streams) ----
+# Each [[source]] is one audio stream. Omit the whole section to use the
+# default sink monitor ("transcribe whatever's playing"). With no label
+# and exactly one source, the "[label] " prefix is dropped in the UI.
+#   target    : "-" (stdin), "monitor" (default sink monitor),
+#               or a PipeWire node name.
+#   label     : display name (optional).
+#   accent    : ANSI SGR code for the label colour (optional; a palette
+#               colour is auto-assigned when unset).
+#   src_lang  : per-stream source-language override (optional).
+#   tgt_langs : per-stream targets (optional; inherits global tgt_langs).
+#
+# The author's phone-call setup (same as --dual):
+# [[source]]
+# target    = "rtp_call_remote_source"
+# label     = "Remote"
+# accent    = "1;36"
+# tgt_langs = ["spa_Latn", "eng_Latn"]
+#
+# [[source]]
+# target    = "rtp_call_me_source"
+# label     = "Local"
+# accent    = "1;32"
+# tgt_langs = ["spa_Latn", "eng_Latn"]
+'''
+
+
+def _normalize_lang_list(v):
+    """Accept a string or list for tgt_langs; return a clean list."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v else []
+    return [str(x) for x in v if x]
+
+
 ap = argparse.ArgumentParser(
+    prog=APP_NAME,
     # Auto-appends "(default: ...)" to every option's help line so the
     # current value is visible from --help — useful when tuning the
     # latency / chunking / mask knobs.
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--beam", type=int, default=1,
+# default=None on the value-bearing flags so we can tell "user passed
+# it" (override config) from "user didn't" (fall through to config).
+ap.add_argument("--config", default=None,
+                help="path to the TOML config file (default: "
+                     "$XDG_CONFIG_HOME/freesoft-asr/config.toml)")
+ap.add_argument("--write-config", action="store_true",
+                help="write a commented default config to the standard "
+                     "path (or --config PATH) and exit")
+ap.add_argument("--host", default=None,
+                help="vLLM host serving Voxtral /v1/realtime")
+ap.add_argument("--port", type=int, default=None,
+                help="vLLM port")
+ap.add_argument("--model", default=None,
+                help="Voxtral model id sent in session.update")
+ap.add_argument("--nllb-dir", default=None,
+                help="CTranslate2 NLLB model directory (translation)")
+ap.add_argument("--source", action="append", dest="sources", default=None,
+                metavar="TARGET[=LABEL]",
+                help="add an audio source. TARGET is '-' (stdin), "
+                     "'monitor' (default sink monitor), or a PipeWire "
+                     "node name. Repeat for multiple streams. With no "
+                     "--source/--dual the default sink monitor is used.")
+ap.add_argument("--src-lang", default=None,
+                help="global source-language override (FLORES-200 code, "
+                     "e.g. spa_Latn). Disables fastText auto-detection. "
+                     "Unset => auto-detect each sentence.")
+ap.add_argument("--tgt-lang", action="append", dest="tgt_langs",
+                default=None, metavar="CODE",
+                help="global target language to translate into "
+                     "(FLORES-200 code). Repeat for several. None => "
+                     "transcription only.")
+ap.add_argument("--no-translate", action="store_true",
+                help="force transcription-only: clear all target "
+                     "languages regardless of config (the bare default "
+                     "is already transcription-only).")
+ap.add_argument("--beam", type=int, default=None,
                 help="NLLB beam-search width. 1 = greedy decoding "
                      "(fastest); 2+ explores more hypotheses for "
                      "marginally better translations at proportional "
                      "cost (beam 2 ≈ 15%% slower on this model).")
 ap.add_argument("--dual", action="store_true",
-                help="dual-stream: the script owns both taps "
-                     "(rtp_call_remote_source=Remote, "
+                help="dual-stream preset: the script owns both phone-call "
+                     "taps (rtp_call_remote_source=Remote, "
                      "rtp_call_me_source=Local) via two pw-record "
-                     "subprocesses + two Voxtral WS sessions. Without "
-                     "this, audio is read from stdin (single stream).")
-ap.add_argument("--mask", type=int, default=MASK_K,
-                help="words of the in-progress EN/ES tail to hide "
+                     "subprocesses + two Voxtral WS sessions, each "
+                     "translating into Spanish + English (the historical "
+                     "default behaviour).")
+ap.add_argument("--mask", type=int, default=None,
+                help="words of the in-progress translation tail to hide "
                      "(model tokens at the very end are unstable)")
 ap.add_argument("--line-flush", action=argparse.BooleanOptionalAction,
-                default=True,
+                default=None,
                 help="when the live line fills the screen width, commit the "
                      "leading clause at a comma (keeps live to ~1 line; "
                      "trades some full-sentence MT coherence). On by default")
-ap.add_argument("--min-clause", type=int, default=25,
+ap.add_argument("--min-clause", type=int, default=None,
                 help="never line-flush a leading clause shorter than this "
                      "many chars (avoids tiny-fragment mistranslation)")
-ap.add_argument("--pause-ms", type=int, default=1500,
+ap.add_argument("--pause-ms", type=int, default=None,
                 help="short pause: flush the live region as a VISUAL "
                      "chunk after this many ms with no new delta. The "
                      "sentence stays open so MT runs on the whole "
-                     "sentence (good context). 0 disables visual flush. "
-                     "Natural inter-clause breaths are ~500-1000ms; "
-                     "this default sits above them and below "
-                     "--sentence-close-ms so only larger pauses flush.")
-ap.add_argument("--sentence-close-ms", type=int, default=3000,
+                     "sentence (good context). 0 disables visual flush.")
+ap.add_argument("--sentence-close-ms", type=int, default=None,
                 help="long pause: CLOSE the sentence after this many ms "
                      "with no new delta (speaker truly stopped). Marker-"
-                     "MT runs and chunk ES/EN backfill. Must be > "
-                     "--pause-ms; should be long enough to not fire "
-                     "during a natural inter-clause pause.")
-ap.add_argument("--auto-recycle-silence-ms", type=int, default=800,
+                     "MT runs and per-target backfill. Must be > "
+                     "--pause-ms.")
+ap.add_argument("--auto-recycle-silence-ms", type=int, default=None,
                 help="VAD-driven WS auto-recycle: when per-stream "
                      "silence (Silero VAD) lasts this long AND nothing "
                      "is in flight, close+reopen that stream's vLLM "
-                     "session to free its KV cache budget. 0 disables. "
-                     "Phone-call sides are mostly idle individually, so "
-                     "this keeps each session short and the cap "
-                     "(--max-model-len) effectively out of reach.")
-ap.add_argument("--auto-recycle-min-s", type=float, default=10.0,
+                     "session to free its KV cache budget. 0 disables.")
+ap.add_argument("--auto-recycle-min-s", type=float, default=None,
                 help="don't auto-recycle a session younger than this "
                      "many seconds of audio sent (anti-thrash).")
-ap.add_argument("--auto-recycle-backstop-s", type=float, default=1100.0,
+ap.add_argument("--auto-recycle-backstop-s", type=float, default=None,
                 help="safety backstop: force a recycle once a stream's "
                      "session reaches this many seconds of audio "
-                     "regardless of in-flight state. Should be safely "
-                     "below the cap (--max-model-len 16384 × 80ms ≈ "
-                     "1310s; default leaves ~3.5min headroom).")
+                     "regardless of in-flight state.")
 ap.add_argument("--plain", action="store_true",
                 help="no TUI; print state transitions (headless validation)")
 ap.add_argument("--trace-emit", action="store_true",
                 help="stderr trace of chunk emits, pause-watcher fires, "
                      "and recycles with monotonic timestamps. Diagnostic.")
 args = ap.parse_args()
+
+# --write-config: emit the commented default and exit before anything
+# heavy (model imports / device init) happens.
+if args.write_config:
+    out_path = args.config or _xdg_config_path()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(DEFAULT_CONFIG_TEXT)
+    print(f"wrote default config to {out_path}", file=sys.stderr)
+    sys.exit(0)
+
+# Build the effective config: defaults < file < CLI flags.
+CONFIG = load_config(args.config or _xdg_config_path())
+
+
+def _apply(flag_val, key):
+    """CLI flag overrides config when the user actually passed it
+    (default=None on the flag means 'not passed')."""
+    if flag_val is not None:
+        CONFIG[key] = flag_val
+
+
+for _flag, _key in [
+        (args.host, "host"), (args.port, "port"), (args.model, "model"),
+        (args.nllb_dir, "nllb_dir"), (args.beam, "beam"),
+        (args.mask, "mask"), (args.line_flush, "line_flush"),
+        (args.min_clause, "min_clause"), (args.pause_ms, "pause_ms"),
+        (args.sentence_close_ms, "sentence_close_ms"),
+        (args.auto_recycle_silence_ms, "auto_recycle_silence_ms"),
+        (args.auto_recycle_min_s, "auto_recycle_min_s"),
+        (args.auto_recycle_backstop_s, "auto_recycle_backstop_s"),
+        (args.src_lang, "src_lang"), (args.tgt_langs, "tgt_langs")]:
+    _apply(_flag, _key)
+
+# Resolved scalar settings (read everywhere below instead of args.*).
+HOST = CONFIG["host"]
+PORT = int(CONFIG["port"])
+MODEL = CONFIG["model"]
+NLLB_DIR = os.path.expanduser(CONFIG["nllb_dir"])
+BEAM = int(CONFIG["beam"])
+MASK = int(CONFIG["mask"])
+LINE_FLUSH = bool(CONFIG["line_flush"])
+MIN_CLAUSE = int(CONFIG["min_clause"])
+PAUSE_MS = int(CONFIG["pause_ms"])
+SENTENCE_CLOSE_MS = int(CONFIG["sentence_close_ms"])
+AUTO_RECYCLE_SILENCE_MS = int(CONFIG["auto_recycle_silence_ms"])
+AUTO_RECYCLE_MIN_S = float(CONFIG["auto_recycle_min_s"])
+AUTO_RECYCLE_BACKSTOP_S = float(CONFIG["auto_recycle_backstop_s"])
+GLOBAL_SRC_LANG = CONFIG["src_lang"] or None
+GLOBAL_TGT_LANGS = _normalize_lang_list(CONFIG["tgt_langs"])
+DEFAULT_SRC_LANG = CONFIG["default_src_lang"]
 CLAUSE_DELIM = re.compile(r'[,;:]')
 
+
+def _build_sources():
+    """Resolve the active source list from --dual / --source / config /
+    the default-monitor fallback, applying per-stream language
+    inheritance and auto-assigning accent colours + a SOLO label when
+    there's a single unlabelled source.
+
+    Returns a list of dicts with keys: target, label, accent, src_lang,
+    tgt_langs. The list order is the render/iteration order."""
+    # 1. pick the raw source list (precedence: --dual > --source > config
+    #    [[source]] > default-monitor fallback).
+    if args.dual:
+        raw = [dict(s) for s in DUAL_PRESET]
+    elif args.sources:
+        raw = []
+        for spec in args.sources:
+            if "=" in spec:
+                tgt, lbl = spec.split("=", 1)
+            else:
+                tgt, lbl = spec, None
+            raw.append({"target": tgt, "label": lbl})
+    elif CONFIG["sources"]:
+        raw = [dict(s) for s in CONFIG["sources"]]
+    else:
+        # D2 default: a single stream capturing the default sink monitor.
+        raw = [{"target": MONITOR, "label": None}]
+
+    single_unlabelled = (len(raw) == 1 and not raw[0].get("label"))
+    out = []
+    for i, s in enumerate(raw):
+        tgt = s.get("target", MONITOR)
+        lbl = s.get("label")
+        if not lbl:
+            lbl = SOLO if single_unlabelled else f"S{i + 1}"
+        accent = s.get("accent") or ACCENT_PALETTE[i % len(ACCENT_PALETTE)]
+        src_lang = s.get("src_lang") or GLOBAL_SRC_LANG
+        tgt_langs = _normalize_lang_list(
+            s["tgt_langs"] if "tgt_langs" in s and s["tgt_langs"] is not None
+            else GLOBAL_TGT_LANGS)
+        if args.no_translate:
+            tgt_langs = []
+        out.append({"target": tgt, "label": lbl, "accent": accent,
+                    "src_lang": src_lang, "tgt_langs": tgt_langs})
+    return out
+
+
+SOURCES = _build_sources()
 # Active stream labels (order = render/iteration order).
-STREAMS = ([lbl for _, lbl, _ in DUAL_SOURCES] if args.dual else [SOLO])
-# label -> ANSI accent for the [label] tag in history (solo: plain).
-ACCENT = ({lbl: c for _, lbl, c in DUAL_SOURCES} if args.dual
-          else {SOLO: "0"})
+STREAMS = [s["label"] for s in SOURCES]
+# label -> resolved source dict.
+SRC_BY_LABEL = {s["label"]: s for s in SOURCES}
+# label -> ANSI accent for the [label] tag in history.
+ACCENT = {s["label"]: s["accent"] for s in SOURCES}
+# Union of every stream's target languages — drives whether NLLB loads
+# at all (D3: skip the model entirely when no stream translates).
+ANY_TGT_LANGS = any(s["tgt_langs"] for s in SOURCES)
+# Whether the single-source-no-label collapse is in effect (controls the
+# "[label] " prefix in the UI / transcript dump).
+IS_SOLO = (STREAMS == [SOLO])
 
 # ---------------- shared state ----------------
 _lock = threading.Lock()
@@ -194,27 +503,28 @@ def _trace(category, **fields):
 
 def _new_stream_state():
     return {
-        # Three live "views" per stream: cur_live is the raw Voxtral
-        # transcription (possibly code-switched); cur_es and cur_en are
-        # NLLB translations of cur_live into Spanish and English
-        # respectively. All three render in the live block as Live▸ /
-        # ES▸ / EN▸; on sentence finalize the chunk's es/en fields in
+        # Live "views" per stream: cur_live is the raw Voxtral
+        # transcription (possibly code-switched); cur_tr maps each of
+        # this stream's target lang codes -> the masked live NLLB
+        # translation of cur_live into that language. cur_live renders
+        # as Live▸; each cur_tr entry renders as one <LABEL>▸ row. On
+        # sentence finalize the chunk's per-target translations in
         # `frozen` are filled with the marker-aligned segments.
         "cur_live": "",      # raw Voxtral text since last visual chunk
-        "cur_es": "",        # masked live Spanish translation of cur_live
-        "cur_en": "",        # masked live English translation of cur_live
+        "cur_tr": {},        # lang_code -> masked live translation of cur_live
         "delta_t": 0.0,      # wall time of last transcription delta (speech)
         # Visual chunking (clause_flush / take_sentences) decouples from
-        # MT: each chunk lands in `frozen` immediately with es=None and
-        # en=None (live raw flow), and its translations are filled in
-        # once the WHOLE sentence is translated TWICE (target=spa_Latn,
-        # target=eng_Latn). `sent_raw` joins emitted raw chunks with
-        # [N] markers (which NLLB passes through cleanly — empirically
-        # verified, 0 marker drops across 7 sentences, perfect order);
-        # at sentence end each translation is split on the markers and
-        # each open chunk's es/en is backfilled by its chunk_id.
+        # MT: each chunk lands in `frozen` immediately with an empty
+        # per-target dict (None per target => pending), and its
+        # translations are filled in once the WHOLE sentence is
+        # translated into each target. `sent_raw` joins emitted raw
+        # chunks with [N] markers (which NLLB passes through cleanly —
+        # empirically verified, 0 marker drops across 7 sentences,
+        # perfect order); at sentence end each per-target translation is
+        # split on the markers and each open chunk's tr-dict is
+        # backfilled by its chunk_id.
         "sent_raw": "",      # marker-laden raw text for the in-progress sentence
-        "open_ids": [],      # chunk_ids whose es/en are pending backfill
+        "open_ids": [],      # chunk_ids whose translations are pending backfill
         "reset": False,      # Ctrl-L OR auto-recycle: cycle the WS
         # Silero-VAD-driven auto-recycle bookkeeping (per-stream):
         # last_speech_t = wall time of the last VAD frame that crossed
@@ -234,7 +544,12 @@ def _new_stream_state():
 
 
 _state = {
-    "frozen": [],          # list[(speaker, raw, es_or_None, en_or_None, chunk_id)]
+    # frozen rows: (speaker, raw, tr_dict, chunk_id). tr_dict maps each
+    # of the stream's target lang codes -> translated text, or None for
+    # a still-pending target (renders as '⋯'), or "" for a marker-split
+    # 'merged into a neighbour' placeholder (renders as '—'). A NOTICE
+    # row carries tr_dict == {}.
+    "frozen": [],
     "streams": {lbl: _new_stream_state() for lbl in STREAMS},
     "active": STREAMS[0],  # label of the last stream to get a delta
     "status": "starting",
@@ -254,16 +569,141 @@ def st_get():
     with _lock:
         act = _state["active"]
         s = _state["streams"][act]
-        return (list(_state["frozen"]), act, s["cur_live"], s["cur_en"],
+        # Live preview of the active stream's first target (if any) —
+        # only used by the --plain live-EN line, which is best-effort.
+        tgts = SRC_BY_LABEL[act]["tgt_langs"]
+        cur_tr0 = s["cur_tr"].get(tgts[0], "") if tgts else ""
+        return (list(_state["frozen"]), act, s["cur_live"], cur_tr0,
                 _state["status"], s["audio_t"])
 
 
-# ---------------- NLLB ----------------
-print("loading NLLB...", file=sys.stderr, flush=True)
-_tok = AutoTokenizer.from_pretrained(NLLB_DIR)
-_tok.src_lang = "spa_Latn"
-_tr = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
-                             inter_threads=1, intra_threads=8)
+# ---------------- silero VAD availability ----------------
+# Imported lazily so the bare transcription-only default doesn't pay the
+# torch/silero import cost when auto-recycle is also off.
+try:
+    import torch
+    from silero_vad import load_silero_vad
+    _SILERO_AVAILABLE = True
+except ImportError:
+    _SILERO_AVAILABLE = False
+
+
+# ---------------- NLLB (translation) — loaded only if needed (D3) ----
+# When NO stream has any target language, NLLB / ctranslate2 / the
+# transformers tokenizer are NOT imported or constructed at all: the
+# tool is transcription-only and renders just the Live row.
+_tok = None
+_tr = None
+_NLLB_LOADED = False
+
+
+def _load_nllb():
+    """Construct the NLLB tokenizer + CTranslate2 translator. Called
+    once, only when at least one stream has target languages."""
+    global _tok, _tr, _NLLB_LOADED
+    if _NLLB_LOADED:
+        return
+    import ctranslate2
+    from transformers import AutoTokenizer
+    print("loading NLLB...", file=sys.stderr, flush=True)
+    _tok = AutoTokenizer.from_pretrained(NLLB_DIR)
+    # src_lang is set per-sentence (auto-detected or pinned) before each
+    # translate; start with a sane default so an early call can't crash.
+    _tok.src_lang = GLOBAL_SRC_LANG or DEFAULT_SRC_LANG
+    _tr = ctranslate2.Translator(NLLB_DIR, device="cpu", compute_type="int8",
+                                 inter_threads=1, intra_threads=8)
+    _NLLB_LOADED = True
+
+
+# ---------------- fastText language id (lid.176) — D8 ----------------
+# Detects each completed sentence's source language ONCE (at the
+# sentence boundary, where translation fires — not per-delta). Used only
+# when a stream's src_lang is unset. Degrades gracefully: if fastText or
+# its model is missing, falls back to DEFAULT_SRC_LANG with one warning.
+_FT_MODEL = None
+_FT_AVAILABLE = False
+_FT_WARNED = False
+# Candidate model locations (lid.176.ftz is ~917 KB). Override with the
+# FASTTEXT_LID_MODEL env var.
+_FT_MODEL_PATHS = [
+    os.environ.get("FASTTEXT_LID_MODEL", ""),
+    os.path.expanduser("~/asr/models/lid.176.ftz"),
+    os.path.expanduser("~/asr/models/lid.176.bin"),
+    os.path.expanduser("~/.cache/fasttext/lid.176.ftz"),
+]
+
+
+def _load_fasttext():
+    """Best-effort load of fastText lid.176. Sets _FT_MODEL / _FT_
+    AVAILABLE. Tries the `fasttext` package against a local .ftz/.bin,
+    then the `fasttext_langdetect`/`ftlangdetect` wrapper (which bundles
+    its own model download). Never raises."""
+    global _FT_MODEL, _FT_AVAILABLE
+    # 1. raw fasttext + a local model file
+    try:
+        import fasttext
+        for p in _FT_MODEL_PATHS:
+            if p and os.path.exists(p):
+                _FT_MODEL = fasttext.load_model(p)
+                _FT_AVAILABLE = True
+                return
+    except Exception:
+        pass
+    # 2. ftlangdetect wrapper (bundles model download on first use)
+    try:
+        from ftlangdetect import detect as _ftdetect
+
+        class _Wrap:
+            def detect(self, text):
+                r = _ftdetect(text=text.replace("\n", " "), low_memory=False)
+                return r.get("lang")
+        _FT_MODEL = _Wrap()
+        _FT_AVAILABLE = True
+        return
+    except Exception:
+        pass
+    _FT_AVAILABLE = False
+
+
+def detect_src_lang(text: str, pinned: str | None) -> str:
+    """Resolve the NLLB src_lang for one sentence. If `pinned` is set
+    (stream/global src_lang override), use it (detection off). Else run
+    fastText once; map its ISO code to a FLORES-200 code. On any failure
+    (no fastText, unmapped code, empty text) fall back to
+    DEFAULT_SRC_LANG with a one-time stderr warning (mirrors how silero
+    degrades)."""
+    global _FT_WARNED
+    if pinned:
+        return pinned
+    if _FT_AVAILABLE and _FT_MODEL is not None and text.strip():
+        try:
+            if hasattr(_FT_MODEL, "predict"):     # raw fasttext model
+                labels, _ = _FT_MODEL.predict(text.replace("\n", " "), k=1)
+                iso = labels[0].replace("__label__", "")
+            else:                                  # wrapper
+                iso = _FT_MODEL.detect(text)
+            code = FT_TO_NLLB.get(iso)
+            if code:
+                return code
+        except Exception:
+            pass
+    if not _FT_WARNED:
+        _FT_WARNED = True
+        print(f"WARNING: fastText language id unavailable / inconclusive; "
+              f"falling back to src_lang={DEFAULT_SRC_LANG}. Install "
+              f"fasttext-wheel (or fasttext-langdetect) and/or set "
+              f"FASTTEXT_LID_MODEL to lid.176.ftz to enable per-sentence "
+              f"detection.", file=sys.stderr, flush=True)
+    return DEFAULT_SRC_LANG
+
+
+if ANY_TGT_LANGS:
+    _load_nllb()
+    # Only need detection when at least one translating stream has no
+    # pinned src_lang (and no global pin).
+    _need_detect = any(not s["src_lang"] for s in SOURCES if s["tgt_langs"])
+    if _need_detect:
+        _load_fasttext()
 
 
 # ---------------- Silero VAD (per-stream) ----------------
@@ -277,13 +717,13 @@ VAD_FRAME_SAMPLES = 512
 VAD_FRAME_S = VAD_FRAME_SAMPLES / SAMPLE_RATE   # 0.032
 VAD_THRESHOLD = 0.5
 _VAD_MODELS = {}
-_AUTO_RECYCLE_ENABLED = (args.auto_recycle_silence_ms > 0
+_AUTO_RECYCLE_ENABLED = (AUTO_RECYCLE_SILENCE_MS > 0
                          and _SILERO_AVAILABLE)
 if _AUTO_RECYCLE_ENABLED:
     print("loading Silero VAD (per-stream)...", file=sys.stderr, flush=True)
     for _lbl in STREAMS:
         _VAD_MODELS[_lbl] = load_silero_vad(onnx=True)
-elif args.auto_recycle_silence_ms > 0 and not _SILERO_AVAILABLE:
+elif AUTO_RECYCLE_SILENCE_MS > 0 and not _SILERO_AVAILABLE:
     print("WARNING: silero_vad/onnxruntime not installed; "
           "auto-recycle disabled. pip install silero-vad onnxruntime "
           "to enable.", file=sys.stderr, flush=True)
@@ -321,39 +761,47 @@ def _vad_score_chunk(label, pcm_bytes):
             s["last_speech_t"] = now
 
 
-def translate(text: str, tgt: str = "eng_Latn") -> str:
-    """Translate `text` into target language `tgt` (a FLORES-200 code,
-    e.g. 'eng_Latn' or 'spa_Latn'). Source language is the tokenizer's
-    src_lang set at load time."""
-    src = _tok.convert_ids_to_tokens(_tok.encode(text))
-    r = _tr.translate_batch([src], target_prefix=[[tgt]],
-                            beam_size=args.beam, max_decoding_length=512)
-    h = r[0].hypotheses[0]
-    if h and h[0] == tgt:
-        h = h[1:]
-    return _tok.decode(_tok.convert_tokens_to_ids(h)).strip()
+def translate_multi(text: str, targets: list, src_lang: str | None = None
+                    ) -> dict:
+    """Translate `text` into each FLORES-200 code in `targets`, returning
+    {code -> translated text}. All targets share ONE batched
+    translate_batch call (the encoder pass is shared across the batch,
+    only the decoder reruns per target — measured ~40 % faster than
+    sequential single-target calls on NLLB-600M int8 CPU).
 
-
-def translate_dual(text: str) -> tuple:
-    """Translate `text` into BOTH Spanish (spa_Latn) and English
-    (eng_Latn) in ONE batched translate_batch call. Measured ~40 %
-    faster than two sequential single-target calls on NLLB-600M int8
-    CPU — the encoder pass is shared across the batch and only the
-    decoder runs twice with different target prefixes. Returns
-    (es, en)."""
+    The NLLB tokenizer's src_lang is set from `src_lang` (the stream's
+    pinned override, or the fastText-detected language for this
+    sentence — see detect_src_lang). A target equal to the source is
+    skipped (its dict entry is the source `text` unchanged — translating
+    X->X is a waste and NLLB sometimes paraphrases). Returns {} for
+    empty input or empty targets."""
+    targets = [t for t in targets if t]
+    if not text.strip() or not targets:
+        return {}
+    if src_lang:
+        _tok.src_lang = src_lang
     src = _tok.convert_ids_to_tokens(_tok.encode(text))
-    r = _tr.translate_batch([src, src],
-                            target_prefix=[["spa_Latn"], ["eng_Latn"]],
-                            beam_size=args.beam, max_decoding_length=512)
-    es_hyp = r[0].hypotheses[0]
-    en_hyp = r[1].hypotheses[0]
-    if es_hyp and es_hyp[0] == "spa_Latn":
-        es_hyp = es_hyp[1:]
-    if en_hyp and en_hyp[0] == "eng_Latn":
-        en_hyp = en_hyp[1:]
-    es = _tok.decode(_tok.convert_tokens_to_ids(es_hyp)).strip()
-    en = _tok.decode(_tok.convert_tokens_to_ids(en_hyp)).strip()
-    return es, en
+    # Build the batch only for targets that actually need MT (skip
+    # target == source).
+    batch_src, batch_tgt, need = [], [], []
+    out = {}
+    for t in targets:
+        if src_lang and t == src_lang:
+            out[t] = text.strip()        # source == target: passthrough
+            continue
+        batch_src.append(src)
+        batch_tgt.append([t])
+        need.append(t)
+    if need:
+        r = _tr.translate_batch(batch_src, target_prefix=batch_tgt,
+                                beam_size=BEAM, max_decoding_length=512)
+        for t, res in zip(need, r):
+            hyp = res.hypotheses[0]
+            if hyp and hyp[0] == t:
+                hyp = hyp[1:]
+            out[t] = _tok.decode(_tok.convert_tokens_to_ids(hyp)).strip()
+    # preserve caller's target order
+    return {t: out[t] for t in targets if t in out}
 
 
 def mask_tail(en: str, k: int) -> str:
@@ -389,35 +837,39 @@ def _split_on_markers(en: str, expected_n: int) -> list:
 _final_q: "queue.Queue[tuple]" = queue.Queue()
 
 
-def _emit_chunk_locked(spk, es_text, is_final,
-                       prelim_es=None, prelim_en=None):
+def _emit_chunk_locked(spk, es_text, is_final, prelim=None):
     """Caller holds _lock. Appends a visual chunk to `frozen` and
-    marker-joins it into the stream's sent_raw. The chunk's es/en
-    start as the supplied preliminary values (typically the live
-    preview translation at the moment of emission — see the callers
-    that capture cur_es/cur_en just before wiping them). They render
-    as a real translation until marker-MT lands the properly aligned
-    segment and overwrites them. Pass None for an honest 'pending'
-    placeholder (renders as '⋯'). Empty-string preliminaries are
-    treated as None — '' is reserved for the marker-MT 'this chunk
-    merged into a neighbor' signal (renders as '—').
+    marker-joins it into the stream's sent_raw. The chunk's per-target
+    translations start as the supplied preliminary dict `prelim`
+    (typically the live preview translations at the moment of emission —
+    see the callers that capture cur_tr just before wiping it), keyed by
+    target lang code. They render as a real translation until marker-MT
+    lands the properly aligned segments and overwrites them. A target
+    absent from `prelim` (or with a falsy value) starts as None — an
+    honest 'pending' placeholder (renders as '⋯'). '' is reserved for
+    the marker-MT 'this chunk merged into a neighbour' signal (renders
+    as '—').
+
+    The chunk's tr-dict is pre-seeded with one key per the STREAM's
+    target langs so the render always knows how many rows to draw.
 
     Returns a (spk, sent_raw, open_ids) sentence-finalize job iff
     is_final and there's a sentence to translate, else None — caller
     queues the job after releasing the lock."""
     es_text = es_text.strip()
     s = _state["streams"][spk]
+    prelim = prelim or {}
     _trace("emit", spk=spk, is_final=is_final,
            raw=es_text[:60], raw_len=len(es_text),
            open_ids_before=len(s["open_ids"]),
-           prelim_es=bool(prelim_es), prelim_en=bool(prelim_en))
+           prelim=sorted(prelim.keys()))
     if es_text:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1
-        es_init = prelim_es if prelim_es else None
-        en_init = prelim_en if prelim_en else None
-        # 5-tuple: (spk, raw, es_translation, en_translation, chunk_id).
-        _state["frozen"].append((spk, es_text, es_init, en_init, cid))
+        tgts = SRC_BY_LABEL[spk]["tgt_langs"]
+        tr = {t: (prelim[t] if prelim.get(t) else None) for t in tgts}
+        # 4-tuple: (spk, raw, tr_dict, chunk_id).
+        _state["frozen"].append((spk, es_text, tr, cid))
         _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
         # Marker BEFORE this chunk if it isn't the first of the sentence.
         # Number the markers 1, 2, ... per the probe (which used [1][2][3]).
@@ -434,73 +886,102 @@ def _emit_chunk_locked(spk, es_text, is_final,
     return None
 
 
-def _backfill_chunk_translations_locked(chunk_id: int,
-                                        es: str, en: str) -> None:
+def _backfill_chunk_translations_locked(chunk_id: int, tr: dict) -> None:
     """Caller holds _lock. Find the frozen row with this chunk_id and
-    set BOTH its es and en fields. Silent no-op if the row was
+    replace its per-target translation dict. Silent no-op if the row was
     truncated by FROZEN_CAP (very-long-call edge case)."""
     fr = _state["frozen"]
     for i in range(len(fr) - 1, -1, -1):    # search from the back (recent)
-        if fr[i][4] == chunk_id:            # chunk_id is now at index 4
-            spk, raw, _old_es, _old_en, cid = fr[i]
-            fr[i] = (spk, raw, es, en, cid)
+        if fr[i][3] == chunk_id:            # chunk_id is at index 3
+            spk, raw, _old_tr, cid = fr[i]
+            fr[i] = (spk, raw, dict(tr), cid)
             return
 
 
+def _plain_label(code: str) -> str:
+    """Fixed-width row label for --plain output."""
+    return lang_label(code).ljust(4)
+
+
 def mt_worker():
+    # If nothing translates (all streams transcription-only), the worker
+    # has no NLLB to run — but it still drains the (empty) final queue
+    # and sleeps so the thread is harmless. Translating streams only.
+    if not ANY_TGT_LANGS:
+        while not _STOP.is_set():
+            try:
+                _final_q.get(timeout=0.2)
+            except queue.Empty:
+                pass
+        return
     # per-stream last-source so a quiet stream's stale cur_live isn't
     # re-translated, and one stream's text never seeds another's.
     last_src = {lbl: None for lbl in STREAMS}
+    translating = [lbl for lbl in STREAMS if SRC_BY_LABEL[lbl]["tgt_langs"]]
     while True:
         if _STOP.is_set():
             return
         # 1. priority: a sentence has completed — translate marker-laden
-        # sent_raw, split EN on markers, backfill the open chunks' EN.
+        # sent_raw into each of the stream's targets, split each on the
+        # markers, backfill the open chunks' per-target translations.
         try:
             job = _final_q.get_nowait()
         except queue.Empty:
             job = None
         if job is not None:
             spk, sent_raw, open_ids = job
+            tgts = SRC_BY_LABEL[spk]["tgt_langs"]
+            # Detect the source language ONCE per sentence (D8), from the
+            # raw sentence with markers stripped, unless pinned.
+            plain_sent = MARKER_RE.sub(" ", sent_raw).strip()
+            src_lang = detect_src_lang(plain_sent,
+                                       SRC_BY_LABEL[spk]["src_lang"])
             try:
-                full_es, full_en = translate_dual(sent_raw)
+                full = translate_multi(sent_raw, tgts, src_lang=src_lang)
             except Exception as e:
-                full_es = full_en = f"[mt error: {e}]"
-            es_segs = _split_on_markers(full_es, len(open_ids))
-            en_segs = _split_on_markers(full_en, len(open_ids))
+                full = {t: f"[mt error: {e}]" for t in tgts}
+            # Per-target marker split -> {cid: {tgt: seg}}.
+            per_target_segs = {t: _split_on_markers(full.get(t, ""),
+                                                    len(open_ids))
+                               for t in tgts}
+            per_chunk = {cid: {} for cid in open_ids}
+            for t in tgts:
+                for cid, seg in zip(open_ids, per_target_segs[t]):
+                    per_chunk[cid][t] = seg
             with _lock:
-                for cid, es, en in zip(open_ids, es_segs, en_segs):
-                    _backfill_chunk_translations_locked(cid, es, en)
+                for cid in open_ids:
+                    _backfill_chunk_translations_locked(cid, per_chunk[cid])
             if args.plain:
-                tag = "" if spk == SOLO else f"[{spk}] "
-                # Per-chunk Live/ES/EN so --plain mirrors `frozen`.
+                tag = "" if (spk == SOLO or IS_SOLO) else f"[{spk}] "
                 with _lock:
-                    fr = {row[4]: row for row in _state["frozen"]}
-                for cid, es, en in zip(open_ids, es_segs, en_segs):
+                    fr = {row[3]: row for row in _state["frozen"]}
+                for cid in open_ids:
                     row = fr.get(cid)
                     if row is None:
                         continue
-                    sys.stdout.write(f"{tag}Live  {row[1]}\n"
-                                     f"{tag}ES    {es}\n"
-                                     f"{tag}EN    {en}\n")
+                    sys.stdout.write(f"{tag}Live  {row[1]}\n")
+                    for t in tgts:
+                        sys.stdout.write(
+                            f"{tag}{_plain_label(t)}  {per_chunk[cid][t]}\n")
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             continue
-        # 2. else: re-translate every stream's in-progress raw tail for
-        # the live ES + EN previews (cur_live is the tail since the last
-        # chunk emit; no markers — preview only, not used for history).
-        # One batched translate_batch per stream (~40% faster on this
-        # model than two sequential single-target calls).
+        # 2. else: re-translate every translating stream's in-progress
+        # raw tail for the live previews (cur_live is the tail since the
+        # last chunk emit; no markers — preview only). One batched
+        # translate_multi per stream.
         did = False
-        for lbl in STREAMS:
+        for lbl in translating:
             with _lock:
                 cur = _state["streams"][lbl]["cur_live"].strip()
             if cur and cur != last_src[lbl]:
                 last_src[lbl] = cur
+                tgts = SRC_BY_LABEL[lbl]["tgt_langs"]
+                src_lang = detect_src_lang(cur, SRC_BY_LABEL[lbl]["src_lang"])
                 try:
-                    es, en = translate_dual(cur)
+                    tr = translate_multi(cur, tgts, src_lang=src_lang)
                 except Exception as e:
-                    es = en = f"[mt error: {e}]"
+                    tr = {t: f"[mt error: {e}]" for t in tgts}
                 with _lock:
                     # Write back if cur_live still STARTS WITH cur — i.e.
                     # it merely grew during translation (continuous
@@ -510,10 +991,8 @@ def mt_worker():
                     # mid-translation, so the preview never wrote back
                     # during sustained speech ("(translating…)" stuck).
                     if _state["streams"][lbl]["cur_live"].strip().startswith(cur):
-                        _state["streams"][lbl]["cur_es"] = \
-                            mask_tail(es, args.mask)
-                        _state["streams"][lbl]["cur_en"] = \
-                            mask_tail(en, args.mask)
+                        _state["streams"][lbl]["cur_tr"] = {
+                            t: mask_tail(tr.get(t, ""), MASK) for t in tgts}
                 did = True
         if not did:
             time.sleep(0.05)
@@ -531,11 +1010,21 @@ def stdin_reader(label, q, loop):
 
 
 def pw_reader(source_name, label, q, loop):
-    """Dual-stream feed: one pw-record subprocess -> queue. VAD-scores
+    """PipeWire feed: one pw-record subprocess -> queue. VAD-scores
     each chunk in-place so the auto-recycle watcher can see speech vs.
-    silence on this stream."""
-    cmd = ["pw-record", "--target", source_name,
-           "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-"]
+    silence on this stream.
+
+    `source_name == MONITOR` selects the DEFAULT SINK's monitor via
+    `stream.capture.sink=true` with NO explicit --target (D2). PW 1.0.5
+    can't resolve `target.object="<sink>.monitor"`, so capture-sink is
+    the correct way to tap "whatever's playing". Any other value is
+    treated as a PipeWire node name and passed as --target."""
+    if source_name == MONITOR:
+        cmd = ["pw-record", "-P", "stream.capture.sink=true",
+               "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-"]
+    else:
+        cmd = ["pw-record", "--target", source_name,
+               "--format=s16", f"--rate={SAMPLE_RATE}", "--channels=1", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
     try:
@@ -567,22 +1056,20 @@ def take_sentences(spk):
             pos = m.end()
         if out:
             # Capture the live preview BEFORE wiping it, so the first
-            # emitted chunk inherits a preliminary translation (the live
-            # ES/EN of the whole pre-cut cur_live). Marker-MT replaces
-            # it shortly after with the marker-aligned segment.
-            prelim_es, prelim_en = s["cur_es"], s["cur_en"]
+            # emitted chunk inherits a preliminary per-target translation
+            # (the live previews of the whole pre-cut cur_live). Marker-MT
+            # replaces it shortly after with the marker-aligned segment.
+            prelim = dict(s["cur_tr"])
             s["cur_live"] = buf[pos:]
-            s["cur_es"] = s["cur_en"] = ""
+            s["cur_tr"] = {}
         else:
-            prelim_es = prelim_en = None
+            prelim = None
         for i, sent in enumerate(out):
             # Only the FIRST chunk inherits the preview (it's the one
             # the preview's text covers). Subsequent sentences in the
             # same buffer were not yet visible — leave their prelim None.
-            pe = prelim_es if i == 0 else None
-            pn = prelim_en if i == 0 else None
-            job = _emit_chunk_locked(spk, sent, is_final=True,
-                                     prelim_es=pe, prelim_en=pn)
+            p = prelim if i == 0 else None
+            job = _emit_chunk_locked(spk, sent, is_final=True, prelim=p)
             if job is not None:
                 jobs.append(job)
     for job in jobs:
@@ -599,14 +1086,14 @@ def clause_flush(spk):
     fragments was translating them out of context (e.g. a lone
     'elocuencia' -> garbage); hence the generous multi-line budget and
     large minimum."""
-    if not args.line_flush:
+    if not LINE_FLUSH:
         return
     with _lock:
         s = _state["streams"][spk]
-        line = max(40, _state["cols"] - 4)       # one ES▸ row of chars
+        line = max(40, _state["cols"] - 4)       # one translation row of chars
         budget = line * 6                        # allow several rows
         buf = s["cur_live"]
-        minc = max(80, args.min_clause)
+        minc = max(80, MIN_CLAUSE)
         flushed, changed = [], False
         while len(buf) > budget:
             cut = -1
@@ -622,20 +1109,18 @@ def clause_flush(spk):
         if changed:
             # Capture preview BEFORE wiping so the first cut piece
             # inherits a preliminary translation.
-            prelim_es, prelim_en = s["cur_es"], s["cur_en"]
+            prelim = dict(s["cur_tr"])
             s["cur_live"] = buf
-            s["cur_es"] = s["cur_en"] = ""
+            s["cur_tr"] = {}
         else:
-            prelim_es = prelim_en = None
+            prelim = None
         # Visual chunks: NOT is_final. The first cut piece carries the
-        # preview as a preliminary es/en; later pieces in the same flush
-        # weren't visible in the preview, leave their prelim None.
+        # preview as preliminary per-target translations; later pieces in
+        # the same flush weren't visible in the preview, leave prelim None.
         for i, piece in enumerate(flushed):
             if piece:
-                pe = prelim_es if i == 0 else None
-                pn = prelim_en if i == 0 else None
-                _emit_chunk_locked(spk, piece, is_final=False,
-                                   prelim_es=pe, prelim_en=pn)
+                p = prelim if i == 0 else None
+                _emit_chunk_locked(spk, piece, is_final=False, prelim=p)
 
 
 def pause_watcher():
@@ -655,12 +1140,12 @@ def pause_watcher():
 
     delta_t == 0.0 until the first delta on a stream ever arrives: a
     silent direction must not flush a phantom line during startup."""
-    if args.pause_ms <= 0 and args.sentence_close_ms <= 0:
+    if PAUSE_MS <= 0 and SENTENCE_CLOSE_MS <= 0:
         return
-    visual_s = args.pause_ms / 1000.0 if args.pause_ms > 0 else None
-    close_s = (args.sentence_close_ms / 1000.0
-               if args.sentence_close_ms > 0 else None)
-    min_sub = max(12, args.min_clause // 2)
+    visual_s = PAUSE_MS / 1000.0 if PAUSE_MS > 0 else None
+    close_s = (SENTENCE_CLOSE_MS / 1000.0
+               if SENTENCE_CLOSE_MS > 0 else None)
+    min_sub = max(12, MIN_CLAUSE // 2)
     while not _STOP.is_set():
         time.sleep(0.1)
         jobs = []
@@ -683,12 +1168,12 @@ def pause_watcher():
                            open_ids=len(s["open_ids"]),
                            tail_kept=bool(rem and len(rem) >= min_sub))
                     # capture preview before wipe
-                    pe, pn = s["cur_es"], s["cur_en"]
+                    prelim = dict(s["cur_tr"])
                     s["cur_live"] = ""
-                    s["cur_es"] = s["cur_en"] = ""
+                    s["cur_tr"] = {}
                     tail = rem if (rem and len(rem) >= min_sub) else ""
                     job = _emit_chunk_locked(lbl, tail, is_final=True,
-                                             prelim_es=pe, prelim_en=pn)
+                                             prelim=prelim)
                     if job is not None:
                         jobs.append(job)
                 # Short pause: flush a visual chunk, keep the sentence
@@ -698,11 +1183,11 @@ def pause_watcher():
                     _trace("pause_visual", spk=lbl, gap=round(gap, 2),
                            threshold=visual_s, rem=rem[:60],
                            rem_len=len(rem), min_sub=min_sub)
-                    pe, pn = s["cur_es"], s["cur_en"]
+                    prelim = dict(s["cur_tr"])
                     s["cur_live"] = ""
-                    s["cur_es"] = s["cur_en"] = ""
+                    s["cur_tr"] = {}
                     _emit_chunk_locked(lbl, rem, is_final=False,
-                                       prelim_es=pe, prelim_en=pn)
+                                       prelim=prelim)
         for job in jobs:
             _final_q.put(job)
 
@@ -727,9 +1212,9 @@ def recycle_watcher():
         than crash vLLM."""
     if not _AUTO_RECYCLE_ENABLED:
         return
-    silence_s = args.auto_recycle_silence_ms / 1000.0
-    min_age_frames = int(args.auto_recycle_min_s / VAD_FRAME_S)
-    backstop_frames = int(args.auto_recycle_backstop_s / VAD_FRAME_S)
+    silence_s = AUTO_RECYCLE_SILENCE_MS / 1000.0
+    min_age_frames = int(AUTO_RECYCLE_MIN_S / VAD_FRAME_S)
+    backstop_frames = int(AUTO_RECYCLE_BACKSTOP_S / VAD_FRAME_S)
     while not _STOP.is_set():
         time.sleep(0.2)
         now = time.time()
@@ -750,7 +1235,7 @@ def recycle_watcher():
                     # the marker-MT will never see (vLLM's chunks for
                     # the old session are about to be discarded).
                     s["cur_live"] = ""
-                    s["cur_es"] = s["cur_en"] = ""
+                    s["cur_tr"] = {}
                     s["sent_raw"] = ""
                     s["open_ids"] = []
                     s["reset"] = True
@@ -896,13 +1381,12 @@ async def _ws_session(label, q):
                         s = _state["streams"][label]
                         rem = s["cur_live"].strip()
                         if rem or s["open_ids"]:
-                            pe, pn = s["cur_es"], s["cur_en"]
+                            prelim = dict(s["cur_tr"])
                             s["cur_live"] = ""
-                            s["cur_es"] = s["cur_en"] = ""
+                            s["cur_tr"] = {}
                             job = _emit_chunk_locked(label, rem,
                                                     is_final=True,
-                                                    prelim_es=pe,
-                                                    prelim_en=pn)
+                                                    prelim=prelim)
                     if job is not None:
                         _final_q.put(job)
                 elif t == "error":
@@ -952,13 +1436,13 @@ async def _ws_session(label, q):
                 s = _state["streams"][label]
                 rem = s["cur_live"].strip()
                 if rem or s["open_ids"]:
-                    pe, pn = s["cur_es"], s["cur_en"]
+                    prelim = dict(s["cur_tr"])
                     s["cur_live"] = ""
-                    s["cur_es"] = s["cur_en"] = ""
+                    s["cur_tr"] = {}
                     tail = rem if (rem and len(rem)
-                                   >= max(12, args.min_clause // 2)) else ""
+                                   >= max(12, MIN_CLAUSE // 2)) else ""
                     job = _emit_chunk_locked(label, tail, is_final=True,
-                                             prelim_es=pe, prelim_en=pn)
+                                             prelim=prelim)
             if job is not None:
                 _final_q.put(job)
                 time.sleep(2.0)
@@ -969,16 +1453,14 @@ async def _ws_session(label, q):
 def net_thread():
     async def _run():
         loop = asyncio.get_running_loop()
-        if args.dual:
-            tasks = []
-            for src, lbl, _ in DUAL_SOURCES:
-                q = asyncio.Queue()
-                tasks.append(asyncio.create_task(
-                    net_main(src, lbl, q, loop)))
-            await asyncio.gather(*tasks)
-        else:
+        tasks = []
+        for src in SOURCES:
             q = asyncio.Queue()
-            await net_main(None, SOLO, q, loop)
+            # target "-" -> stdin (source_name=None); else pw_reader.
+            sn = None if src["target"] == "-" else src["target"]
+            tasks.append(asyncio.create_task(
+                net_main(sn, src["label"], q, loop)))
+        await asyncio.gather(*tasks)
     try:
         asyncio.run(_run())
     except Exception as e:
@@ -1087,8 +1569,8 @@ def _clear_history():
     at any natural pause effectively resets the duration budget — a
     cheap workaround until we raise --max-model-len for real.
 
-    Live region (cur_live/cur_es/cur_en) is cleared too: the new vLLM
-    session starts with a fresh KV anyway, so keeping the old partial
+    Live region (cur_live/cur_tr) is cleared too: the new vLLM session
+    starts with a fresh KV anyway, so keeping the old partial
     transcription on the client side would just be misleading."""
     with _lock:
         _state["frozen"].clear()
@@ -1097,7 +1579,7 @@ def _clear_history():
         for lbl in STREAMS:
             s = _state["streams"][lbl]
             s["cur_live"] = ""
-            s["cur_es"] = s["cur_en"] = ""
+            s["cur_tr"] = {}
             s["sent_raw"] = ""
             s["open_ids"] = []
             s["reset"] = True      # net_main session loop sees this
@@ -1110,13 +1592,15 @@ def _clear_history():
 
 def _fmt_transcript(frozen, live_snap, dual):
     """Render a frozen snapshot (+ the in-flight live region) to plain
-    text for the Ctrl-W dump. Mirrors the on-screen Live/ES/EN layout
-    without ANSI; lines are left unwrapped so the saved file is a
+    text for the Ctrl-W dump. Mirrors the on-screen Live + per-target
+    layout without ANSI; lines are left unwrapped so the saved file is a
     lossless record (let the reader wrap). `live_snap` is a list of
-    (label, cur_live, cur_es, cur_en)."""
-    def prefixes(spk):
-        head = "" if (spk == SOLO or not dual) else f"[{spk}] "
-        return head + "Live ", head + "ES   ", head + "EN   "
+    (label, cur_live, cur_tr_dict). Frozen rows are
+    (spk, raw, tr_dict, cid)."""
+    def head(spk):
+        return "" if (spk == SOLO or not dual) else f"[{spk}] "
+    def label_pref(spk, code):
+        return f"{head(spk)}{lang_label(code):<4} "
     def field(val):
         if val is None:
             return "⋯"          # pending translation
@@ -1124,27 +1608,26 @@ def _fmt_transcript(frozen, live_snap, dual):
             return "—"          # marker-split placed content elsewhere
         return val
     out = []
-    for spk, raw, es, en, _cid in frozen:
+    for spk, raw, tr, _cid in frozen:
         if spk == NOTICE:
             out.append(f"    ── {raw} ──")
             out.append("")
             continue
-        lp, ep, ne = prefixes(spk)
-        out.append(lp + raw)
-        out.append(ep + field(es))
-        out.append(ne + field(en))
+        tgts = SRC_BY_LABEL[spk]["tgt_langs"] if spk in SRC_BY_LABEL else []
+        out.append(f"{head(spk)}Live " + raw)
+        for code in tgts:
+            out.append(label_pref(spk, code) + field(tr.get(code)))
         out.append("")
-    live = [(lbl, cl, ce, cen) for lbl, cl, ce, cen in live_snap
-            if cl or ce or cen]
+    live = [(lbl, cl, ct) for lbl, cl, ct in live_snap if cl or any(ct.values())]
     if live:
         out.append("(live, in progress)")
-        for lbl, cl, ce, cen in live:
-            lp, ep, ne = prefixes(lbl)
-            out.append(lp + cl)
-            if ce:
-                out.append(ep + ce)
-            if cen:
-                out.append(ne + cen)
+        for lbl, cl, ct in live:
+            tgts = SRC_BY_LABEL[lbl]["tgt_langs"] if lbl in SRC_BY_LABEL else []
+            out.append(f"{head(lbl)}Live " + cl)
+            for code in tgts:
+                v = ct.get(code)
+                if v:
+                    out.append(label_pref(lbl, code) + v)
             out.append("")
     return "\n".join(out)
 
@@ -1161,13 +1644,12 @@ def _write_transcript():
     while os.path.exists(path):
         path = f"{base}-{n}.txt"
         n += 1
-    dual = STREAMS != [SOLO]
+    dual = not IS_SOLO
     with _lock:
         frozen = list(_state["frozen"])
         live_snap = [(lbl,
                       _state["streams"][lbl]["cur_live"],
-                      _state["streams"][lbl]["cur_es"],
-                      _state["streams"][lbl]["cur_en"])
+                      dict(_state["streams"][lbl]["cur_tr"]))
                      for lbl in STREAMS]
     header = "ASR transcript\n" + "=" * 50 + "\n\n"
     body = _fmt_transcript(frozen, live_snap, dual)
@@ -1188,7 +1670,7 @@ def _write_transcript():
     with _lock:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1
-        _state["frozen"].append((NOTICE, msg, None, None, cid))
+        _state["frozen"].append((NOTICE, msg, {}, cid))
         _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
 
 
@@ -1291,10 +1773,9 @@ def render():
                             for lbl in STREAMS}
                 snap = [(lbl,
                          _state["streams"][lbl]["cur_live"],
-                         _state["streams"][lbl]["cur_es"],
-                         _state["streams"][lbl]["cur_en"])
+                         dict(_state["streams"][lbl]["cur_tr"]))
                         for lbl in STREAMS]
-            dual = STREAMS != [SOLO]
+            dual = not IS_SOLO
             now = time.time()
             def _mark(t):
                 return "●" if (now - t) < 1.5 else "○"
@@ -1348,7 +1829,7 @@ def render():
             else:
                 rc_tag = ""
                 age_tag = ""
-            head_left = (f" asr-tui  │  {status}{audio_tag}"
+            head_left = (f" {APP_NAME}  │  {status}{audio_tag}"
                          f"{rc_tag}{age_tag}  │  {len(frozen)} done  "
                          f"│  ^C quit  ^L clear")
             if scroll_tag:
@@ -1373,54 +1854,46 @@ def render():
                                + ln + CSI + "0m")
                 return out
 
-            # --- live block: three lines per stream — Live (raw
-            # Voxtral transcription), ES (NLLB Spanish translation,
-            # masked-tail preview), EN (NLLB English translation,
-            # masked-tail preview). The whole '[Remote] Live▸ ' /
-            # '[Remote] ES▸ ' / '[Remote] EN▸ ' prefix sits inside the
-            # speaker accent block, so the three label rows form one
-            # visually-coherent colored stripe per stream.
-            live = []   # list[str] (fully ANSI-formatted)
-            for lbl, ces_live, ces_trans, cen_trans in snap:
+            # --- live block: one Live row per stream (raw Voxtral
+            # transcription), then one row per configured target lang
+            # (NLLB translation, masked-tail preview). The whole
+            # '[Remote] Live▸ ' / '[Remote] EN▸ ' prefix sits inside the
+            # speaker accent block, so the label rows form one visually-
+            # coherent colored stripe per stream. Transcription-only
+            # streams (no targets) render just the Live row.
+            def _pref(lbl, name):
+                raw = f"[{lbl}] {name}" if dual else name
                 if dual:
                     acc = ACCENT.get(lbl, "0")
-                    opener = CSI + acc + "m"
-                    closer = CSI + "0m"
-                    live_raw = f"[{lbl}] Live▸ "
-                    es_raw   = f"[{lbl}] ES▸   "
-                    en_raw   = f"[{lbl}] EN▸   "
-                    live_pref = opener + live_raw + closer
-                    es_pref   = opener + es_raw   + closer
-                    en_pref   = opener + en_raw   + closer
+                    pref = CSI + acc + "m" + raw + CSI + "0m"
                 else:
-                    live_raw = live_pref = "Live▸ "
-                    es_raw   = es_pref   = "ES▸   "
-                    en_raw   = en_pref   = "EN▸   "
-                live_pw = len(live_raw)
-                es_pw   = len(es_raw)
-                en_pw   = len(en_raw)
+                    pref = raw
+                return raw, pref, len(raw)
+            live = []   # list[str] (fully ANSI-formatted)
+            for lbl, ces_live, ctr in snap:
+                tgts = SRC_BY_LABEL[lbl]["tgt_langs"]
+                live_raw, live_pref, live_pw = _pref(lbl, "Live▸ ")
+                # row prefixes per target, label padded to 4 cols.
+                target_prefs = [
+                    (code,) + _pref(lbl, f"{lang_label(code):<4}▸ ")
+                    for code in tgts]
                 # Pending placeholder is the same '⋯' as the history
-                # rows. Dim distinguishes pending vs. real content;
-                # idle channels render only the styled prefix.
+                # rows; idle channels render only the styled prefix.
                 if not ces_live:
                     live.append(live_pref.rstrip())
-                    live.append(es_pref.rstrip())
-                    live.append(en_pref.rstrip())
+                    for _code, _raw, pref, _pw in target_prefs:
+                        live.append(pref.rstrip())
                     continue
-                # Body color is intentionally default (white). The
-                # accent on the prefix and the Live/ES/EN label already
-                # identify channels; coloring the body too produces
-                # inconsistent output because the wrap-continuation
-                # rows can't reproduce the prefix's embedded reset.
+                # Body color default (white): the accent prefix + label
+                # already identify the channel; coloring the body too
+                # breaks on wrap-continuation rows.
                 live.extend(wrap_pref(ces_live, live_pref, live_pw, "0"))
-                if ces_trans:
-                    live.extend(wrap_pref(ces_trans, es_pref, es_pw, "0"))
-                else:
-                    live.append(es_pref + "⋯")
-                if cen_trans:
-                    live.extend(wrap_pref(cen_trans, en_pref, en_pw, "0"))
-                else:
-                    live.append(en_pref + "⋯")
+                for code, _raw, pref, pw in target_prefs:
+                    val = ctr.get(code)
+                    if val:
+                        live.extend(wrap_pref(val, pref, pw, "0"))
+                    else:
+                        live.append(pref + "⋯")
             # never overflow the screen (that would scroll the terminal
             # and corrupt the layout): keep the most recent live lines.
             live_budget = max(2, rows - 2)
@@ -1428,25 +1901,15 @@ def render():
                 live = live[-live_budget:]
             live_h = 1 + len(live)                       # +1 separator
             body_h = max(0, rows - 1 - live_h)
-            # history (most recent at the bottom). Each chunk renders
-            # three lines — Live (raw transcription), ES (NLLB Spanish
-            # translation), EN (NLLB English translation), plus a
-            # separator blank. The whole '[Remote] Live ' / '[Remote]
-            # ES   ' / '[Remote] EN   ' prefix sits inside the speaker
-            # accent block (matches the live region). es/en are None
-            # until the whole sentence is translated, "" when the
-            # marker-split placed that field's content on a neighbor.
-            def _trans_line(tag, tag_w, value, ansi):
-                # Body color is intentionally default (white). The
-                # accent on the prefix and the ES/EN label already
-                # identify channels; coloring the body too produces
-                # inconsistent output because the wrap-continuation
-                # rows can't reproduce the prefix's embedded reset
-                # (so the first row ends up white and later rows
-                # end up `ansi`-colored — the symptom this fixes).
-                # `ansi` is kept in the signature in case we want
-                # per-channel placeholder color back; currently unused.
-                del ansi
+            # history (most recent at the bottom). Each chunk renders a
+            # Live row (raw transcription) plus one row per the stream's
+            # configured target lang, plus a separator blank. The whole
+            # '[Remote] Live ' / '[Remote] EN   ' prefix sits inside the
+            # speaker accent block (matches the live region). A target's
+            # value is None until the whole sentence is translated, ""
+            # when the marker-split placed its content on a neighbour.
+            def _trans_line(tag, tag_w, value):
+                # Body color default (white) — see the live-block note.
                 if value is None:
                     return tag + "⋯"
                 if value == "":
@@ -1454,39 +1917,31 @@ def render():
                 wrapped = wrap(value, max(8, cols - tag_w))
                 return [(tag if i == 0 else " " * tag_w) + ln
                         for i, ln in enumerate(wrapped)]
+
+            def _htag(spk, name):
+                raw = name if spk == SOLO else f"[{spk}] {name}"
+                if spk == SOLO:
+                    return raw, raw, len(raw)
+                acc = ACCENT.get(spk, "0")
+                return raw, CSI + acc + "m" + raw + CSI + "0m", len(raw)
+
             hist = []
-            for spk, raw, es, en, _cid in frozen:
+            for spk, raw, tr, _cid in frozen:
                 if spk == NOTICE:
                     # Dim standalone marker row (Ctrl-W write point).
                     for ln in wrap("── " + raw + " ──", max(8, cols)):
                         hist.append(CSI + "2m" + ln + CSI + "0m")
                     hist.append("")
                     continue
-                if spk == SOLO:
-                    live_tag = live_raw = "Live "
-                    es_tag   = es_raw   = "ES   "
-                    en_tag   = en_raw   = "EN   "
-                else:
-                    acc = ACCENT.get(spk, "0")
-                    opener = CSI + acc + "m"
-                    closer = CSI + "0m"
-                    live_raw = f"[{spk}] Live "
-                    es_raw   = f"[{spk}] ES   "
-                    en_raw   = f"[{spk}] EN   "
-                    live_tag = opener + live_raw + closer
-                    es_tag   = opener + es_raw   + closer
-                    en_tag   = opener + en_raw   + closer
-                live_w = len(live_raw)
-                es_w   = len(es_raw)
-                en_w   = len(en_raw)
+                tgts = (SRC_BY_LABEL[spk]["tgt_langs"]
+                        if spk in SRC_BY_LABEL else [])
+                live_raw, live_tag, live_w = _htag(spk, "Live ")
                 # Live (raw) — never None/empty: it's what got emitted.
                 for i, ln in enumerate(wrap(raw, max(8, cols - live_w))):
-                    hist.append((live_tag if i == 0 else " " * live_w)
-                                + ln)
-                for fn, tag, tag_w, ansi in (
-                        (es, es_tag, es_w, "33"),   # yellow for ES
-                        (en, en_tag, en_w, "36")):  # cyan for EN
-                    out = _trans_line(tag, tag_w, fn, ansi)
+                    hist.append((live_tag if i == 0 else " " * live_w) + ln)
+                for code in tgts:
+                    _r, tag, tag_w = _htag(spk, f"{lang_label(code):<4} ")
+                    out = _trans_line(tag, tag_w, tr.get(code))
                     if isinstance(out, list):
                         hist.extend(out)
                     else:
@@ -1537,15 +1992,16 @@ def render():
 
 
 def plain_loop():
-    # mt_worker prints ES/EN on finalize; just keep alive + show live EN
+    # mt_worker prints the per-target chunks on finalize; just keep
+    # alive + show the active stream's first-target live preview.
     last = ""
     while True:
         if _STOP.is_set():
             return
         _, act, _, cen, _, _ = st_get()
         if cen and cen != last:
-            tag = "" if act == SOLO else f"[{act}] "
-            sys.stderr.write(f"\r[live EN] {tag}{cen[:120]}\033[K")
+            tag = "" if (act == SOLO or IS_SOLO) else f"[{act}] "
+            sys.stderr.write(f"\r[live] {tag}{cen[:120]}\033[K")
             sys.stderr.flush()
             last = cen
         time.sleep(0.2)
@@ -1575,7 +2031,7 @@ def main():
             render()
         finally:
             _tty_restore()
-    print("[asr-tui] bye.", file=sys.stderr)
+    print(f"[{APP_NAME}] bye.", file=sys.stderr)
 
 
 if __name__ == "__main__":

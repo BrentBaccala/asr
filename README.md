@@ -56,8 +56,8 @@ into context-free pieces.
   speaker-tagged history.
 - **Whole-sentence marker-MT** — chunks become visible as they're
   spoken (`⋯` placeholder), then backfill with proper chunk-aligned
-  translation when the sentence completes. No more `elocuencia` →
-  `I'm not a good speaker` from context-free fragments.
+  translation once the sentence completes, avoiding the garbled output
+  you get from translating three-word fragments in isolation.
 - **Multi-stream concurrent transcription** — independent vLLM sessions
   per source, separately auto-recycled. The built-in **`dual`** profile
   (`--profile dual`) expands to the author's two RTP phone-call sources
@@ -497,8 +497,7 @@ needed), you have four options:
 - **stdin** — `pw-record --target <src> --format=s16 --rate=16000
   --channels=1 - | freesoft-asr --source -`.
 - **Multi-stream with local sources** — repeat `--source` for each, or
-  list them as `[[source]]` tables in the config. No need to rename your
-  PipeWire nodes to the `rtp_call_*` names any more.
+  list them as `[[source]]` tables in the config.
 
 ## Alternative streaming scripts (in this repo for reference)
 
@@ -522,11 +521,10 @@ for the final TUI. Each is self-contained — reads raw 16-bit-LE mono
 | `stream-canary.py` | canary-1b-flash (NeMo) | single-pass ASR + translation |
 | `stream-cacheaware.py` | NeMo fastconformer | true cache-aware English streaming |
 
-`asr-call-transcribe` is a faster-whisper dual-stream transcriber
-that predates `freesoft-asr --profile dual`. Same `rtp_call_remote_source` /
-`rtp_call_me_source` audio-input architecture but with whisper
-instead of Voxtral + NLLB. Kept as the reference design for the
-two-source plumbing.
+`asr-call-transcribe` is a faster-whisper dual-stream transcriber using
+the same `rtp_call_remote_source` / `rtp_call_me_source` audio-input
+architecture, but with whisper in place of Voxtral + NLLB — an
+alternative reference implementation of the two-source plumbing.
 
 Setup commands for recreating any of these venvs and downloading the
 models they need are in **[INSTALL.md](INSTALL.md#recreating-the-alternative-venvs-and-models)**.

@@ -8,6 +8,12 @@ two-channel phone-call transcription with separately-labelled
 `[Remote]` and `[Local]` streams, but the single-stream path works with
 any local or piped audio source.
 
+![asr-tui transcribing a bilingual phone call in real time](demo.gif)
+
+*Above: a live call to an automated bilingual hotline. `[Remote]` (cyan)
+is the far end, `[Local]` (green) is the near end; each shows the raw
+Voxtral transcription plus inline Spanish and English translation.*
+
 Three views per channel render in the live panel:
 
 ```

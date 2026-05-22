@@ -1169,15 +1169,18 @@ def _write_transcript():
                       _state["streams"][lbl]["cur_es"],
                       _state["streams"][lbl]["cur_en"])
                      for lbl in STREAMS]
-    header = (f"ASR transcript\n"
-              f"Written: {time.strftime('%d %b %Y %H:%M:%S %Z', now)}\n"
-              + "=" * 50 + "\n\n")
+    header = "ASR transcript\n" + "=" * 50 + "\n\n"
     body = _fmt_transcript(frozen, live_snap, dual)
     hhmmss = time.strftime("%H:%M:%S", now)
+    msg = f"transcript written to {path} at {hhmmss}"
+    # The creating write gets the same dim ── marker as every other write
+    # point, placed at the very bottom of the file (after any in-flight
+    # live region). Same format _fmt_transcript renders NOTICE rows in, so
+    # this file's footer matches how it'll appear inline in later dumps.
+    trailer = f"    ── {msg} ──\n"
     try:
         with open(path, "w") as f:
-            f.write(header + body + "\n")
-        msg = f"transcript written to {path} at {hhmmss}"
+            f.write(header + body + "\n" + trailer)
     except OSError as e:
         msg = f"transcript write FAILED at {hhmmss}: {e}"
     # Mark the write point in the running transcript regardless of

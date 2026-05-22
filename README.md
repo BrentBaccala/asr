@@ -488,7 +488,7 @@ sender-side action.
 ## Same-host / local-audio variants
 
 If your audio is already on the same machine as Voxtral (no RTP
-needed), you have two options:
+needed), you have four options:
 
 - **Default monitor** — just run `freesoft-asr` (no args) to transcribe
   the default sink's monitor.

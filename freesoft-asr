@@ -1983,12 +1983,12 @@ def render():
             # coherent colored stripe per stream. Transcription-only
             # streams (no targets) render just the Live row.
             def _pref(lbl, name):
+                # Accent the tag whether or not the [label] prefix is
+                # shown — a single unlabelled (SOLO) source still honors
+                # its configured accent colour. Only `raw` is conditional.
                 raw = f"[{lbl}] {name}" if dual else name
-                if dual:
-                    acc = ACCENT.get(lbl, "0")
-                    pref = CSI + acc + "m" + raw + CSI + "0m"
-                else:
-                    pref = raw
+                acc = ACCENT.get(lbl, "0")
+                pref = CSI + acc + "m" + raw + CSI + "0m"
                 return raw, pref, len(raw)
             live = []   # list[str] (fully ANSI-formatted)
             for lbl, ces_live, ctr in snap:
@@ -2040,9 +2040,9 @@ def render():
                         for i, ln in enumerate(wrapped)]
 
             def _htag(spk, name):
+                # Accent the tag even for a single unlabelled (SOLO)
+                # source; only the [label] prefix is conditional.
                 raw = name if spk == SOLO else f"[{spk}] {name}"
-                if spk == SOLO:
-                    return raw, raw, len(raw)
                 acc = ACCENT.get(spk, "0")
                 return raw, CSI + acc + "m" + raw + CSI + "0m", len(raw)
 

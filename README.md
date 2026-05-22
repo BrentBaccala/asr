@@ -335,8 +335,9 @@ The useful consequence here is that a node in that graph need not be
 local hardware. PipeWire ships RTP send/receive modules, so any source
 or sink — the monitor of your laptop's speakers, your microphone — can
 be streamed straight out over the network as UDP. That is exactly how
-`freesoft-asr` gets fed in the phone-call setup: a PipeWire laptop taps
-its own audio and dumps it across the LAN to a server (where the GPU
+`freesoft-asr` gets fed in the phone-call setup: the phone is
+Bluetooth-paired to a PipeWire laptop that taps its own audio and dumps
+it across the LAN to a server (where the GPU
 lives) running the transcriber, so the machine doing the *listening*
 can be nowhere near the machine doing the *transcribing*.
 

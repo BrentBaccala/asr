@@ -100,18 +100,28 @@ DUAL_PRESET = [
 # carry scalar overrides (host, beam, tgt_langs, …) and/or a "sources"
 # list. `--profile NAME` selects one. A config [profiles.NAME] table of
 # the same name fully REPLACES the built-in (simple replace, not merge).
+# Basic interpreter mode: one source = Brent's mic (rtp_call_me_source =
+# the "Local" tap), translate English -> Spanish AND speak the Spanish.
+# A Spanish-in sentence is skipped by the source==target rule
+# (transcription-only, no speak), giving the "Spanish in -> just print"
+# half for free.
+_INTERPRET_SOURCES = [
+    {"target": "rtp_call_me_source", "label": "Local",
+     "accent": "1;32", "src_lang": None,
+     "tgt_langs": ["spa_Latn"], "speak": ["spa_Latn"]},
+]
 BUILTIN_PROFILES = {
     "dual": {"sources": [dict(s) for s in DUAL_PRESET]},
-    # "interpret" (basic interpreter mode): one source = Brent's mic
-    # (rtp_call_me_source = the "Local" tap), translate English -> Spanish
-    # AND speak the Spanish. A Spanish-in sentence is skipped by the
-    # source==target rule (transcription-only, no speak), giving the
-    # "Spanish in -> just print" half for free. See the [tts] block.
-    "interpret": {"sources": [
-        {"target": "rtp_call_me_source", "label": "Local",
-         "accent": "1;32", "src_lang": None,
-         "tgt_langs": ["spa_Latn"], "speak": ["spa_Latn"]},
-    ]},
+    # "interpret": speak Spanish but with no output sink ([tts].output
+    # stays unset -> "would speak" logging only). Audition / dry-run.
+    "interpret": {"sources": [dict(s) for s in _INTERPRET_SOURCES]},
+    # "spanish-tts": interpret + actually send the Spanish TTS to the
+    # pony->samsung RTP return sink (PipeWire node "rtp_tts_sink"; see
+    # 92-rtp-tts-return-sink.conf on pony). Same mic source as interpret;
+    # the only addition is [tts].output so the synthesized Spanish leaves
+    # the box and reaches samsung's headphones.
+    "spanish-tts": {"sources": [dict(s) for s in _INTERPRET_SOURCES],
+                    "tts": {"output": "rtp_tts_sink"}},
 }
 # Accent palette auto-assigned to sources that don't set `accent`.
 ACCENT_PALETTE = ["1;36", "1;32", "1;33", "1;35", "1;34", "1;31"]
@@ -446,6 +456,12 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # accent    = "1;32"
 # tgt_langs = ["spa_Latn"]
 # speak     = ["spa_Latn"]
+#
+# The built-in "spanish-tts" profile is "interpret" wired to a real output:
+# same mic source, plus [tts].output = "rtp_tts_sink" (the pony->samsung RTP
+# return sink). `freesoft-asr --profile spanish-tts` speaks the Spanish over
+# the wire to samsung's headphones. A profile's [tts] deep-merges over the
+# top-level one, so this does NOT clobber your [tts.lang.*] overrides.
 '''
 
 
@@ -600,7 +616,23 @@ if SELECTED_PROFILE is not None:
     for _k, _v in _prof.items():
         if _k == "sources":
             continue
-        CONFIG[_k] = _v
+        if _k == "tts" and isinstance(_v, dict) and isinstance(
+                CONFIG.get("tts"), dict):
+            # Deep-merge the profile's [tts] over the config's (mirrors
+            # load_config): a profile that sets only `output` must NOT
+            # clobber the user's top-level [tts.lang.<code>] overlays.
+            _base = dict(CONFIG["tts"])
+            _base_lang = dict(_base.get("lang", {}))
+            for _tk, _tv in _v.items():
+                if _tk == "lang" and isinstance(_tv, dict):
+                    for _code, _ldef in _tv.items():
+                        _base_lang[_code] = dict(_ldef)
+                    _base["lang"] = _base_lang
+                else:
+                    _base[_tk] = _tv
+            CONFIG["tts"] = _base
+        else:
+            CONFIG[_k] = _v
     # Sources: a profile that defines sources REPLACES the top-level
     # sources; one that defines none inherits them (handled by leaving
     # PROFILE_SOURCES = None).

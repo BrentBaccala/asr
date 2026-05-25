@@ -1313,7 +1313,12 @@ _TTS_REQ_ID = 0
 def _tts_emit_notice(msg: str) -> None:
     """Drop a dim NOTICE marker row into the running transcript (same
     mechanism as the Ctrl-W 'transcript written' notice), so the TUI
-    shows what was spoken."""
+    shows what was spoken. In --plain mode (no TUI render of frozen
+    rows) also print it to stdout so the speak path is observable
+    headless."""
+    if args.plain:
+        sys.stdout.write(f"    ── {msg} ──\n")
+        sys.stdout.flush()
     with _lock:
         cid = _state["next_chunk_id"]
         _state["next_chunk_id"] += 1

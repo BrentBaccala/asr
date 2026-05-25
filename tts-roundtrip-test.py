@@ -150,10 +150,16 @@ def tts(text, language, device, out_wav):
 
 
 def wav_seconds(path):
+    """Duration in seconds. pocket-tts's StreamingWAVWriter leaves a
+    placeholder nframes in the header (it can't know the length upfront),
+    so the wave module misreads it — compute from data size instead via
+    ffprobe (robust against the bogus header)."""
     try:
-        import wave
-        with wave.open(path, "rb") as w:
-            return w.getnframes() / w.getframerate()
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        return float(out)
     except Exception:
         return 0.0
 

@@ -102,6 +102,16 @@ DUAL_PRESET = [
 # the same name fully REPLACES the built-in (simple replace, not merge).
 BUILTIN_PROFILES = {
     "dual": {"sources": [dict(s) for s in DUAL_PRESET]},
+    # "interpret" (basic interpreter mode): one source = Brent's mic
+    # (rtp_call_me_source = the "Local" tap), translate English -> Spanish
+    # AND speak the Spanish. A Spanish-in sentence is skipped by the
+    # source==target rule (transcription-only, no speak), giving the
+    # "Spanish in -> just print" half for free. See the [tts] block.
+    "interpret": {"sources": [
+        {"target": "rtp_call_me_source", "label": "Local",
+         "accent": "1;32", "src_lang": None,
+         "tgt_langs": ["spa_Latn"], "speak": ["spa_Latn"]},
+    ]},
 }
 # Accent palette auto-assigned to sources that don't set `accent`.
 ACCENT_PALETTE = ["1;36", "1;32", "1;33", "1;35", "1;34", "1;31"]
@@ -152,6 +162,39 @@ def lang_label(code: str) -> str:
     return code.split("_")[0][:3].upper()
 
 
+# ---------------- TTS (speak-out) — pocket-tts ----------------
+# FLORES-200 target code -> built-in per-language pocket-tts engine config
+# (engine, model, device, streaming). These are the sane defaults so a
+# config / profile need only list a target in a source's `speak`. Per the
+# 2026-05-23 model-selection research (~/project/reports/
+# interpreter-tts-and-prior-art-research.md): English distills to CPU
+# real-time (2.19x RT); the European languages ship only as bigger `_24l`
+# previews that are below real-time on CPU but real-time on the 3090
+# (spanish_24l 1.67x RT GPU vs 0.72x CPU), so they default to cuda.
+# `streaming` is advisory only in v0 — pocket-tts has NO drivable
+# incremental-text API (text input is a beartype-guarded str; a text
+# generator is rejected; successive shared-state calls truncate on each
+# call's EOS), so eager-speak is per-CLAUSE-block, never sub-clause. The
+# flag selects clause-granularity (true) vs whole-sentence (false) enqueue.
+BUILTIN_TTS_LANG = {
+    "eng_Latn": {"engine": "pocket-tts", "model": "english",
+                 "device": "cpu", "streaming": True},
+    "spa_Latn": {"engine": "pocket-tts", "model": "spanish_24l",
+                 "device": "cuda", "streaming": True},
+    "fra_Latn": {"engine": "pocket-tts", "model": "french_24l",
+                 "device": "cuda", "streaming": True},
+    "deu_Latn": {"engine": "pocket-tts", "model": "german_24l",
+                 "device": "cuda", "streaming": True},
+    "por_Latn": {"engine": "pocket-tts", "model": "portuguese_24l",
+                 "device": "cuda", "streaming": True},
+    "ita_Latn": {"engine": "pocket-tts", "model": "italian_24l",
+                 "device": "cuda", "streaming": True},
+}
+# Path to the synthesis sidecar (ships in the repo next to this script).
+TTS_SYNTH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "tts_synth.py")
+
+
 # ---------------- configuration ----------------
 # Built-in defaults — the single source of truth for every setting.
 # Config file overlays these; CLI flags override both. The keys are the
@@ -186,6 +229,14 @@ DEFAULTS = {
     # Profile selected when no --profile is given on the CLI. None =>
     # no profile (top-level config / monitor default).
     "default_profile": None,
+    # ---- TTS (speak-out) ----
+    # [tts] table. `output` is the PipeWire sink target passed to pw-play
+    # --target; None/"" => no real playback (the worker logs "would speak"
+    # so the cascade is still observable). `lang` is a dict of FLORES-200
+    # code -> per-language engine overlay merged over BUILTIN_TTS_LANG.
+    # The TTS sidecars are only spun up if at least one resolved source
+    # has a non-empty `speak` (mirrors the D3 NLLB lazy-load rule).
+    "tts": {"output": None, "lang": {}},
 }
 
 
@@ -221,7 +272,22 @@ def load_config(path: str) -> dict:
                     pdict["sources"] = [dict(s) for s in psrcs]
                 cfg["profiles"][name] = pdict
         for k, v in data.items():
-            cfg[k] = v
+            if k == "tts" and isinstance(v, dict):
+                # Deep-merge the [tts] table: keep DEFAULTS["tts"] keys
+                # the file omits, and merge [tts.lang.<code>] overlays
+                # rather than replacing the whole lang map.
+                base = dict(cfg["tts"])
+                base_lang = dict(base.get("lang", {}))
+                for tk, tv in v.items():
+                    if tk == "lang" and isinstance(tv, dict):
+                        for code, ldef in tv.items():
+                            base_lang[code] = dict(ldef)
+                        base["lang"] = base_lang
+                    else:
+                        base[tk] = tv
+                cfg["tts"] = base
+            else:
+                cfg[k] = v
         if srcs is not None:
             cfg["sources"] = [dict(s) for s in srcs]
     # Names that came from the config file (a config profile of the same
@@ -293,10 +359,17 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 #               colour is auto-assigned when unset).
 #   src_lang  : per-stream source-language override (optional).
 #   tgt_langs : per-stream targets (optional; inherits global tgt_langs).
+#   speak     : per-stream list of target codes to VOCALIZE via TTS
+#               (optional; each must also be in this source's tgt_langs).
+#               Empty/absent => no TTS. A code equal to the detected
+#               source is not spoken (translate_multi passes it through —
+#               speaking it would echo the input back), so "speak the
+#               translation only" comes for free.
 #
 # [[source]]
 # target    = "monitor"
 # tgt_langs = ["spa_Latn"]
+# speak     = ["spa_Latn"]      # vocalize the Spanish translation
 
 # ---- profiles (named full config overlays) ----
 # A [profiles.<name>] table is a FULL overlay selected with
@@ -335,6 +408,44 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # [profiles.tv]
 # beam      = 4
 # tgt_langs = ["eng_Latn"]
+
+# ---- TTS (speak-out) ----
+# The [tts] table configures text-to-speech for any source `speak`
+# targets. The TTS sidecars (one pocket-tts process per speak-language,
+# in a dedicated venv) are only started if at least one source has a
+# non-empty `speak` — the bare tool is byte-for-byte unaffected.
+# [tts]
+# # output: the PipeWire sink target passed to pw-play --target. Unset
+# # (or "") => no real playback; the worker logs a "would speak: <text>"
+# # NOTICE row instead so the cascade stays observable (the RTP return
+# # path to a real headphone sink is a separate follow-up).
+# # output = "my_headphones_sink"
+#
+# # Per-language engine config. Sane built-in defaults exist for
+# # eng_Latn (english / cpu / streaming) and spa_Latn (spanish_24l /
+# # cuda / streaming) plus fr/de/pt/it (_24l / cuda); you only need a
+# # [tts.lang.<code>] block to override one. `streaming = true` speaks at
+# # clause granularity; `false` waits for the whole sentence. (pocket-tts
+# # has no sub-clause text-streaming API, so "streaming" is per-clause
+# # blocks, never mid-clause.)
+# [tts.lang.spa_Latn]
+# engine    = "pocket-tts"
+# model     = "spanish_24l"
+# device    = "cuda"
+# streaming = true
+
+# The built-in "interpret" profile (basic interpreter mode): one source =
+# rtp_call_me_source (the mic / "Local" tap), tgt_langs = ["spa_Latn"],
+# speak = ["spa_Latn"]. English in -> spoken Spanish; Spanish in ->
+# transcription only (the source==target skip). Run with
+# `freesoft-asr --profile interpret` (set [tts].output to a real sink for
+# live playback). Defining it here REPLACES the built-in:
+# [[profiles.interpret.source]]
+# target    = "rtp_call_me_source"
+# label     = "Local"
+# accent    = "1;32"
+# tgt_langs = ["spa_Latn"]
+# speak     = ["spa_Latn"]
 '''
 
 
@@ -577,8 +688,26 @@ def _build_sources():
             else GLOBAL_TGT_LANGS)
         if args.no_translate:
             tgt_langs = []
+        # `speak`: list of FLORES-200 codes to vocalize for this source.
+        # Each MUST also be in this source's effective tgt_langs (you can
+        # only speak a language you're translating into) — warn + drop a
+        # speak code that isn't. --no-translate clears speak too (nothing
+        # to vocalize). Absent/empty => no TTS (unchanged behaviour).
+        speak = _normalize_lang_list(s.get("speak"))
+        if args.no_translate:
+            speak = []
+        kept = []
+        for code in speak:
+            if code in tgt_langs:
+                kept.append(code)
+            else:
+                print(f"{APP_NAME}: source {lbl!r}: speak code {code!r} is "
+                      f"not in this source's tgt_langs {tgt_langs}; ignoring "
+                      f"(you can only speak a language you translate into).",
+                      file=sys.stderr)
         out.append({"target": tgt, "label": lbl, "accent": accent,
-                    "src_lang": src_lang, "tgt_langs": tgt_langs})
+                    "src_lang": src_lang, "tgt_langs": tgt_langs,
+                    "speak": kept})
     return out
 
 
@@ -592,6 +721,26 @@ ACCENT = {s["label"]: s["accent"] for s in SOURCES}
 # Union of every stream's target languages — drives whether NLLB loads
 # at all (D3: skip the model entirely when no stream translates).
 ANY_TGT_LANGS = any(s["tgt_langs"] for s in SOURCES)
+# Resolved TTS config (deep-merge BUILTIN_TTS_LANG under the config/
+# profile [tts.lang.<code>] overlays). TTS_OUTPUT is the pw-play sink
+# target (None => no-op "would speak" logging). SPEAK_LANGS is the union
+# of every source's resolved `speak` codes — drives whether the TTS
+# sidecars spin up at all (mirrors the D3 NLLB lazy-load rule).
+_tts_cfg = CONFIG.get("tts") or {}
+TTS_OUTPUT = _tts_cfg.get("output") or None
+TTS_LANG_CFG = {}
+for _code, _base in BUILTIN_TTS_LANG.items():
+    TTS_LANG_CFG[_code] = dict(_base)
+for _code, _ovl in (_tts_cfg.get("lang") or {}).items():
+    merged = dict(TTS_LANG_CFG.get(_code, {}))
+    merged.update(_ovl)
+    TTS_LANG_CFG[_code] = merged
+SPEAK_LANGS = []
+for _s in SOURCES:
+    for _c in _s.get("speak", []):
+        if _c not in SPEAK_LANGS:
+            SPEAK_LANGS.append(_c)
+ANY_SPEAK = bool(SPEAK_LANGS)
 # Whether the single-source-no-label collapse is in effect (controls the
 # "[label] " prefix in the UI / transcript dump).
 IS_SOLO = (STREAMS == [SOLO])
@@ -957,6 +1106,12 @@ def _split_on_markers(en: str, expected_n: int) -> list:
 # One job per sentence (not per chunk).
 _final_q: "queue.Queue[tuple]" = queue.Queue()
 
+# TTS speak-out jobs: (lang_code, text). Enqueued from _emit_chunk_locked
+# for each finalized chunk whose target is in the source's `speak` list.
+# Drained by tts_worker, which routes to the per-language sidecar. Only
+# created/used when ANY_SPEAK.
+_speak_q: "queue.Queue[tuple]" = queue.Queue()
+
 
 def _emit_chunk_locked(spk, es_text, is_final, prelim=None):
     """Caller holds _lock. Appends a visual chunk to `frozen` and
@@ -1072,6 +1227,30 @@ def mt_worker():
             with _lock:
                 for cid in open_ids:
                     _backfill_chunk_translations_locked(cid, per_chunk[cid])
+            # --- TTS speak-out (only for this source's `speak` targets) ---
+            # Speak ONLY genuine translations: when the detected source
+            # language equals a speak target (e.g. Spanish-in under the
+            # interpret profile, tgt==src==spa_Latn), translate_multi
+            # passes the text through unchanged — speaking it would echo
+            # the input back, so skip it. That is exactly the "Spanish in
+            # -> just print, don't speak" half of basic interpreter mode.
+            if ANY_SPEAK:
+                speak_codes = [c for c in SRC_BY_LABEL[spk].get("speak", [])
+                               if c != src_lang]
+                for code in speak_codes:
+                    lang_cfg = TTS_LANG_CFG.get(code, {})
+                    if lang_cfg.get("streaming", True):
+                        # Clause granularity: one job per finalized chunk
+                        # segment, in order, skipping empty (merged) segs.
+                        for cid in open_ids:
+                            seg = (per_chunk.get(cid, {}).get(code) or "").strip()
+                            if seg:
+                                _speak_q.put((code, seg))
+                    else:
+                        # Whole-sentence: one job for the full translation.
+                        whole = (full.get(code) or "").strip()
+                        if whole:
+                            _speak_q.put((code, whole))
             if args.plain:
                 tag = "" if (spk == SOLO or IS_SOLO) else f"[{spk}] "
                 with _lock:
@@ -1117,6 +1296,156 @@ def mt_worker():
                 did = True
         if not did:
             time.sleep(0.05)
+
+
+# ---------------- TTS sidecars + worker (speak-out) ----------------
+# One long-lived tts_synth.py subprocess per active speak-language (model
+# load is expensive — keep it warm). Each runs under the dedicated
+# pocket-tts venv (tts_synth.py's shebang) on the configured device. The
+# worker enqueues newline-JSON requests on the sidecar's stdin and reads
+# framed PCM ("AUDIO <id> <nbytes> <sr>\n" + nbytes of s16le) on its
+# stdout, then pipes the PCM to pw-play (or no-op-logs it if TTS_OUTPUT is
+# unset). Lazy: nothing here runs unless ANY_SPEAK.
+_TTS_SIDECARS = {}     # lang_code -> Popen of tts_synth.py
+_TTS_REQ_ID = 0
+
+
+def _tts_emit_notice(msg: str) -> None:
+    """Drop a dim NOTICE marker row into the running transcript (same
+    mechanism as the Ctrl-W 'transcript written' notice), so the TUI
+    shows what was spoken."""
+    with _lock:
+        cid = _state["next_chunk_id"]
+        _state["next_chunk_id"] += 1
+        _state["frozen"].append((NOTICE, msg, {}, cid))
+        _state["frozen"][:] = _state["frozen"][-FROZEN_CAP:]
+
+
+def _start_tts_sidecar(code: str):
+    """Spawn the tts_synth.py sidecar for one speak-language. Returns the
+    Popen, or None on failure (a one-time warning is printed)."""
+    cfg = TTS_LANG_CFG.get(code)
+    if not cfg:
+        print(f"{APP_NAME}: no TTS engine config for speak code {code!r}; "
+              f"not speaking it.", file=sys.stderr)
+        return None
+    # tts_synth.py has its own venv shebang (the pocket-tts env); run it
+    # directly so it does NOT use freesoft-asr's mt-env interpreter.
+    cmd = [TTS_SYNTH_PY,
+           "--language", str(cfg.get("model", "english")),
+           "--device", str(cfg.get("device", "cpu"))]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
+    except Exception as e:
+        print(f"{APP_NAME}: failed to start TTS sidecar for {code} "
+              f"({cfg.get('model')}/{cfg.get('device')}): {e}",
+              file=sys.stderr)
+        return None
+    # Wait for the "ready" header line? The sidecar logs ready on stderr
+    # (DEVNULL here); we instead just trust the first request to block
+    # until the model is up. Read the AUDIO/ERR header is synchronous in
+    # _tts_speak, so the first synth naturally waits for model load.
+    return proc
+
+
+def _read_exact(f, n: int) -> bytes:
+    """Read exactly n bytes from a binary stream (sidecar stdout)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = f.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _tts_speak(code: str, text: str) -> None:
+    """Synthesize `text` in language `code` via its sidecar and play it
+    to TTS_OUTPUT (or no-op-log). Blocking; called from tts_worker."""
+    global _TTS_REQ_ID
+    proc = _TTS_SIDECARS.get(code)
+    if proc is None or proc.poll() is not None:
+        proc = _start_tts_sidecar(code)
+        _TTS_SIDECARS[code] = proc
+        if proc is None:
+            return
+    _TTS_REQ_ID += 1
+    rid = _TTS_REQ_ID
+    try:
+        proc.stdin.write((json.dumps({"id": rid, "text": text}) + "\n").encode())
+        proc.stdin.flush()
+    except Exception as e:
+        print(f"{APP_NAME}: TTS sidecar {code} write failed: {e}",
+              file=sys.stderr)
+        _TTS_SIDECARS[code] = None
+        return
+    # Read the header line.
+    header = b""
+    while not header.endswith(b"\n"):
+        b = proc.stdout.read(1)
+        if not b:
+            break
+        header += b
+    header = header.decode(errors="replace").strip()
+    parts = header.split()
+    if not parts or parts[0] not in ("AUDIO", "ERR"):
+        return
+    if parts[0] == "ERR":
+        return
+    # AUDIO <id> <nbytes> <sr>
+    try:
+        nbytes, sr = int(parts[2]), int(parts[3])
+    except (IndexError, ValueError):
+        return
+    pcm = _read_exact(proc.stdout, nbytes)
+    label = lang_label(code)
+    if not TTS_OUTPUT:
+        # No real sink configured: log it so the cascade is observable.
+        secs = (len(pcm) / 2) / sr if sr else 0.0
+        msg = f"would speak [{label}]: {text}  ({secs:.1f}s @ {sr}Hz)"
+        _tts_emit_notice(msg)
+        return
+    # Play the PCM to the configured PipeWire sink via pw-play (raw s16le
+    # mono at the model sample rate).
+    try:
+        play = subprocess.Popen(
+            ["pw-play", "--target", str(TTS_OUTPUT),
+             f"--rate={sr}", "--channels=1", "--format=s16", "-"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        play.stdin.write(pcm)
+        play.stdin.close()
+        play.wait()
+    except Exception as e:
+        print(f"{APP_NAME}: pw-play failed for {code}: {e}", file=sys.stderr)
+    _tts_emit_notice(f"spoke [{label}]: {text}")
+
+
+def tts_worker():
+    """Drain _speak_q and vocalize each (code, text) item. No-op thread
+    when nothing speaks."""
+    if not ANY_SPEAK:
+        while not _STOP.is_set():
+            try:
+                _speak_q.get(timeout=0.2)
+            except queue.Empty:
+                pass
+        return
+    while not _STOP.is_set():
+        try:
+            code, text = _speak_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        _tts_speak(code, text)
+    # Best-effort: tell sidecars to quit on shutdown.
+    for code, proc in _TTS_SIDECARS.items():
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.write(b'{"quit": true}\n')
+                proc.stdin.flush()
+            except Exception:
+                pass
 
 
 # ---------------- network (asyncio in a thread) ----------------
@@ -2134,6 +2463,7 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     threading.Thread(target=mt_worker, daemon=True).start()
+    threading.Thread(target=tts_worker, daemon=True).start()
     threading.Thread(target=net_thread, daemon=True).start()
     threading.Thread(target=pause_watcher, daemon=True).start()
     threading.Thread(target=recycle_watcher, daemon=True).start()

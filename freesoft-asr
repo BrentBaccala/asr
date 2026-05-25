@@ -1451,11 +1451,19 @@ def _tts_speak(code: str, text: str) -> None:
         # it pw-play hands stdin to libsndfile, which fails to detect a
         # format ("Format not recognised"), exits, and we get a broken
         # pipe writing the PCM.
+        # Trailing-silence pad: pw-play disconnects from the RTP sender
+        # sink the instant stdin EOFs, dropping whatever audio is still in
+        # flight (PipeWire quantum + RTP packetization + receiver jitter
+        # buffer). Without a pad that lost tail is real speech — the last
+        # syllable audibly clips. Padding ~0.5 s of silence flushes the
+        # real tail and lets only the silence be dropped. Tune via the
+        # 0.5 factor if the clip persists (raise) or feels laggy (lower).
+        pad = b"\x00\x00" * int(sr * 0.5)
         play = subprocess.Popen(
             ["pw-play", "--raw", "--target", str(TTS_OUTPUT),
              f"--rate={sr}", "--channels=1", "--format=s16", "-"],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        play.stdin.write(pcm)
+        play.stdin.write(pcm + pad)
         play.stdin.close()
         play.wait()
     except Exception as e:

@@ -57,6 +57,16 @@ def _log(obj):
     sys.stderr.flush()
 
 
+# pocket-tts emits audio at 12.5 frames/s (80 ms/frame). Once the EOS
+# token fires, generate_audio appends only a few trailing frames by
+# default (spanish_24l sets no model_recommended_frames_after_eos, so it
+# falls to a guess of ~3-5), which clips the final syllable of the spoken
+# output. Force a generous tail so the last syllable fully renders. 8 is
+# french_24l's own recommended value (= 640 ms). Lower toward 4-5 if a
+# trailing silence/breath becomes noticeable; raise if it still clips.
+FRAMES_AFTER_EOS = 8
+
+
 def main():
     ap = argparse.ArgumentParser(description="Pocket TTS synthesis sidecar")
     ap.add_argument("--language", required=True,
@@ -114,7 +124,7 @@ def main():
             # True => each utterance independent (no EOS bleed).
             audio = model.generate_audio(
                 model_state=voice_state, text_to_generate=text,
-                copy_state=True)
+                frames_after_eos=FRAMES_AFTER_EOS, copy_state=True)
             gen_ms = (time.monotonic() - t0) * 1000.0
             # audio is a float tensor in [-1, 1], shape [samples] (the
             # short-text path yields [samples]; generate_audio cats on

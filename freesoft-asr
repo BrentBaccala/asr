@@ -1447,8 +1447,12 @@ def _tts_speak(code: str, text: str) -> None:
     # Play the PCM to the configured PipeWire sink via pw-play (raw s16le
     # mono at the model sample rate).
     try:
+        # --raw is REQUIRED: we feed headerless s16 PCM on stdin. Without
+        # it pw-play hands stdin to libsndfile, which fails to detect a
+        # format ("Format not recognised"), exits, and we get a broken
+        # pipe writing the PCM.
         play = subprocess.Popen(
-            ["pw-play", "--target", str(TTS_OUTPUT),
+            ["pw-play", "--raw", "--target", str(TTS_OUTPUT),
              f"--rate={sr}", "--channels=1", "--format=s16", "-"],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         play.stdin.write(pcm)

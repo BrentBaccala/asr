@@ -481,6 +481,10 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # # engine = "piper"
 # # model  = "es_ES-davefx-medium"   # male; sharvard-medium is female (default)
 # # device = "cpu"
+# # `voice` overrides the speaker without touching `model` (for Piper it
+# # picks a different .onnx; for pocket-tts a predefined speaker). The CLI
+# # --tts-voice <VOICE> overrides it for every speak language (quick A/B):
+# # voice = "es_ES-davefx-medium"
 
 # The built-in "interpret" profile (basic interpreter mode): one source =
 # rtp_call_me_source (the mic / "Local" tap), tgt_langs = ["spa_Latn"],
@@ -620,6 +624,13 @@ ap.add_argument("--tts-speed", type=float, default=None, metavar="X",
                      "speed knob, so this pitch-preservingly time-stretches "
                      "the audio via ffmpeg atempo (range 0.5-2.0). Overrides "
                      "[tts].speed.")
+ap.add_argument("--tts-voice", default=None, metavar="VOICE",
+                help="override the TTS voice for every speak language (handy "
+                     "for A/B-ing voices). For Piper this is the voice id / "
+                     ".onnx (e.g. es_ES-davefx-medium, under ~/asr/piper-"
+                     "voices); for pocket-tts the predefined speaker (e.g. "
+                     "lola). Overrides [tts.lang.<code>].voice. Single-language "
+                     "convenience; per-language use the config key.")
 args = ap.parse_args()
 
 # --write-config: emit the commented default and exit before anything
@@ -814,6 +825,9 @@ TTS_OUTPUT = _tts_cfg.get("output") or None
 # synthesis (pre-RTP), one numbered WAV per spoken clip, for replay against
 # what was heard over the wire. Numbering continues past existing files so
 # reruns append instead of clobbering.
+# TTS voice override (CLI --tts-voice; per-language [tts.lang.<code>].voice
+# is the fallback, applied in _start_tts_sidecar). None => engine/lang default.
+TTS_VOICE = args.tts_voice or None
 TTS_DUMP_DIR = args.tts_dump_dir or _tts_cfg.get("dump_dir") or None
 _TTS_DUMP_N = 1
 if TTS_DUMP_DIR:
@@ -1458,14 +1472,21 @@ def _start_tts_sidecar(code: str):
     # piper -> piper-env), run directly so it does NOT use freesoft-asr's
     # mt-env interpreter. `engine` selects which.
     engine = str(cfg.get("engine", "pocket-tts"))
+    # Voice override: CLI --tts-voice wins over a per-language [tts.lang.<code>]
+    # `voice` key. For Piper the voice IS the model (.onnx), so it selects a
+    # different voice file; for pocket-tts it's the predefined speaker (the
+    # language model is unchanged).
+    voice = TTS_VOICE or cfg.get("voice")
     if engine == "piper":
         cmd = [TTS_SYNTH_PIPER_PY,
-               "--voice", str(cfg.get("model", "es_ES-sharvard-medium")),
+               "--voice", str(voice or cfg.get("model", "es_ES-sharvard-medium")),
                "--device", str(cfg.get("device", "cpu"))]
-    else:  # pocket-tts
+    else:  # pocket-tts: model = language id; voice = predefined speaker
         cmd = [TTS_SYNTH_PY,
                "--language", str(cfg.get("model", "english")),
                "--device", str(cfg.get("device", "cpu"))]
+        if voice:
+            cmd += ["--voice", str(voice)]
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

@@ -247,7 +247,7 @@ DEFAULTS = {
     # code -> per-language engine overlay merged over BUILTIN_TTS_LANG.
     # The TTS sidecars are only spun up if at least one resolved source
     # has a non-empty `speak` (mirrors the D3 NLLB lazy-load rule).
-    "tts": {"output": None, "lang": {}, "dump_dir": None},
+    "tts": {"output": None, "lang": {}, "dump_dir": None, "speed": 1.0},
 }
 
 
@@ -432,9 +432,14 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # # path to a real headphone sink is a separate follow-up).
 # # output = "my_headphones_sink"
 # # dump_dir: if set, write each synthesized clip as a numbered WAV
-# # (NNNN_<lang>_<slug>.wav) here — the raw synthesis, before RTP playback,
+# # (NNNN_<lang>_<slug>.wav) here — the synthesis (post-speed, pre-RTP),
 # # for replay/inspection. CLI --tts-dump-dir overrides this. Off if unset.
 # # dump_dir = "/tmp/freesoft-asr-clips"
+# # speed: speaking-rate multiplier (<1 slower, >1 faster, 1.0 unchanged).
+# # pocket-tts has no native speed knob, so this pitch-preservingly
+# # time-stretches the audio via ffmpeg atempo (range 0.5-2.0). CLI
+# # --tts-speed overrides this. e.g. 0.85 = ~15% slower.
+# # speed = 1.0
 #
 # # Per-language engine config. Sane built-in defaults exist for
 # # eng_Latn (english / cpu / streaming) and spa_Latn (spanish_24l /
@@ -578,9 +583,15 @@ ap.add_argument("--trace-emit", action="store_true",
 ap.add_argument("--tts-dump-dir", default=None, metavar="DIR",
                 help="dump each synthesized TTS clip to DIR as a numbered "
                      "WAV (NNNN_<lang>_<slug>.wav) for replay/inspection. "
-                     "The raw synthesis, before RTP playback. Numbering "
+                     "The synthesis (post-speed, pre-RTP). Numbering "
                      "continues past existing files so reruns don't clobber. "
                      "Overrides [tts].dump_dir. Off unless set.")
+ap.add_argument("--tts-speed", type=float, default=None, metavar="X",
+                help="speaking-rate multiplier for spoken TTS: <1 = slower, "
+                     ">1 = faster (1.0 = unchanged). pocket-tts has no native "
+                     "speed knob, so this pitch-preservingly time-stretches "
+                     "the audio via ffmpeg atempo (range 0.5-2.0). Overrides "
+                     "[tts].speed.")
 args = ap.parse_args()
 
 # --write-config: emit the commented default and exit before anything
@@ -785,6 +796,22 @@ if TTS_DUMP_DIR:
     _TTS_DUMP_N = (max(_nums) + 1) if _nums else 1
     print(f"{APP_NAME}: dumping TTS clips to {TTS_DUMP_DIR} "
           f"(starting at {_TTS_DUMP_N:04d})", file=sys.stderr)
+# TTS speaking-rate multiplier (<1 slower). pocket-tts has no native speed
+# control, so speech is time-stretched pitch-preservingly via ffmpeg atempo
+# (single-filter range 0.5-2.0; clamped). 1.0 => no stretch (no ffmpeg call).
+_spd = args.tts_speed if args.tts_speed is not None else _tts_cfg.get("speed")
+TTS_SPEED = float(_spd) if _spd else 1.0
+if TTS_SPEED <= 0:
+    TTS_SPEED = 1.0
+if TTS_SPEED != 1.0 and not (0.5 <= TTS_SPEED <= 2.0):
+    _clamped = min(2.0, max(0.5, TTS_SPEED))
+    print(f"{APP_NAME}: tts speed {TTS_SPEED} out of atempo range; "
+          f"clamping to {_clamped}", file=sys.stderr)
+    TTS_SPEED = _clamped
+if TTS_SPEED != 1.0:
+    print(f"{APP_NAME}: TTS speed = {TTS_SPEED} "
+          f"({'slower' if TTS_SPEED < 1 else 'faster'}, pitch-preserving)",
+          file=sys.stderr)
 TTS_LANG_CFG = {}
 for _code, _base in BUILTIN_TTS_LANG.items():
     TTS_LANG_CFG[_code] = dict(_base)
@@ -1412,6 +1439,22 @@ def _start_tts_sidecar(code: str):
     return proc
 
 
+def _time_stretch(pcm: bytes, sr: int, speed: float) -> bytes:
+    """Pitch-preserving tempo change of s16le mono PCM via ffmpeg atempo.
+    speed<1 => slower, >1 => faster; sample rate is unchanged (only the
+    sample count changes). Returns the original pcm on any failure."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "s16le", "-ar", str(sr),
+             "-ac", "1", "-i", "-", "-filter:a", f"atempo={speed}",
+             "-f", "s16le", "-ar", str(sr), "-ac", "1", "-"],
+            input=pcm, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return r.stdout or pcm
+    except Exception as e:
+        print(f"{APP_NAME}: TTS time-stretch failed: {e}", file=sys.stderr)
+        return pcm
+
+
 def _read_exact(f, n: int) -> bytes:
     """Read exactly n bytes from a binary stream (sidecar stdout)."""
     buf = bytearray()
@@ -1462,9 +1505,13 @@ def _tts_speak(code: str, text: str) -> None:
     except (IndexError, ValueError):
         return
     pcm = _read_exact(proc.stdout, nbytes)
+    # Optional pitch-preserving slow-down/speed-up (pocket-tts has no native
+    # speed knob). Applied before dump + playback so both reflect what's heard.
+    if TTS_SPEED != 1.0 and pcm:
+        pcm = _time_stretch(pcm, sr, TTS_SPEED)
     label = lang_label(code)
-    # Optional: dump the raw synthesized clip as a numbered WAV (for
-    # replay / comparing the clean synthesis against the RTP playback).
+    # Optional: dump the synthesized clip as a numbered WAV (for replay /
+    # comparing the clean synthesis against the RTP playback).
     if TTS_DUMP_DIR and pcm:
         slug = re.sub(r"[^A-Za-z0-9]+", "_", text)[:32].strip("_") or "clip"
         fn = os.path.join(TTS_DUMP_DIR, f"{_TTS_DUMP_N:04d}_{code}_{slug}.wav")

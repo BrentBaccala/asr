@@ -190,8 +190,16 @@ def lang_label(code: str) -> str:
 BUILTIN_TTS_LANG = {
     "eng_Latn": {"engine": "pocket-tts", "model": "english",
                  "device": "cpu", "streaming": True},
-    "spa_Latn": {"engine": "pocket-tts", "model": "spanish_24l",
-                 "device": "cuda", "streaming": True},
+    # Spanish defaults to PIPER (es_ES-sharvard-medium): pocket-tts's
+    # spanish/spanish_24l drop or mangle the first word ~50% of the time on
+    # short utterances (temperature-independent, measured). Piper is
+    # deterministic and reliable. To A/B pocket-tts, override in config:
+    #   [tts.lang.spa_Latn]
+    #   engine = "pocket-tts"
+    #   model  = "spanish_24l"
+    #   device = "cuda"
+    "spa_Latn": {"engine": "piper", "model": "es_ES-sharvard-medium",
+                 "device": "cpu", "streaming": True},
     "fra_Latn": {"engine": "pocket-tts", "model": "french_24l",
                  "device": "cuda", "streaming": True},
     "deu_Latn": {"engine": "pocket-tts", "model": "german_24l",
@@ -204,6 +212,9 @@ BUILTIN_TTS_LANG = {
 # Path to the synthesis sidecar (ships in the repo next to this script).
 TTS_SYNTH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "tts_synth.py")
+# Piper sidecar (engine="piper"): deterministic VITS, reliable onsets.
+TTS_SYNTH_PIPER_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "tts_synth_piper.py")
 
 
 # ---------------- configuration ----------------
@@ -450,18 +461,26 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # # lead_pad_ms = 400
 # # tail_pad_ms = 300
 #
-# # Per-language engine config. Sane built-in defaults exist for
-# # eng_Latn (english / cpu / streaming) and spa_Latn (spanish_24l /
-# # cuda / streaming) plus fr/de/pt/it (_24l / cuda); you only need a
-# # [tts.lang.<code>] block to override one. `streaming = true` speaks at
-# # clause granularity; `false` waits for the whole sentence. (pocket-tts
-# # has no sub-clause text-streaming API, so "streaming" is per-clause
-# # blocks, never mid-clause.)
+# # Per-language engine config. Built-in defaults: eng_Latn = pocket-tts
+# # english/cpu; spa_Latn = PIPER es_ES-sharvard-medium/cpu (reliable — see
+# # below); fr/de/pt/it = pocket-tts _24l/cuda. Override per language with a
+# # [tts.lang.<code>] block. `engine` is "piper" (deterministic VITS, voices
+# # under ~/asr/piper-voices, `model` = voice id) or "pocket-tts" (`model` =
+# # language id). `streaming = true` speaks at clause granularity; `false`
+# # waits for the whole sentence (neither engine streams sub-clause text).
+# #
+# # Spanish defaults to Piper because pocket-tts's spanish/spanish_24l drop
+# # or mangle the first word ~50% of the time on short utterances (known
+# # open bug kyutai-labs/pocket-tts#174). To A/B the pocket-tts voice:
 # [tts.lang.spa_Latn]
 # engine    = "pocket-tts"
 # model     = "spanish_24l"
 # device    = "cuda"
 # streaming = true
+# # Or a different Piper Spanish voice (downloaded under ~/asr/piper-voices):
+# # engine = "piper"
+# # model  = "es_ES-davefx-medium"   # male; sharvard-medium is female (default)
+# # device = "cpu"
 
 # The built-in "interpret" profile (basic interpreter mode): one source =
 # rtp_call_me_source (the mic / "Local" tap), tgt_langs = ["spa_Latn"],
@@ -1435,11 +1454,18 @@ def _start_tts_sidecar(code: str):
         print(f"{APP_NAME}: no TTS engine config for speak code {code!r}; "
               f"not speaking it.", file=sys.stderr)
         return None
-    # tts_synth.py has its own venv shebang (the pocket-tts env); run it
-    # directly so it does NOT use freesoft-asr's mt-env interpreter.
-    cmd = [TTS_SYNTH_PY,
-           "--language", str(cfg.get("model", "english")),
-           "--device", str(cfg.get("device", "cpu"))]
+    # Each sidecar has its own venv shebang (pocket-tts -> tts-env;
+    # piper -> piper-env), run directly so it does NOT use freesoft-asr's
+    # mt-env interpreter. `engine` selects which.
+    engine = str(cfg.get("engine", "pocket-tts"))
+    if engine == "piper":
+        cmd = [TTS_SYNTH_PIPER_PY,
+               "--voice", str(cfg.get("model", "es_ES-sharvard-medium")),
+               "--device", str(cfg.get("device", "cpu"))]
+    else:  # pocket-tts
+        cmd = [TTS_SYNTH_PY,
+               "--language", str(cfg.get("model", "english")),
+               "--device", str(cfg.get("device", "cpu"))]
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

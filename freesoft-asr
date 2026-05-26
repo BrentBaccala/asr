@@ -119,10 +119,14 @@ BUILTIN_PROFILES = {
     # "spanish-tts": interpret + actually send the Spanish TTS to the
     # pony->samsung RTP return sink (PipeWire node "rtp_tts_sink"; see
     # 92-rtp-tts-return-sink.conf on pony). Same mic source as interpret;
-    # the only addition is [tts].output so the synthesized Spanish leaves
-    # the box and reaches samsung's headphones.
+    # [tts].output sends the synthesized Spanish out to samsung's
+    # headphones. sentence_close_ms=1000 commits/speaks ~1s after you pause
+    # (vs the 3000 default) — the dominant latency lever; since it's below
+    # the 1500 pause_ms it runs single-tier (closes at 1.0s, the visual-
+    # chunk tier is inert), which is what we want for short utterances.
     "spanish-tts": {"sources": [dict(s) for s in _INTERPRET_SOURCES],
-                    "tts": {"output": "rtp_tts_sink"}},
+                    "tts": {"output": "rtp_tts_sink"},
+                    "sentence_close_ms": 1000},
 }
 # Accent palette auto-assigned to sources that don't set `accent`.
 ACCENT_PALETTE = ["1;36", "1;32", "1;33", "1;35", "1;34", "1;31"]

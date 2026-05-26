@@ -43,10 +43,16 @@ Type=exec
 # launcher exported the same prefix on PATH for the same reason.
 Environment=PATH=%h/asr/vllm-env/bin:/usr/local/bin:/usr/bin:/bin
 Environment=VLLM_DISABLE_COMPILE_CACHE=1
+# --gpu-memory-utilization 0.85 (was 0.92): leaves ~4.3 GiB free on the 3090
+# so ollama's bge-m3 (~1.7 GiB, loaded by lightrag/find-compaction) coexists,
+# and so Voxtral can (re)start even when bge-m3 is already resident (at 0.92
+# it OOM'd by ~30 MiB: "Free memory ... less than desired GPU utilization").
+# Safe: this workload uses ~1% of the KV cache, so the smaller reservation
+# costs nothing practical.
 ExecStart=%h/asr/vllm-env/bin/vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 \
     --compilation_config '{"cudagraph_mode":"PIECEWISE"}' \
     --host 127.0.0.1 --port 8000 \
-    --max-model-len 16384 --gpu-memory-utilization 0.92
+    --max-model-len 16384 --gpu-memory-utilization 0.85
 
 # Auto-restart on crash. vLLM exits non-zero on the --max-model-len
 # AssertionError in _bookkeeping_sync that killed the EngineCore on

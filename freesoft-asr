@@ -247,7 +247,8 @@ DEFAULTS = {
     # code -> per-language engine overlay merged over BUILTIN_TTS_LANG.
     # The TTS sidecars are only spun up if at least one resolved source
     # has a non-empty `speak` (mirrors the D3 NLLB lazy-load rule).
-    "tts": {"output": None, "lang": {}, "dump_dir": None, "speed": 1.0},
+    "tts": {"output": None, "lang": {}, "dump_dir": None, "speed": 1.0,
+            "lead_pad_ms": 400, "tail_pad_ms": 300},
 }
 
 
@@ -440,6 +441,14 @@ auto_recycle_backstop_s  = 1100.0  # --auto-recycle-backstop-s
 # # time-stretches the audio via ffmpeg atempo (range 0.5-2.0). CLI
 # # --tts-speed overrides this. e.g. 0.85 = ~15% slower.
 # # speed = 1.0
+# # lead_pad_ms / tail_pad_ms: silence (ms) prepended/appended to spoken
+# # audio so the per-utterance RTP transport ramp + teardown eat silence
+# # instead of the speech onset/tail (synthesis starts at full volume with
+# # ~0 ms runway, so the first syllable clips on the wire without this).
+# # Playback-only; the dump_dir clips stay unpadded. 0 disables. Lower if
+# # the leading gap feels too long once your receiver ramps faster.
+# # lead_pad_ms = 400
+# # tail_pad_ms = 300
 #
 # # Per-language engine config. Sane built-in defaults exist for
 # # eng_Latn (english / cpu / streaming) and spa_Latn (spanish_24l /
@@ -812,6 +821,14 @@ if TTS_SPEED != 1.0:
     print(f"{APP_NAME}: TTS speed = {TTS_SPEED} "
           f"({'slower' if TTS_SPEED < 1 else 'faster'}, pitch-preserving)",
           file=sys.stderr)
+# Leading/trailing silence (ms) prepended/appended to spoken audio so the
+# per-utterance RTP transport ramp (pw-play link-up + the receiver's
+# jitter-buffer spin-up from idle) and teardown eat silence, not the speech
+# onset/tail. Synthesis starts at full amplitude with ~0 ms runway, so over
+# RTP the first syllable is clipped without this. Playback-only (the dump
+# stays clean). 0 disables.
+TTS_LEAD_PAD_MS = int(_tts_cfg.get("lead_pad_ms", 400) or 0)
+TTS_TAIL_PAD_MS = int(_tts_cfg.get("tail_pad_ms", 300) or 0)
 TTS_LANG_CFG = {}
 for _code, _base in BUILTIN_TTS_LANG.items():
     TTS_LANG_CFG[_code] = dict(_base)
@@ -1530,6 +1547,12 @@ def _tts_speak(code: str, text: str) -> None:
         msg = f"would speak [{label}]: {text}  ({secs:.1f}s @ {sr}Hz)"
         _tts_emit_notice(msg)
         return
+    # Pad leading/trailing silence so the per-utterance RTP transport ramp
+    # and teardown eat silence instead of the speech onset/tail (the dump
+    # above is left unpadded — clean speech; only the wire gets the pad).
+    if pcm and (TTS_LEAD_PAD_MS or TTS_TAIL_PAD_MS):
+        pcm = (b"\x00\x00" * int(TTS_LEAD_PAD_MS * sr / 1000)
+               + pcm + b"\x00\x00" * int(TTS_TAIL_PAD_MS * sr / 1000))
     # Play the PCM to the configured PipeWire sink via pw-play (raw s16le
     # mono at the model sample rate).
     try:

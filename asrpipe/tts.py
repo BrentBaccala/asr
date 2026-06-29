@@ -14,18 +14,21 @@ model, one process), so `synth()` holds a per-sidecar lock. Run it in a
 thread executor from asyncio code.
 """
 import json
+import os
+import select
 import subprocess
 import threading
+import time
 
-
-def _read_exact(f, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        c = f.read(n - len(buf))
-        if not c:
-            break
-        buf.extend(c)
-    return bytes(buf)
+# A wedged sidecar (e.g. a model whose load stalled while the disk was
+# full) stays alive but never answers, so a blocking read would hang the
+# calling thread forever and silently break that language. Every read is
+# capped with a deadline; on timeout the proc is killed so TtsManager
+# respawns a fresh one. Generous, because the AUDIO header only arrives
+# after the whole utterance is synthesized (slow engines + long
+# sentences); a truly wedged sidecar never answers, so even a large value
+# cleanly separates the two. Override via env for tuning.
+_SYNTH_TIMEOUT = float(os.environ.get("ASRPIPE_TTS_SYNTH_TIMEOUT", "60"))
 
 
 class _Sidecar:
@@ -37,8 +40,52 @@ class _Sidecar:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, bufsize=0)
 
+    def _kill(self):
+        """Kill the sidecar so TtsManager._sidecar_for (which checks
+        proc.poll()) respawns a fresh one on the next request."""
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+
+    def _read_until(self, n: int, deadline: float):
+        """Read exactly n bytes from stdout before `deadline` (monotonic),
+        or return None on timeout/EOF — the caller treats None as a
+        dead/wedged sidecar. Safe because stdout is raw (bufsize=0), so
+        select() on the fd reflects real readability with no hidden
+        Python-level buffering."""
+        fd = self.proc.stdout
+        buf = bytearray()
+        while len(buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                return None
+            chunk = fd.read(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _readline_until(self, deadline: float):
+        fd = self.proc.stdout
+        buf = bytearray()
+        while not buf.endswith(b"\n"):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                return None
+            c = fd.read(1)
+            if not c:
+                return None
+            buf.extend(c)
+        return bytes(buf)
+
     def synth(self, text: str):
-        """Return (pcm_bytes, sample_rate) or (b'', 0) on error/empty."""
+        """Return (pcm_bytes, sample_rate) or (b'', 0) on error/empty.
+
+        Every read is bounded by _SYNTH_TIMEOUT; if the sidecar fails to
+        answer in time it is presumed wedged (alive but stuck — the
+        full-disk failure mode), killed, and respawned on the next call,
+        rather than reused forever."""
         text = (text or "").strip()
         if not text:
             return b"", 0
@@ -52,19 +99,29 @@ class _Sidecar:
                     (json.dumps({"id": rid, "text": text}) + "\n").encode())
                 self.proc.stdin.flush()
             except Exception:
+                self._kill()
                 return b"", 0
-            # read header line
-            hdr = b""
-            while not hdr.endswith(b"\n"):
-                c = self.proc.stdout.read(1)
-                if not c:
-                    return b"", 0
-                hdr += c
+            # The AUDIO header arrives only once the utterance is fully
+            # synthesized, so this deadline must cover synth latency.
+            hdr = self._readline_until(time.monotonic() + _SYNTH_TIMEOUT)
+            if hdr is None:
+                self._kill()
+                return b"", 0
             parts = hdr.decode(errors="replace").split()
             if not parts or parts[0] != "AUDIO":
+                # e.g. "ERR <id> <msg>" — a per-request failure, not a dead
+                # sidecar; leave it running.
                 return b"", 0
-            nbytes, sr = int(parts[2]), int(parts[3])
-            pcm = _read_exact(self.proc.stdout, nbytes)
+            try:
+                nbytes, sr = int(parts[2]), int(parts[3])
+            except (IndexError, ValueError):
+                return b"", 0
+            # PCM is already buffered in the sidecar once the header is out,
+            # so a fresh deadline keeps the body read bounded too.
+            pcm = self._read_until(nbytes, time.monotonic() + _SYNTH_TIMEOUT)
+            if pcm is None:
+                self._kill()
+                return b"", 0
             return pcm, sr
 
     def close(self):

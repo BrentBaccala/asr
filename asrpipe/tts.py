@@ -87,16 +87,19 @@ class TtsManager:
     _instance_lock = threading.Lock()
 
     @classmethod
-    def shared(cls, tts_lang: dict, synth_py: str, piper_py: str):
+    def shared(cls, tts_lang: dict, synth_py: str, piper_py: str,
+               melo_py: str = None):
         with cls._instance_lock:
             if cls._instance is None:
-                cls._instance = cls(tts_lang, synth_py, piper_py)
+                cls._instance = cls(tts_lang, synth_py, piper_py, melo_py)
             return cls._instance
 
-    def __init__(self, tts_lang: dict, synth_py: str, piper_py: str):
+    def __init__(self, tts_lang: dict, synth_py: str, piper_py: str,
+                 melo_py: str = None):
         self.tts_lang = tts_lang
         self.synth_py = synth_py
         self.piper_py = piper_py
+        self.melo_py = melo_py
         self._sidecars = {}
         self._reg_lock = threading.Lock()
 
@@ -109,6 +112,8 @@ class TtsManager:
         model = str(cfg.get("model", "english"))
         if engine == "piper":
             cmd = [self.piper_py, "--voice", model, "--device", device]
+        elif engine == "melo":
+            cmd = [self.melo_py, "--language", model, "--device", device]
         else:
             cmd = [self.synth_py, "--language", model, "--device", device]
             voice = cfg.get("voice")

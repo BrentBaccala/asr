@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 
 import websockets
 
-from .config import PipelineConfig, SAMPLE_RATE, TTS_SYNTH_PY, TTS_SYNTH_PIPER_PY
+from .config import (PipelineConfig, SAMPLE_RATE, TTS_SYNTH_PY,
+                     TTS_SYNTH_PIPER_PY, TTS_SYNTH_MELO_PY)
 from .nllb import NllbTranslator
 from .tts import TtsManager
 
@@ -86,7 +87,7 @@ class Session:
         self._nllb = await self.loop.run_in_executor(
             None, NllbTranslator.shared, self.cfg.nllb_dir, self.cfg.nllb_beam)
         self._tts = TtsManager.shared(self.cfg.tts_lang, TTS_SYNTH_PY,
-                                      TTS_SYNTH_PIPER_PY)
+                                      TTS_SYNTH_PIPER_PY, TTS_SYNTH_MELO_PY)
         # Prewarm the speak targets so first utterance isn't slow.
         if self._speak:
             self.loop.run_in_executor(None, self._tts.prewarm, list(self._speak))

@@ -21,6 +21,7 @@ NLLB_BEAM = int(os.environ.get("ASRPIPE_NLLB_BEAM", "1"))
 _PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TTS_SYNTH_PY = os.path.join(_PKG_PARENT, "tts_synth.py")
 TTS_SYNTH_PIPER_PY = os.path.join(_PKG_PARENT, "tts_synth_piper.py")
+TTS_SYNTH_MELO_PY = os.path.join(_PKG_PARENT, "tts_synth_melo.py")
 
 SAMPLE_RATE = 16000          # Voxtral input rate (s16le mono)
 
@@ -68,6 +69,11 @@ BUILTIN_TTS_LANG = {
                  "device": "cpu"},
     "zho_Hans": {"engine": "piper", "model": "zh_CN-huayan-medium",
                  "device": "cpu"},
+    # Japanese/Korean have no Piper voice (espeak-ng can't phonemize kanji /
+    # hangul). MeloTTS is a multilingual VITS model that does both, real-time+
+    # on CPU (zero GPU). Runs from ~/asr/melo-env via tts_synth_melo.py.
+    "jpn_Jpan": {"engine": "melo", "model": "JP", "device": "cpu"},
+    "kor_Hang": {"engine": "melo", "model": "KR", "device": "cpu"},
 }
 
 # The languages the web UI offers in its dropdowns: (FLORES code, label).
@@ -83,6 +89,8 @@ LANG_CHOICES = [
     ("arb_Arab", "Arabic"),
     ("hin_Deva", "Hindi"),
     ("zho_Hans", "Chinese"),
+    ("jpn_Jpan", "Japanese"),
+    ("kor_Hang", "Korean"),
 ]
 
 LANG_LABEL = {c: l for c, l in LANG_CHOICES}

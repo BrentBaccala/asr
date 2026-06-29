@@ -30,7 +30,7 @@ FT_TO_NLLB = {
     "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn",
     "de": "deu_Latn", "it": "ita_Latn", "pt": "por_Latn",
     "ru": "rus_Cyrl", "zh": "zho_Hans", "ja": "jpn_Jpan",
-    "ko": "kor_Hang", "ar": "ara_Arab", "nl": "nld_Latn",
+    "ko": "kor_Hang", "ar": "arb_Arab", "nl": "nld_Latn",
     "pl": "pol_Latn", "tr": "tur_Latn", "vi": "vie_Latn",
     "hi": "hin_Deva", "uk": "ukr_Cyrl", "ca": "cat_Latn",
 }
@@ -54,6 +54,20 @@ BUILTIN_TTS_LANG = {
                  "device": "cuda"},
     "ita_Latn": {"engine": "pocket-tts", "model": "italian_24l",
                  "device": "cuda"},
+    # --- Phase 2/3: the 7 languages Voxtral transcribes + NLLB translates
+    # but had no speak-back. Five get intelligible CPU Piper voices (zero
+    # GPU cost, real-time+); only Japanese/Korean lack a Piper voice and
+    # are covered by the streaming GPU CJK model (see below).
+    "nld_Latn": {"engine": "piper", "model": "nl_NL-mls-medium",
+                 "device": "cpu"},
+    "rus_Cyrl": {"engine": "piper", "model": "ru_RU-dmitri-medium",
+                 "device": "cpu"},
+    "arb_Arab": {"engine": "piper", "model": "ar_JO-kareem-medium",
+                 "device": "cpu"},
+    "hin_Deva": {"engine": "piper", "model": "hi_IN-pratham-medium",
+                 "device": "cpu"},
+    "zho_Hans": {"engine": "piper", "model": "zh_CN-huayan-medium",
+                 "device": "cpu"},
 }
 
 # The languages the web UI offers in its dropdowns: (FLORES code, label).
@@ -64,6 +78,11 @@ LANG_CHOICES = [
     ("fra_Latn", "French"),
     ("deu_Latn", "German"),
     ("por_Latn", "Portuguese"),
+    ("nld_Latn", "Dutch"),
+    ("rus_Cyrl", "Russian"),
+    ("arb_Arab", "Arabic"),
+    ("hin_Deva", "Hindi"),
+    ("zho_Hans", "Chinese"),
 ]
 
 LANG_LABEL = {c: l for c, l in LANG_CHOICES}

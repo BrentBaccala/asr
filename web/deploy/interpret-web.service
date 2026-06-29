@@ -1,0 +1,22 @@
+# cosine --user systemd unit for freesoft-interpret-web on pony.
+# Install: ln -s ~/asr/web/deploy/interpret-web.service \
+#            ~/.config/systemd/user/interpret-web.service
+#          systemctl --user daemon-reload && systemctl --user enable --now interpret-web
+# (linger must be on for the cosine user so it survives logout/boot.)
+[Unit]
+Description=freesoft-interpret-web (aiohttp + aiortc bridge)
+After=network.target voxtral.service
+Wants=voxtral.service
+
+[Service]
+Type=exec
+WorkingDirectory=/home/cosine/asr
+# interpret-web.env holds ASRPIPE_NLLB_DIR + ASRPIPE_TURN_SECRET/_HOST/_PORT
+# (mode 600; the TURN secret must match edge:/etc/coturn-shared-secret).
+EnvironmentFile=/home/cosine/asr/web/interpret-web.env
+ExecStart=/home/cosine/asr/web-env/bin/python /home/cosine/asr/web/server.py --host 0.0.0.0 --port 8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

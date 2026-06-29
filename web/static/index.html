@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>freesoft interpret</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background:#15171c; color:#e6e6e6; }
+  header { padding: .6rem 1rem; background:#1d2027; display:flex; gap:1rem;
+           align-items:center; flex-wrap:wrap; border-bottom:1px solid #2a2e37; }
+  header h1 { font-size:1rem; margin:0; font-weight:600; color:#8ec07c; }
+  select, button { font-size:.95rem; padding:.35rem .5rem; border-radius:6px;
+           border:1px solid #3a3f4b; background:#23262e; color:#e6e6e6; }
+  .lang { display:flex; gap:.3rem; align-items:center; }
+  #ptt { padding:.8rem 1.4rem; font-size:1.05rem; font-weight:600;
+         background:#3a4150; user-select:none; touch-action:none; }
+  #ptt.live { background:#cc5430; }
+  #lock { }
+  #lock.on { background:#458588; }
+  #status { margin-left:auto; font-size:.82rem; color:#a89984; }
+  main { padding: .8rem 1rem; }
+  #live { min-height:1.6rem; padding:.4rem .6rem; background:#1a1d23;
+          border-radius:6px; color:#83a598; font-style:italic; margin-bottom:.6rem; }
+  .row { padding:.4rem .2rem; border-bottom:1px solid #23262e; }
+  .row .who { font-size:.72rem; color:#928374; text-transform:uppercase; letter-spacing:.04em; }
+  .row .src { color:#ebdbb2; }
+  .row .tr { color:#8ec07c; margin-top:.15rem; }
+  .row .tr .code { font-size:.7rem; color:#665c54; margin-right:.4rem; }
+  .notice { color:#665c54; font-size:.78rem; padding:.2rem; }
+  audio { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>freesoft&nbsp;interpret</h1>
+  <div id="solo-langs">
+    <span class="lang">In <select id="input_lang"></select></span>
+    <span class="lang">Out <select id="output_lang"></select></span>
+  </div>
+  <div id="duo-langs" style="display:none">
+    <span class="lang">My language <select id="my_lang"></select></span>
+  </div>
+  <button id="ptt">Hold to talk</button>
+  <button id="lock">Lock&nbsp;mic</button>
+  <span id="status">idle</span>
+</header>
+<main>
+  <div id="live"></div>
+  <div id="history"></div>
+</main>
+<audio id="remote" autoplay></audio>
+<script>
+const qs = new URLSearchParams(location.search);
+const ROOM = qs.get('room');
+const MODE = ROOM ? 'duo' : 'solo';
+let pc, dc, micTrack, locked = false;
+const rows = {};   // "label/seq" -> {el, src, tr}
+
+const $ = id => document.getElementById(id);
+const setStatus = s => $('status').textContent = s;
+
+async function loadLangs() {
+  const r = await fetch('/langs'); const {choices} = await r.json();
+  const fill = (sel, def) => {
+    for (const [code, label] of choices) {
+      const o = document.createElement('option');
+      o.value = code; o.textContent = label; if (code === def) o.selected = true;
+      sel.appendChild(o);
+    }
+  };
+  fill($('input_lang'), 'eng_Latn'); fill($('output_lang'), 'spa_Latn');
+  fill($('my_lang'), MODE === 'duo' ? 'eng_Latn' : 'eng_Latn');
+  $('solo-langs').style.display = MODE === 'solo' ? '' : 'none';
+  $('duo-langs').style.display = MODE === 'duo' ? '' : 'none';
+}
+
+function sendLang() {
+  if (!dc || dc.readyState !== 'open') return;
+  const msg = {t:'setlang'};
+  if (MODE === 'solo') { msg.input_lang = $('input_lang').value; msg.output_lang = $('output_lang').value; }
+  else { msg.lang = $('my_lang').value; }
+  dc.send(JSON.stringify(msg));
+}
+
+function renderEvent(ev) {
+  if (ev.kind === 'live') { $('live').textContent = ev.text || ''; return; }
+  if (ev.kind === 'notice') {
+    const n = document.createElement('div'); n.className = 'notice';
+    n.textContent = '· ' + ev.text; $('history').appendChild(n);
+    n.scrollIntoView(); return;
+  }
+  const key = ev.speaker + '/' + ev.seq;
+  let row = rows[key];
+  if (!row) {
+    const el = document.createElement('div'); el.className = 'row';
+    const who = document.createElement('div'); who.className = 'who'; who.textContent = ev.speaker;
+    const src = document.createElement('div'); src.className = 'src';
+    const tr = document.createElement('div'); tr.className = 'tr';
+    el.append(who, src, tr); $('history').appendChild(el);
+    row = rows[key] = {el, src, tr};
+  }
+  if (ev.kind === 'final') { row.src.textContent = ev.text; $('live').textContent=''; }
+  if (ev.kind === 'translation') {
+    row.tr.innerHTML = '';
+    for (const [code, text] of Object.entries(ev.translations || {})) {
+      const d = document.createElement('div');
+      d.innerHTML = '<span class="code">' + code.split('_')[0] + '</span>';
+      d.appendChild(document.createTextNode(text));
+      row.tr.appendChild(d);
+    }
+  }
+  row.el.scrollIntoView();
+}
+
+async function loadIce() {
+  try { const r = await fetch('/ice'); const c = await r.json();
+    window.ICE_SERVERS = c.iceServers || []; window.ICE_POLICY = c.iceTransportPolicy || 'all';
+  } catch (e) { window.ICE_SERVERS = []; window.ICE_POLICY = 'all'; }
+}
+
+async function start() {
+  await loadLangs();
+  await loadIce();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}, video:false});
+  micTrack = stream.getAudioTracks()[0];
+  micTrack.enabled = false;        // push-to-talk: muted until held
+
+  pc = new RTCPeerConnection({iceServers: window.ICE_SERVERS || [],
+                              iceTransportPolicy: window.ICE_POLICY || 'all'});
+  pc.addTrack(micTrack, stream);
+  pc.ontrack = e => { $('remote').srcObject = e.streams[0]; };
+  pc.onconnectionstatechange = () => setStatus(pc.connectionState);
+
+  dc = pc.createDataChannel('ctl');
+  dc.onopen = () => { setStatus('connected'); sendLang(); };
+  dc.onmessage = e => { const d = JSON.parse(e.data); if (d.t === 'event') renderEvent(d); };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const body = {sdp: pc.localDescription.sdp, type: pc.localDescription.type, mode: MODE};
+  if (ROOM) body.room = ROOM;
+  if (MODE === 'solo') { body.input_lang = $('input_lang').value; body.output_lang = $('output_lang').value; }
+  else body.lang = $('my_lang').value;
+  const r = await fetch('/offer', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+  const ans = await r.json();
+  if (ans.error) { setStatus('error: ' + ans.error); return; }
+  await pc.setRemoteDescription(ans);
+}
+
+// PTT + lock
+function setLive(on) { if (micTrack) micTrack.enabled = on; $('ptt').classList.toggle('live', on); }
+$('ptt').addEventListener('pointerdown', () => setLive(true));
+$('ptt').addEventListener('pointerup',   () => { if (!locked) setLive(false); });
+$('ptt').addEventListener('pointerleave',() => { if (!locked) setLive(false); });
+$('lock').addEventListener('click', () => {
+  locked = !locked; $('lock').classList.toggle('on', locked);
+  $('lock').textContent = locked ? 'Mic locked' : 'Lock mic'; setLive(locked);
+});
+['input_lang','output_lang','my_lang'].forEach(id =>
+  $(id).addEventListener('change', sendLang));
+
+start().catch(e => setStatus('start failed: ' + e.message));
+</script>
+</body>
+</html>

@@ -21,6 +21,7 @@ All heavy/blocking work (NLLB, TTS sidecars) runs in the default thread
 executor so the event loop stays responsive; Voxtral WS I/O is native
 asyncio.
 """
+import array
 import asyncio
 import base64
 import json
@@ -36,6 +37,25 @@ from .nllb import NllbTranslator
 from .tts import TtsManager
 
 _SENT_SPLIT = re.compile(r'(?<=[.!?…])\s+')
+
+# End-of-utterance (commit) detection. Push-to-talk release sets the
+# browser mic track to enabled=false, which keeps the track ALIVE but
+# streams digital silence — there is no audio gap to detect. So we detect
+# end-of-speech by RMS and commit the Voxtral input buffer after a hangover
+# of silence following speech; the commit drives transcription.done ->
+# finalize -> translate -> speak. Also finalizes pauses in locked-mic mode.
+_VOICE_RMS = 300.0        # s16le RMS above this counts as speech (silence ~0)
+_SILENCE_HANG = 0.7       # seconds of silence after speech before committing
+
+
+def _chunk_rms(pcm: bytes) -> float:
+    """RMS amplitude of an s16le mono buffer (0.0 for digital silence)."""
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0
+    a = array.array("h")
+    a.frombytes(pcm[:n * 2])
+    return (sum(x * x for x in a) / n) ** 0.5
 
 
 @dataclass
@@ -176,18 +196,30 @@ class Session:
                         return
 
             rx = asyncio.ensure_future(receiver())
+            spoke = False              # uncommitted speech is in the buffer
+            last_voice = 0.0
             try:
                 while not self._stop.is_set():
                     try:
                         chunk = await asyncio.wait_for(self._audio_q.get(),
                                                        timeout=0.2)
                     except asyncio.TimeoutError:
-                        continue
+                        chunk = b""    # no audio arriving; still check silence
                     if chunk is None:
                         break
-                    await ws.send(json.dumps(
-                        {"type": "input_audio_buffer.append",
-                         "audio": base64.b64encode(chunk).decode()}))
+                    if chunk:
+                        await ws.send(json.dumps(
+                            {"type": "input_audio_buffer.append",
+                             "audio": base64.b64encode(chunk).decode()}))
+                        if _chunk_rms(chunk) >= _VOICE_RMS:
+                            spoke = True
+                            last_voice = self.loop.time()
+                    # Commit (finalize the utterance) once speech is followed
+                    # by a hangover of silence — e.g. the mic is released.
+                    if spoke and self.loop.time() - last_voice >= _SILENCE_HANG:
+                        await ws.send(json.dumps(
+                            {"type": "input_audio_buffer.commit"}))
+                        spoke = False
             finally:
                 rx.cancel()
 

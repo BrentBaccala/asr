@@ -46,6 +46,8 @@ _SENT_SPLIT = re.compile(r'(?<=[.!?…])\s+')
 # finalize -> translate -> speak. Also finalizes pauses in locked-mic mode.
 _VOICE_RMS = 300.0        # s16le RMS above this counts as speech (silence ~0)
 _SILENCE_HANG = 0.7       # seconds of silence after speech before committing
+_TEXT_QUIET = 0.6         # seconds the transcript must stop growing before
+                          # finalizing (Voxtral streams the tail after silence)
 
 
 def _chunk_rms(pcm: bytes) -> float:
@@ -93,6 +95,7 @@ class Session:
         self._audio_q: asyncio.Queue = asyncio.Queue()
         self._cur = ""                # un-finalized live transcript
         self._force_finalize = False  # set by the audio loop on end-of-speech
+        self._last_change = 0.0       # loop.time() the transcript last grew
         self._seq = 0
         self._lang_lock = asyncio.Lock()
         self._stop = asyncio.Event()
@@ -175,11 +178,14 @@ class Session:
 
             async def receiver():
                 while not self._stop.is_set():
-                    # End-of-speech signal from the audio loop. Voxtral never
-                    # emits transcription.done, so we finalize the buffered
-                    # transcript ourselves — done here, the only coroutine
-                    # that touches self._cur, to avoid races.
-                    if self._force_finalize:
+                    # End-of-speech from the audio loop. Voxtral never emits
+                    # transcription.done, so we finalize the buffered
+                    # transcript ourselves — but only once it has also stopped
+                    # growing (_TEXT_QUIET), since Voxtral streams the tail of
+                    # the utterance for a beat after the mic goes silent.
+                    # Done here, the only coroutine that touches self._cur.
+                    if (self._force_finalize and
+                            self.loop.time() - self._last_change >= _TEXT_QUIET):
                         self._force_finalize = False
                         await self._drain_sentences(force=True)
                     try:
@@ -191,10 +197,13 @@ class Session:
                     m = json.loads(raw)
                     t = m.get("type")
                     if t == "transcription.delta":
-                        self._cur += m.get("delta", "")
-                        await self._drain_sentences()
-                        self._emit(TranscriptEvent(
-                            kind="live", speaker=self.label, text=self._cur))
+                        d = m.get("delta", "")
+                        if d:
+                            self._cur += d
+                            self._last_change = self.loop.time()
+                            await self._drain_sentences()
+                            self._emit(TranscriptEvent(
+                                kind="live", speaker=self.label, text=self._cur))
                     elif t == "transcription.done":
                         await self._drain_sentences(force=True)
                     elif t == "error":

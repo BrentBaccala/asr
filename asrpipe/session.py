@@ -92,6 +92,7 @@ class Session:
 
         self._audio_q: asyncio.Queue = asyncio.Queue()
         self._cur = ""                # un-finalized live transcript
+        self._force_finalize = False  # set by the audio loop on end-of-speech
         self._seq = 0
         self._lang_lock = asyncio.Lock()
         self._stop = asyncio.Event()
@@ -174,6 +175,13 @@ class Session:
 
             async def receiver():
                 while not self._stop.is_set():
+                    # End-of-speech signal from the audio loop. Voxtral never
+                    # emits transcription.done, so we finalize the buffered
+                    # transcript ourselves — done here, the only coroutine
+                    # that touches self._cur, to avoid races.
+                    if self._force_finalize:
+                        self._force_finalize = False
+                        await self._drain_sentences(force=True)
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=0.2)
                     except asyncio.TimeoutError:
@@ -214,9 +222,12 @@ class Session:
                         if _chunk_rms(chunk) >= _VOICE_RMS:
                             spoke = True
                             last_voice = self.loop.time()
-                    # Commit (finalize the utterance) once speech is followed
-                    # by a hangover of silence — e.g. the mic is released.
+                    # End of speech (a hangover of silence after voice —
+                    # e.g. the mic released): have the receiver finalize the
+                    # buffered transcript, and commit Voxtral's input buffer
+                    # so the next utterance starts clean.
                     if spoke and self.loop.time() - last_voice >= _SILENCE_HANG:
+                        self._force_finalize = True
                         await ws.send(json.dumps(
                             {"type": "input_audio_buffer.commit"}))
                         spoke = False

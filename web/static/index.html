@@ -27,8 +27,8 @@
   #lock.on { background:#458588; }
   #status { margin-left:auto; font-size:.82rem; color:#a89984; }
   main { padding: .8rem 1rem; flex:1 1 auto; overflow-y:auto; min-height:0; }
-  #live { min-height:1.6rem; padding:.4rem .6rem; background:#1a1d23;
-          border-radius:6px; color:#83a598; font-style:italic; margin-bottom:.6rem; }
+  #live { flex:0 0 auto; min-height:1.6rem; padding:.4rem 1rem; background:#1a1d23;
+          color:#83a598; font-style:italic; border-bottom:1px solid #2a2e37; }
   .row { padding:.4rem .2rem; border-bottom:1px solid #23262e; }
   .row .who { font-size:.72rem; color:#928374; text-transform:uppercase; letter-spacing:.04em; }
   .row .src { color:#ebdbb2; }
@@ -52,8 +52,8 @@
   <button id="lock">Lock&nbsp;mic</button>
   <span id="status">idle</span>
 </header>
+<div id="live"></div>
 <main>
-  <div id="live"></div>
   <div id="history"></div>
 </main>
 <audio id="remote" autoplay></audio>

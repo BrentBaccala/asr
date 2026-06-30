@@ -85,6 +85,7 @@ let MODE = ROOM ? 'duo' : 'solo';
 const PAIR_ROOM = qs.get('room') || 'pair'; // shared room the Pair button joins
 let pc, dc, micTrack, audioSender, locked = false, myLabel = null;
 let micConnected = false;   // is the OS microphone currently held by this app?
+let micAutoReleased = false; // mic was dropped because the page was backgrounded
 let rows = {};     // "label/seq" -> {el, src, tr}; reset on each (re)connect
 
 const $ = id => document.getElementById(id);
@@ -271,7 +272,21 @@ $('lock').addEventListener('click', () => {
 ['input_lang','output_lang','my_lang'].forEach(id =>
   $(id).addEventListener('change', sendLang));
 $('pair').addEventListener('click', () => setPaired(MODE !== 'duo'));
-$('mic').addEventListener('click', () => setMicConnected(!micConnected));
+$('mic').addEventListener('click', () => {
+  micAutoReleased = false;   // an explicit click overrides the auto policy
+  setMicConnected(!micConnected);
+});
+
+// Release the mic when the page is backgrounded (e.g. you switch to another
+// app that needs the microphone) and re-grab it on return — but only if WE
+// released it, so a manual "Disconnect mic" stays disconnected.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    if (micConnected) { micAutoReleased = true; setMicConnected(false); }
+  } else if (micAutoReleased) {
+    micAutoReleased = false; setMicConnected(true);
+  }
+});
 
 (async () => {
   await loadLangs();

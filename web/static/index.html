@@ -40,6 +40,12 @@
   .row .src { color:#ebdbb2; }
   .row .tr { color:#8ec07c; margin-top:.15rem; }
   .row .tr .code { font-size:.7rem; color:#665c54; margin-right:.4rem; }
+  /* Paired mode only: tint each utterance by origin — LOCAL (you, blue)
+     vs REMOTE (peer, orange). Solo keeps the neutral palette above. */
+  body.duo .row.local  { border-left:3px solid #83a598; padding-left:.55rem; }
+  body.duo .row.remote { border-left:3px solid #fe8019; padding-left:.55rem; }
+  body.duo .row.local  .who { color:#83a598; }
+  body.duo .row.remote .who { color:#fe8019; }
   .notice { color:#665c54; font-size:.78rem; padding:.2rem; }
   audio { display:none; }
 </style>
@@ -100,6 +106,7 @@ function applyModeUI() {
   $('duo-langs').style.display = MODE === 'duo' ? '' : 'none';
   $('pair').textContent = MODE === 'duo' ? 'Unpair' : 'Pair';
   $('pair').classList.toggle('on', MODE === 'duo');
+  document.body.classList.toggle('duo', MODE === 'duo');
 }
 
 // In paired (duo) mode, show each utterance from this client's point of
@@ -129,7 +136,8 @@ function renderEvent(ev) {
   const key = ev.speaker + '/' + ev.seq;
   let row = rows[key];
   if (!row) {
-    const el = document.createElement('div'); el.className = 'row';
+    const el = document.createElement('div');
+    el.className = 'row ' + (labelFor(ev.speaker) === 'LOCAL' ? 'local' : 'remote');
     const who = document.createElement('div'); who.className = 'who'; who.textContent = labelFor(ev.speaker);
     const src = document.createElement('div'); src.className = 'src';
     const tr = document.createElement('div'); tr.className = 'tr';

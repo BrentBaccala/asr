@@ -31,6 +31,8 @@
   #lock { }
   #lock.on { background:#458588; }
   #pair.on { background:#b16286; border-color:#d3869b; }
+  #mic.off { background:#cc4433; border-color:#e06b5e; color:#fff; }
+  button:disabled { opacity:.4; cursor:default; }
   #status { margin-left:auto; font-size:.82rem; color:#a89984; }
   main { padding: .8rem 1rem; flex:1 1 auto; overflow-y:auto; min-height:0; }
   #live { flex:0 0 auto; min-height:1.6rem; padding:.4rem 1rem; background:#1a1d23;
@@ -67,6 +69,7 @@
     </svg>
   </button>
   <button id="lock">Lock&nbsp;mic</button>
+  <button id="mic">Disconnect&nbsp;mic</button>
   <button id="pair">Pair</button>
   <span id="status">idle</span>
 </header>
@@ -80,7 +83,8 @@ const qs = new URLSearchParams(location.search);
 let ROOM = qs.get('room');                  // mutable: the Pair toggle sets it
 let MODE = ROOM ? 'duo' : 'solo';
 const PAIR_ROOM = qs.get('room') || 'pair'; // shared room the Pair button joins
-let pc, dc, micTrack, locked = false, myLabel = null;
+let pc, dc, micTrack, audioSender, locked = false, myLabel = null;
+let micConnected = false;   // is the OS microphone currently held by this app?
 let rows = {};     // "label/seq" -> {el, src, tr}; reset on each (re)connect
 
 const $ = id => document.getElementById(id);
@@ -167,19 +171,57 @@ function teardown() {
   try { if (dc) dc.close(); } catch (e) {}
   try { if (pc) pc.close(); } catch (e) {}
   if (micTrack) { try { micTrack.stop(); } catch (e) {} }
-  pc = dc = micTrack = null; myLabel = null;
+  pc = dc = micTrack = audioSender = null; myLabel = null; micConnected = false;
+  updateMicUI();
+}
+
+// Grab the OS microphone. Returns the audio track (caller owns stop()).
+async function acquireMic() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}, video:false});
+  return stream.getAudioTracks()[0];
+}
+
+// Reflect mic state in the UI: button label/colour + whether PTT/lock work.
+function updateMicUI() {
+  $('mic').innerHTML = micConnected ? 'Disconnect&nbsp;mic' : 'Connect&nbsp;mic';
+  $('mic').classList.toggle('off', !micConnected);
+  $('ptt').disabled = !micConnected;
+  $('lock').disabled = !micConnected;
+}
+
+// Connect/disconnect the physical microphone without dropping the session.
+// Disconnecting fully releases the mic (track.stop) so other phone apps can
+// use it; reconnecting re-grabs it and swaps it back onto the live sender
+// via replaceTrack() — no WebRTC renegotiation needed.
+async function setMicConnected(on) {
+  if (on === micConnected) return;
+  if (on) {
+    try { micTrack = await acquireMic(); }
+    catch (e) { setStatus('mic error: ' + e.message); return; }
+    micTrack.enabled = locked;
+    if (audioSender) { try { await audioSender.replaceTrack(micTrack); } catch (e) {} }
+    micConnected = true;
+  } else {
+    if (audioSender) { try { await audioSender.replaceTrack(null); } catch (e) {} }
+    if (micTrack) { try { micTrack.stop(); } catch (e) {} micTrack = null; }
+    micConnected = false;
+    // Clear PTT/lock so nothing thinks the (now absent) mic is live.
+    locked = false; $('lock').classList.remove('on');
+    $('lock').innerHTML = 'Lock&nbsp;mic'; $('ptt').classList.remove('live');
+  }
+  updateMicUI();
 }
 
 async function connect() {
   rows = {}; $('history').innerHTML = ''; $('live').textContent = '';
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}, video:false});
-  micTrack = stream.getAudioTracks()[0];
+  micTrack = await acquireMic();
   micTrack.enabled = locked;       // push-to-talk: muted unless the mic is locked
 
   pc = new RTCPeerConnection({iceServers: window.ICE_SERVERS || [],
                               iceTransportPolicy: window.ICE_POLICY || 'all'});
-  pc.addTrack(micTrack, stream);
+  audioSender = pc.addTrack(micTrack, new MediaStream([micTrack]));
+  micConnected = true; updateMicUI();
   pc.ontrack = e => { $('remote').srcObject = e.streams[0]; };
   pc.onconnectionstatechange = () => setStatus(pc.connectionState);
 
@@ -215,7 +257,10 @@ async function setPaired(on) {
 }
 
 // PTT + lock
-function setLive(on) { if (micTrack) micTrack.enabled = on; $('ptt').classList.toggle('live', on); }
+function setLive(on) {
+  if (!micConnected || !micTrack) return;   // mic released — nothing to key
+  micTrack.enabled = on; $('ptt').classList.toggle('live', on);
+}
 $('ptt').addEventListener('pointerdown', () => setLive(true));
 $('ptt').addEventListener('pointerup',   () => { if (!locked) setLive(false); });
 $('ptt').addEventListener('pointerleave',() => { if (!locked) setLive(false); });
@@ -226,6 +271,7 @@ $('lock').addEventListener('click', () => {
 ['input_lang','output_lang','my_lang'].forEach(id =>
   $(id).addEventListener('change', sendLang));
 $('pair').addEventListener('click', () => setPaired(MODE !== 'duo'));
+$('mic').addEventListener('click', () => setMicConnected(!micConnected));
 
 (async () => {
   await loadLangs();

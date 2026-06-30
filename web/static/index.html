@@ -20,9 +20,14 @@
   select, button { font-size:.95rem; padding:.35rem .5rem; border-radius:6px;
            border:1px solid #3a3f4b; background:#23262e; color:#e6e6e6; }
   .lang { display:flex; gap:.3rem; align-items:center; }
-  #ptt { padding:.8rem 1.4rem; font-size:1.05rem; font-weight:600;
-         background:#3a4150; user-select:none; touch-action:none; }
-  #ptt.live { background:#cc5430; }
+  #ptt { width:64px; height:64px; padding:0; border-radius:50%;
+         display:inline-flex; align-items:center; justify-content:center;
+         background:#3a4150; border:1px solid #4a4f5b; color:#e6e6e6;
+         cursor:pointer; user-select:none; touch-action:none;
+         transition:background .12s, box-shadow .12s; }
+  #ptt svg { width:30px; height:30px; }
+  #ptt.live { background:#e0392b; border-color:#ff6b5e; color:#fff;
+              box-shadow:0 0 0 4px rgba(224,57,43,.35); }
   #lock { }
   #lock.on { background:#458588; }
   #status { margin-left:auto; font-size:.82rem; color:#a89984; }
@@ -48,7 +53,12 @@
   <div id="duo-langs" style="display:none">
     <span class="lang">My language <select id="my_lang"></select></span>
   </div>
-  <button id="ptt">Hold to talk</button>
+  <button id="ptt" aria-label="Hold to talk" title="Hold to talk">
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/>
+      <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-3.08A7 7 0 0 0 19 11z"/>
+    </svg>
+  </button>
   <button id="lock">Lock&nbsp;mic</button>
   <span id="status">idle</span>
 </header>

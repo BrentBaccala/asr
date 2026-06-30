@@ -184,7 +184,12 @@ class Session:
                     # growing (_TEXT_QUIET), since Voxtral streams the tail of
                     # the utterance for a beat after the mic goes silent.
                     # Done here, the only coroutine that touches self._cur.
-                    if (self._force_finalize and
+                    # Wait for the transcript to actually arrive (Voxtral lags
+                    # the audio by up to ~1s, so _cur is often still empty when
+                    # the mic-silence flag fires) AND to stop growing, before
+                    # finalizing. Without the non-empty guard the flag would be
+                    # consumed on an empty buffer and the late word lost.
+                    if (self._force_finalize and self._cur.strip() and
                             self.loop.time() - self._last_change >= _TEXT_QUIET):
                         self._force_finalize = False
                         await self._drain_sentences(force=True)

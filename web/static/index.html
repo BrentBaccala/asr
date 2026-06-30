@@ -28,10 +28,7 @@
   #ptt svg { width:30px; height:30px; }
   #ptt.live { background:#e0392b; border-color:#ff6b5e; color:#fff;
               box-shadow:0 0 0 4px rgba(224,57,43,.35); }
-  #lock { }
-  #lock.on { background:#458588; }
   #pair.on { background:#b16286; border-color:#d3869b; }
-  #mic.off { background:#cc4433; border-color:#e06b5e; color:#fff; }
   button:disabled { opacity:.4; cursor:default; }
   #status { margin-left:auto; font-size:.82rem; color:#a89984; }
   main { padding: .8rem 1rem; flex:1 1 auto; overflow-y:auto; min-height:0; }
@@ -68,8 +65,12 @@
       <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-3.08A7 7 0 0 0 19 11z"/>
     </svg>
   </button>
-  <button id="lock">Lock&nbsp;mic</button>
-  <button id="mic">Disconnect&nbsp;mic</button>
+  <select id="micmode" title="Microphone mode">
+    <option value="hold">Hold to talk</option>
+    <option value="tap">Tap to talk / stop</option>
+    <option value="lock">Locked on</option>
+    <option value="off">Disconnected</option>
+  </select>
   <button id="pair">Pair</button>
   <span id="status">idle</span>
 </header>
@@ -83,7 +84,9 @@ const qs = new URLSearchParams(location.search);
 let ROOM = qs.get('room');                  // mutable: the Pair toggle sets it
 let MODE = ROOM ? 'duo' : 'solo';
 const PAIR_ROOM = qs.get('room') || 'pair'; // shared room the Pair button joins
-let pc, dc, micTrack, audioSender, locked = false, myLabel = null;
+let pc, dc, micTrack, audioSender, myLabel = null;
+let micMode = 'hold';       // 'hold' | 'tap' | 'lock' | 'off'
+let live = false;           // is mic audio currently being transmitted?
 let micConnected = false;   // is the OS microphone currently held by this app?
 let micAutoReleased = false; // mic was dropped because the page was backgrounded
 let rows = {};     // "label/seq" -> {el, src, tr}; reset on each (re)connect
@@ -172,7 +175,8 @@ function teardown() {
   try { if (dc) dc.close(); } catch (e) {}
   try { if (pc) pc.close(); } catch (e) {}
   if (micTrack) { try { micTrack.stop(); } catch (e) {} }
-  pc = dc = micTrack = audioSender = null; myLabel = null; micConnected = false;
+  pc = dc = micTrack = audioSender = null; myLabel = null;
+  micConnected = false; live = false;
   updateMicUI();
 }
 
@@ -183,46 +187,75 @@ async function acquireMic() {
   return stream.getAudioTracks()[0];
 }
 
-// Reflect mic state in the UI: button label/colour + whether PTT/lock work.
-function updateMicUI() {
-  $('mic').innerHTML = micConnected ? 'Disconnect&nbsp;mic' : 'Connect&nbsp;mic';
-  $('mic').classList.toggle('off', !micConnected);
-  $('ptt').disabled = !micConnected;
-  $('lock').disabled = !micConnected;
+// Grab the OS mic and swap it onto the live sender (no renegotiation).
+async function attachMic() {
+  if (micConnected) return;
+  try { micTrack = await acquireMic(); }
+  catch (e) { setStatus('mic error: ' + e.message); return; }
+  micTrack.enabled = false;
+  if (audioSender) { try { await audioSender.replaceTrack(micTrack); } catch (e) {} }
+  micConnected = true;
 }
 
-// Connect/disconnect the physical microphone without dropping the session.
-// Disconnecting fully releases the mic (track.stop) so other phone apps can
-// use it; reconnecting re-grabs it and swaps it back onto the live sender
-// via replaceTrack() — no WebRTC renegotiation needed.
-async function setMicConnected(on) {
-  if (on === micConnected) return;
-  if (on) {
-    try { micTrack = await acquireMic(); }
-    catch (e) { setStatus('mic error: ' + e.message); return; }
-    micTrack.enabled = locked;
-    if (audioSender) { try { await audioSender.replaceTrack(micTrack); } catch (e) {} }
-    micConnected = true;
+// Fully release the OS mic so other phone apps can use it.
+async function detachMic() {
+  if (audioSender) { try { await audioSender.replaceTrack(null); } catch (e) {} }
+  if (micTrack) { try { micTrack.stop(); } catch (e) {} micTrack = null; }
+  micConnected = false;
+}
+
+// Push `live` to the actual track + the talk-button glow.
+function applyLive() {
+  const on = micConnected && live;
+  if (micTrack) micTrack.enabled = on;
+  $('ptt').classList.toggle('live', on);
+}
+
+// Reflect the current mic mode in the UI.
+function updateMicUI() {
+  $('micmode').value = micMode;
+  // The round button only actuates in the two push modes.
+  $('ptt').disabled = !(micMode === 'tap' || micMode === 'hold');
+  $('ptt').title = micMode === 'hold' ? 'Hold to talk'
+                 : micMode === 'tap'  ? 'Tap to talk, tap again to stop'
+                 : micMode === 'lock' ? 'Microphone locked on'
+                 :                      'Microphone disconnected';
+}
+
+// Switch microphone mode. 'off' releases the OS mic; the other three keep it
+// held and differ only in how `live` (transmitting) is controlled:
+//   lock = always live; tap = toggled by the button; hold = live while held.
+async function setMicMode(mode) {
+  micMode = mode;
+  micAutoReleased = false;        // an explicit choice overrides the auto policy
+  if (mode === 'off') {
+    live = false; applyLive();
+    await detachMic();
   } else {
-    if (audioSender) { try { await audioSender.replaceTrack(null); } catch (e) {} }
-    if (micTrack) { try { micTrack.stop(); } catch (e) {} micTrack = null; }
-    micConnected = false;
-    // Clear PTT/lock so nothing thinks the (now absent) mic is live.
-    locked = false; $('lock').classList.remove('on');
-    $('lock').innerHTML = 'Lock&nbsp;mic'; $('ptt').classList.remove('live');
+    await attachMic();
+    live = (mode === 'lock');     // lock starts live; tap/hold start muted
+    applyLive();
   }
   updateMicUI();
 }
 
 async function connect() {
   rows = {}; $('history').innerHTML = ''; $('live').textContent = '';
-  micTrack = await acquireMic();
-  micTrack.enabled = locked;       // push-to-talk: muted unless the mic is locked
-
   pc = new RTCPeerConnection({iceServers: window.ICE_SERVERS || [],
                               iceTransportPolicy: window.ICE_POLICY || 'all'});
-  audioSender = pc.addTrack(micTrack, new MediaStream([micTrack]));
-  micConnected = true; updateMicUI();
+  if (micMode === 'off') {
+    // Pre-create the audio sender without grabbing the mic, so a later mode
+    // change can replaceTrack() onto it with no renegotiation.
+    audioSender = pc.addTransceiver('audio', {direction: 'sendrecv'}).sender;
+    micConnected = false; live = false;
+  } else {
+    micTrack = await acquireMic();
+    micTrack.enabled = false;
+    audioSender = pc.addTrack(micTrack, new MediaStream([micTrack]));
+    micConnected = true;
+    live = (micMode === 'lock');   // lock = transmit immediately; tap/hold muted
+  }
+  applyLive(); updateMicUI();
   pc.ontrack = e => { $('remote').srcObject = e.streams[0]; };
   pc.onconnectionstatechange = () => setStatus(pc.connectionState);
 
@@ -257,34 +290,26 @@ async function setPaired(on) {
   await reconnect();
 }
 
-// PTT + lock
-function setLive(on) {
-  if (!micConnected || !micTrack) return;   // mic released — nothing to key
-  micTrack.enabled = on; $('ptt').classList.toggle('live', on);
-}
-$('ptt').addEventListener('pointerdown', () => setLive(true));
-$('ptt').addEventListener('pointerup',   () => { if (!locked) setLive(false); });
-$('ptt').addEventListener('pointerleave',() => { if (!locked) setLive(false); });
-$('lock').addEventListener('click', () => {
-  locked = !locked; $('lock').classList.toggle('on', locked);
-  $('lock').textContent = locked ? 'Mic locked' : 'Lock mic'; setLive(locked);
-});
+// The round talk button actuates the two push modes.
+$('ptt').addEventListener('pointerdown', () => { if (micMode === 'hold') { live = true;  applyLive(); } });
+$('ptt').addEventListener('pointerup',   () => { if (micMode === 'hold') { live = false; applyLive(); } });
+$('ptt').addEventListener('pointerleave',() => { if (micMode === 'hold') { live = false; applyLive(); } });
+$('ptt').addEventListener('click',       () => { if (micMode === 'tap')  { live = !live; applyLive(); } });
+
+$('micmode').addEventListener('change', () => setMicMode($('micmode').value));
 ['input_lang','output_lang','my_lang'].forEach(id =>
   $(id).addEventListener('change', sendLang));
 $('pair').addEventListener('click', () => setPaired(MODE !== 'duo'));
-$('mic').addEventListener('click', () => {
-  micAutoReleased = false;   // an explicit click overrides the auto policy
-  setMicConnected(!micConnected);
-});
 
 // Release the mic when the page is backgrounded (e.g. you switch to another
 // app that needs the microphone) and re-grab it on return — but only if WE
-// released it, so a manual "Disconnect mic" stays disconnected.
+// released it and the chosen mode still wants the mic (not "Disconnected").
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
-    if (micConnected) { micAutoReleased = true; setMicConnected(false); }
+    if (micConnected) { micAutoReleased = true; live = false; applyLive(); detachMic(); }
   } else if (micAutoReleased) {
-    micAutoReleased = false; setMicConnected(true);
+    micAutoReleased = false;
+    if (micMode !== 'off') setMicMode(micMode);
   }
 });
 

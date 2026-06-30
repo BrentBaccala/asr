@@ -46,8 +46,11 @@ _SENT_SPLIT = re.compile(r'(?<=[.!?…])\s+')
 # finalize -> translate -> speak. Also finalizes pauses in locked-mic mode.
 _VOICE_RMS = 300.0        # s16le RMS above this counts as speech (silence ~0)
 _SILENCE_HANG = 0.7       # seconds of silence after speech before committing
-_TEXT_QUIET = 0.6         # seconds the transcript must stop growing before
-                          # finalizing (Voxtral streams the tail after silence)
+_TEXT_QUIET = 1.2         # fallback: finalize after the transcript stops
+                          # growing this long (only when Voxtral leaves the
+                          # utterance unpunctuated; see _SENTENCE_END)
+_SENTENCE_END = ".!?…"    # Voxtral appends terminal punctuation when an
+                          # utterance is complete — its de-facto "done" signal
 
 
 def _chunk_rms(pcm: bytes) -> float:
@@ -184,15 +187,19 @@ class Session:
                     # growing (_TEXT_QUIET), since Voxtral streams the tail of
                     # the utterance for a beat after the mic goes silent.
                     # Done here, the only coroutine that touches self._cur.
-                    # Wait for the transcript to actually arrive (Voxtral lags
-                    # the audio by up to ~1s, so _cur is often still empty when
-                    # the mic-silence flag fires) AND to stop growing, before
-                    # finalizing. Without the non-empty guard the flag would be
-                    # consumed on an empty buffer and the late word lost.
-                    if (self._force_finalize and self._cur.strip() and
-                            self.loop.time() - self._last_change >= _TEXT_QUIET):
-                        self._force_finalize = False
-                        await self._drain_sentences(force=True)
+                    # After end-of-speech, finalize the whole utterance as one
+                    # unit. Voxtral lags the audio (so _cur is often still empty
+                    # when the flag first fires — the non-empty guard keeps the
+                    # flag until text arrives) and streams the tail in bursts,
+                    # so finalizing too early splits the line at the release
+                    # point. Wait for Voxtral's "done" tell — terminal
+                    # punctuation — or, if it leaves the utterance unpunctuated,
+                    # for the transcript to go quiet for _TEXT_QUIET.
+                    if self._force_finalize and self._cur.strip():
+                        if (self._cur.rstrip()[-1:] in _SENTENCE_END or
+                                self.loop.time() - self._last_change >= _TEXT_QUIET):
+                            self._force_finalize = False
+                            await self._drain_sentences(force=True)
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=0.2)
                     except asyncio.TimeoutError:

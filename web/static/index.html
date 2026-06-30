@@ -30,6 +30,7 @@
               box-shadow:0 0 0 4px rgba(224,57,43,.35); }
   #lock { }
   #lock.on { background:#458588; }
+  #pair.on { background:#b16286; border-color:#d3869b; }
   #status { margin-left:auto; font-size:.82rem; color:#a89984; }
   main { padding: .8rem 1rem; flex:1 1 auto; overflow-y:auto; min-height:0; }
   #live { flex:0 0 auto; min-height:1.6rem; padding:.4rem 1rem; background:#1a1d23;
@@ -60,6 +61,7 @@
     </svg>
   </button>
   <button id="lock">Lock&nbsp;mic</button>
+  <button id="pair">Pair</button>
   <span id="status">idle</span>
 </header>
 <div id="live"></div>
@@ -69,10 +71,11 @@
 <audio id="remote" autoplay></audio>
 <script>
 const qs = new URLSearchParams(location.search);
-const ROOM = qs.get('room');
-const MODE = ROOM ? 'duo' : 'solo';
-let pc, dc, micTrack, locked = false;
-const rows = {};   // "label/seq" -> {el, src, tr}
+let ROOM = qs.get('room');                  // mutable: the Pair toggle sets it
+let MODE = ROOM ? 'duo' : 'solo';
+const PAIR_ROOM = qs.get('room') || 'pair'; // shared room the Pair button joins
+let pc, dc, micTrack, locked = false, myLabel = null;
+let rows = {};     // "label/seq" -> {el, src, tr}; reset on each (re)connect
 
 const $ = id => document.getElementById(id);
 const setStatus = s => $('status').textContent = s;
@@ -87,9 +90,23 @@ async function loadLangs() {
     }
   };
   fill($('input_lang'), 'eng_Latn'); fill($('output_lang'), 'spa_Latn');
-  fill($('my_lang'), MODE === 'duo' ? 'eng_Latn' : 'eng_Latn');
+  fill($('my_lang'), 'eng_Latn');
+}
+
+// Reflect the current MODE in the UI: which language selectors show, and
+// the Pair button's state. Called on load and on every pair/unpair toggle.
+function applyModeUI() {
   $('solo-langs').style.display = MODE === 'solo' ? '' : 'none';
   $('duo-langs').style.display = MODE === 'duo' ? '' : 'none';
+  $('pair').textContent = MODE === 'duo' ? 'Unpair' : 'Pair';
+  $('pair').classList.toggle('on', MODE === 'duo');
+}
+
+// In paired (duo) mode, show each utterance from this client's point of
+// view: your own speech is LOCAL, the peer's is REMOTE. Solo has only you.
+function labelFor(speaker) {
+  if (MODE !== 'duo') return 'LOCAL';
+  return (myLabel && speaker === myLabel) ? 'LOCAL' : 'REMOTE';
 }
 
 function sendLang() {
@@ -103,6 +120,8 @@ function sendLang() {
 function renderEvent(ev) {
   if (ev.kind === 'live') { $('live').textContent = ev.text || ''; return; }
   if (ev.kind === 'notice') {
+    if (MODE === 'duo' && ev.text === 'paired') setStatus('paired');
+    if (MODE === 'duo' && ev.text === 'peer disconnected') setStatus('waiting for peer');
     const n = document.createElement('div'); n.className = 'notice';
     n.textContent = '· ' + ev.text; $('history').appendChild(n);
     n.scrollIntoView(); return;
@@ -111,7 +130,7 @@ function renderEvent(ev) {
   let row = rows[key];
   if (!row) {
     const el = document.createElement('div'); el.className = 'row';
-    const who = document.createElement('div'); who.className = 'who'; who.textContent = ev.speaker;
+    const who = document.createElement('div'); who.className = 'who'; who.textContent = labelFor(ev.speaker);
     const src = document.createElement('div'); src.className = 'src';
     const tr = document.createElement('div'); tr.className = 'tr';
     el.append(who, src, tr); $('history').appendChild(el);
@@ -136,13 +155,19 @@ async function loadIce() {
   } catch (e) { window.ICE_SERVERS = []; window.ICE_POLICY = 'all'; }
 }
 
-async function start() {
-  await loadLangs();
-  await loadIce();
+function teardown() {
+  try { if (dc) dc.close(); } catch (e) {}
+  try { if (pc) pc.close(); } catch (e) {}
+  if (micTrack) { try { micTrack.stop(); } catch (e) {} }
+  pc = dc = micTrack = null; myLabel = null;
+}
+
+async function connect() {
+  rows = {}; $('history').innerHTML = ''; $('live').textContent = '';
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}, video:false});
   micTrack = stream.getAudioTracks()[0];
-  micTrack.enabled = false;        // push-to-talk: muted until held
+  micTrack.enabled = locked;       // push-to-talk: muted unless the mic is locked
 
   pc = new RTCPeerConnection({iceServers: window.ICE_SERVERS || [],
                               iceTransportPolicy: window.ICE_POLICY || 'all'});
@@ -151,7 +176,7 @@ async function start() {
   pc.onconnectionstatechange = () => setStatus(pc.connectionState);
 
   dc = pc.createDataChannel('ctl');
-  dc.onopen = () => { setStatus('connected'); sendLang(); };
+  dc.onopen = () => { setStatus(MODE === 'duo' ? 'waiting for peer' : 'connected'); sendLang(); };
   dc.onmessage = e => { const d = JSON.parse(e.data); if (d.t === 'event') renderEvent(d); };
 
   const offer = await pc.createOffer();
@@ -162,8 +187,23 @@ async function start() {
   else body.lang = $('my_lang').value;
   const r = await fetch('/offer', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
   const ans = await r.json();
-  if (ans.error) { setStatus('error: ' + ans.error); return; }
+  if (ans.error) { setStatus('error: ' + ans.error); teardown(); return; }
+  myLabel = ans.label || null;
   await pc.setRemoteDescription(ans);
+}
+
+// Tear down the current peer connection and reconnect in the current MODE.
+async function reconnect() {
+  teardown();
+  applyModeUI();
+  await connect().catch(e => setStatus('start failed: ' + e.message));
+}
+
+// Pair button: join the shared room (duo) or fall back to independent (solo).
+async function setPaired(on) {
+  MODE = on ? 'duo' : 'solo';
+  ROOM = on ? PAIR_ROOM : null;
+  await reconnect();
 }
 
 // PTT + lock
@@ -177,8 +217,14 @@ $('lock').addEventListener('click', () => {
 });
 ['input_lang','output_lang','my_lang'].forEach(id =>
   $(id).addEventListener('change', sendLang));
+$('pair').addEventListener('click', () => setPaired(MODE !== 'duo'));
 
-start().catch(e => setStatus('start failed: ' + e.message));
+(async () => {
+  await loadLangs();
+  await loadIce();
+  applyModeUI();
+  await connect();
+})().catch(e => setStatus('start failed: ' + e.message));
 </script>
 </body>
 </html>

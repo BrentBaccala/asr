@@ -313,6 +313,8 @@ async def offer(request):
     # session to already exist.
     await room.make_session(m, loop)
     await room.rewire(loop)
+    if mode == "duo" and len(room.members) == 2:
+        room.broadcast_event({"kind": "notice", "text": "paired"})
     await pc.setRemoteDescription(
         RTCSessionDescription(sdp=params["sdp"], type=params["type"]))
     answer = await pc.createAnswer()
@@ -338,6 +340,12 @@ async def _cleanup(room, m):
         room.members.remove(m)
     if not room.members:
         ROOMS.rooms.pop(room.id, None)
+        return
+    # A peer left a duo room: tell the survivor and rewire it back to
+    # "no target" so it stops translating/speaking to the vanished member.
+    if room.mode == "duo":
+        room.broadcast_event({"kind": "notice", "text": "peer disconnected"})
+        await room.rewire(asyncio.get_event_loop())
 
 
 def main():

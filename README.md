@@ -93,6 +93,15 @@ its own language), a four-mode microphone control, and live per-client
 language switching across all 13 languages. It is deployed in production
 on pony at `https://osito.freesoft.org/` (all traffic over port 443).
 
+<p align="center">
+  <img src="web/interpret-web-android.png" width="320"
+       alt="freesoft-interpret-web on Android at osito.freesoft.org: English→Spanish, with the mic-mode selector, Pair button, and a LOCAL utterance shown with its Spanish translation">
+</p>
+
+*Above: the web interface on Android — a `solo` English→Spanish session
+showing the microphone-mode selector, the **Pair** button, and a
+**LOCAL** utterance with its Spanish translation spoken back.*
+
 See **[`web/README.md`](web/README.md)** for architecture, the systemd
 services, and the haproxy/coturn 443-mux deployment. A printable
 one-page sign announcing the service in all 13 languages lives at

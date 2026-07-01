@@ -73,7 +73,7 @@ one-page sign announcing the service in all 13 languages lives at
 **[`web/translation-service-sign.pdf`](web/translation-service-sign.pdf)**
 (regenerate with `python3 web/sign/build.py`).
 
-## Features
+## Terminal UI features
 
 - **Config-file driven** — a TOML file (default
   `~/.config/freesoft-asr/config.toml`) sets the endpoint, model,

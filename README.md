@@ -40,12 +40,23 @@ into context-free pieces.
 
 Alongside the terminal UI there is a **browser interpreter**,
 `freesoft-interpret-web`, that drives the same pipeline
-(Voxtral ASR + NLLB MT + Pocket-TTS/Piper/MeloTTS) over WebRTC. It offers
-a **solo** mode (pick In/Out languages, speak, hear the translation) and
-a **paired** mode (two clients cross-translate, each hearing the other in
-its own language), a four-mode microphone control, and live per-client
-language switching across all 13 languages. It is deployed in production
-on pony at `https://osito.freesoft.org/` (all traffic over port 443).
+(Voxtral ASR + NLLB MT + Pocket-TTS/Piper/MeloTTS) over WebRTC, deployed
+in production on pony at `https://osito.freesoft.org/`.
+
+- **Solo & paired modes** — solo: pick *In*/*Out* languages, speak, and
+  hear the translation; paired: two clients cross-translate, each hearing
+  the other in its own language, joined by a one-tap **Pair** toggle.
+- **LOCAL / REMOTE transcript** — in paired mode every utterance is
+  labelled and colour-coded by origin (you vs. the peer).
+- **Four microphone modes** — hold-to-talk, tap-to-talk/stop, locked-on,
+  and disconnected (fully releases the mic for other apps); the mic also
+  auto-releases when the page is backgrounded.
+- **13 languages, switchable live** — language dropdowns re-target the
+  session mid-call without dropping the Voxtral stream.
+- **Speak-back TTS** — translations are synthesized and played to the
+  listener (Pocket-TTS / Piper / MeloTTS, chosen per language).
+- **Everything over port 443** — WebRTC media + signaling are muxed with
+  a TURN relay behind haproxy, so it works from restrictive networks.
 
 <p align="center">
   <img src="web/interpret-web-android.png" width="320"

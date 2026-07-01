@@ -82,6 +82,23 @@ into context-free pieces.
   session.
 - **`--plain`** headless mode for logging and validation.
 
+## Web interface (`web/`)
+
+Alongside the terminal UI there is a **browser interpreter**,
+`freesoft-interpret-web`, that drives the same pipeline
+(Voxtral ASR + NLLB MT + Pocket-TTS/Piper/MeloTTS) over WebRTC. It offers
+a **solo** mode (pick In/Out languages, speak, hear the translation) and
+a **paired** mode (two clients cross-translate, each hearing the other in
+its own language), a four-mode microphone control, and live per-client
+language switching across all 13 languages. It is deployed in production
+on pony at `https://osito.freesoft.org/` (all traffic over port 443).
+
+See **[`web/README.md`](web/README.md)** for architecture, the systemd
+services, and the haproxy/coturn 443-mux deployment. A printable
+one-page sign announcing the service in all 13 languages lives at
+**[`web/translation-service-sign.pdf`](web/translation-service-sign.pdf)**
+(regenerate with `python3 web/sign/build.py`).
+
 ## Pipeline
 
 ```

@@ -8,8 +8,9 @@ one page). Complex scripts (Arabic RTL, Devanagari conjuncts, CJK, Cyrillic)
 are shaped by Chromium's HarfBuzz using the system Noto fonts, so a Noto
 font set covering those scripts must be installed (fc-list | grep -i noto).
 
-Flags are vendored under ./flags/ (public-domain SVGs from lipis/flag-icons),
-so no network or npm is needed. Regenerate with:  python3 build.py
+Flags are vendored under ./flags/ (from lipis/flag-icons, MIT; see
+flags/README.md and flags/LICENSE), so no network or npm is needed.
+Regenerate with:  python3 build.py
 
 Chromium is auto-detected (Playwright cache, then chromium/chrome on PATH);
 override with CHROME=/path/to/chrome.

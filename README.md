@@ -9,6 +9,13 @@ languages all come from a TOML file (and/or CLI flags), so it works for
 anything from "transcribe whatever's playing on this machine" to
 multi-channel multilingual phone-call transcription.
 
+Its intended use is **live translation of a telephone call**: the phone
+is Bluetooth-tethered to the laptop, so the call audio flows into the
+laptop and each side of the conversation is transcribed and translated as
+it is spoken (the built-in `dual` profile is exactly this — the near and
+far ends as two streams). The other party hears nothing from the tool; it
+is a listener's aid on your end of the call.
+
 ![freesoft-asr transcribing a bilingual phone call in real time](demo.gif)
 
 *Above: a live call to an automated bilingual hotline. `[Remote]` (cyan)
@@ -86,6 +93,12 @@ Alongside the terminal UI there is a **browser interpreter**,
 `freesoft-interpret-web`, that drives the same pipeline
 (Voxtral ASR + NLLB MT + Pocket-TTS/Piper/MeloTTS) over WebRTC, deployed
 in production on pony at `https://osito.freesoft.org/`.
+
+Where the terminal UI listens in on a phone call, this is intended for a
+**conversation in which both parties use the web app** — each on their
+own phone or laptop. In paired mode the two clients cross-translate: each
+person speaks and reads in their own language, and hears the other's
+speech translated and spoken aloud.
 
 - **Solo & paired modes** — solo: pick *In*/*Out* languages, speak, and
   hear the translation; paired: two clients cross-translate, each hearing

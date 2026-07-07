@@ -37,9 +37,9 @@ UID_N="$(id -u)"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_N}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 
-# ---- config ----
-VOXTRAL_HEALTH="http://localhost:8000/health"
-VOXTRAL_METRICS="http://localhost:8000/metrics"
+# ---- config (URLs overridable via env, mainly for testing the gates) ----
+VOXTRAL_HEALTH="${GPU_LEASE_HEALTH_URL:-http://localhost:8000/health}"
+VOXTRAL_METRICS="${GPU_LEASE_METRICS_URL:-http://localhost:8000/metrics}"
 QWEN_MODEL="qwen3.6:27b"
 LOCK="$XDG_RUNTIME_DIR/gpu-lease.json"
 RELLOCK="$XDG_RUNTIME_DIR/gpu-lease.rel.lock"
@@ -59,7 +59,7 @@ voxtral_active() { sudo systemctl --user -M cosine@ is-active voxtral.service 2>
 voxtral_stop()   { sudo systemctl --user -M cosine@ stop  voxtral.service; }
 voxtral_start()  { sudo systemctl --user -M cosine@ start voxtral.service; }
 
-health_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$VOXTRAL_HEALTH" 2>/dev/null || echo 000; }
+health_code() { local c; c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$VOXTRAL_HEALTH" 2>/dev/null)"; echo "${c:-000}"; }
 
 # ---- GPU inspection ----
 gpu_apps()     { nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null; }

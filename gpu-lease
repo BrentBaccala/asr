@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# gpu-lease — dynamic GPU model switching on pony (RTX 3090, 24 GB)
+#
+# The card can't hold both the ASR stack and the big LLM at once:
+#   - voxtral.service (vLLM, cosine@ user unit) reserves ~15.2 GB for the
+#     Voxtral realtime ASR/interpretation model whenever it is up.
+#   - ollama qwen3.6:27b needs essentially the whole card.
+#
+# This tool lets a client CLAIM the GPU for the big model — stopping voxtral
+# and verifying its VRAM is actually freed — and later RELEASE it, restarting
+# voxtral and confirming ASR is healthy again. Guardrails:
+#   * refuses to claim while an interpretation/transcription request is
+#     mid-flight (vllm:num_requests_running > 0) unless --force. Every live
+#     interpret-web session streams through vLLM on :8000, so this single
+#     metric is the unified "is anyone talking" signal.
+#   * a systemd --user safety timer auto-releases after --ttl (default 2h) so
+#     a crashed client can never leave ASR down indefinitely.
+#
+# Runs as the pony `claude` user (passwordless sudo drives cosine's user
+# units). Deployed from github.com/BrentBaccala/asr: edit on samsung, push,
+# `git -C ~/asr pull` on pony; symlinked onto PATH at /usr/local/bin/gpu-lease.
+#
+# State file: $XDG_RUNTIME_DIR/gpu-lease.json (i.e. /run/user/<uid>/…) — a
+# tmpfs path that is cleared on reboot. That is deliberate: a reboot autostarts
+# voxtral fresh (linger is enabled on cosine), so a stale lease must NOT
+# survive a reboot. The systemd --user safety timer is likewise runtime-scoped.
+
+set -uo pipefail
+
+# Make the tool self-contained regardless of the (login vs non-login vs
+# systemd-service) PATH it is invoked with.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# systemctl --user / systemd-run --user need these when we are invoked from a
+# non-login ssh (which does not export them).
+UID_N="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_N}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+# ---- config ----
+VOXTRAL_HEALTH="http://localhost:8000/health"
+VOXTRAL_METRICS="http://localhost:8000/metrics"
+QWEN_MODEL="qwen3.6:27b"
+LOCK="$XDG_RUNTIME_DIR/gpu-lease.json"
+RELLOCK="$XDG_RUNTIME_DIR/gpu-lease.rel.lock"
+TIMER_UNIT="gpu-lease-autorelease"
+DEFAULT_TTL="2h"
+HEALTH_TIMEOUT=120      # s to wait for voxtral /health=200 after release
+VRAM_FREE_TIMEOUT=60    # s to wait for EngineCore VRAM to actually drop
+SELF="$(readlink -f "$0")"
+
+# ---- logging ----
+log()  { printf '[gpu-lease] %s\n' "$*" >&2; }
+warn() { printf '[gpu-lease] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[gpu-lease] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---- voxtral (cosine@ user unit, driven via sudo) ----
+voxtral_active() { sudo systemctl --user -M cosine@ is-active voxtral.service 2>/dev/null || true; }
+voxtral_stop()   { sudo systemctl --user -M cosine@ stop  voxtral.service; }
+voxtral_start()  { sudo systemctl --user -M cosine@ start voxtral.service; }
+
+health_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$VOXTRAL_HEALTH" 2>/dev/null || echo 000; }
+
+# ---- GPU inspection ----
+gpu_apps()     { nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null; }
+vllm_on_gpu()  { gpu_apps | grep -q 'VLLM::EngineCore'; }
+gpu_mem_line() { nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader 2>/dev/null; }
+
+# Idleness: echoes an integer request count, or -1 if unknown.
+#   voxtral down     -> 0  (nothing can be running)
+#   metrics readable -> vllm:num_requests_running (rounded)
+#   voxtral up but metrics unreadable -> -1 (unknown; treat as busy)
+requests_running() {
+    if [ "$(voxtral_active)" != "active" ]; then echo 0; return; fi
+    local body; body="$(curl -s --max-time 5 "$VOXTRAL_METRICS" 2>/dev/null)"
+    [ -n "$body" ] || { echo -1; return; }
+    printf '%s\n' "$body" | awk '
+        /^vllm:num_requests_running/ { v=$2; f=1 }
+        END { if (f) printf "%d\n", (v+0.5); else print -1 }'
+}
+
+# ---- ttl helpers ----
+ttl_seconds() {
+    local t="$1"
+    case "$t" in
+        *h)   echo $(( ${t%h}   * 3600 )) ;;
+        *min) echo $(( ${t%min} * 60 ))   ;;
+        *m)   echo $(( ${t%m}   * 60 ))   ;;
+        *s)   echo "${t%s}" ;;
+        *)    echo "$t" ;;
+    esac
+}
+
+# ---- lock file ----
+lock_field() { [ -f "$LOCK" ] && jq -r ".$1 // empty" "$LOCK" 2>/dev/null || true; }
+lock_age() {
+    local c; c="$(lock_field claimed_at)"; [ -n "$c" ] || { echo "?"; return; }
+    local age=$(( $(date +%s) - c ))
+    printf '%dm%02ds' $(( age / 60 )) $(( age % 60 ))
+}
+write_lock() {
+    local label="$1" ttl="$2" now exp
+    now="$(date +%s)"; exp=$(( now + $(ttl_seconds "$ttl") ))
+    jq -n \
+        --arg holder "$(whoami)@$(hostname)" \
+        --arg label  "$label" \
+        --arg ttl    "$ttl" \
+        --argjson claimed_at "$now" \
+        --arg claimed_h "$(date -Is -d "@$now")" \
+        --argjson expires_at "$exp" \
+        --arg expires_h "$(date -Is -d "@$exp")" \
+        '{holder:$holder, label:$label, ttl:$ttl,
+          claimed_at:$claimed_at, claimed_at_h:$claimed_h,
+          expires_at:$expires_at, expires_at_h:$expires_h}' > "$LOCK"
+}
+
+# ---- safety timer (systemd --user transient) ----
+arm_timer() {
+    local ttl="$1"
+    systemctl --user stop "${TIMER_UNIT}.timer" 2>/dev/null || true
+    systemctl --user reset-failed "${TIMER_UNIT}.timer" "${TIMER_UNIT}.service" 2>/dev/null || true
+    systemd-run --user --on-active="$ttl" --unit="$TIMER_UNIT" \
+        --description="gpu-lease safety auto-release" \
+        "$SELF" release --expired >/dev/null 2>&1 \
+        || warn "could not arm safety timer (lease still granted; release manually)"
+}
+cancel_timer() {
+    systemctl --user stop "${TIMER_UNIT}.timer" 2>/dev/null || true
+    systemctl --user reset-failed "${TIMER_UNIT}.timer" "${TIMER_UNIT}.service" 2>/dev/null || true
+}
+timer_left() {
+    systemctl --user list-timers "${TIMER_UNIT}.timer" --no-pager 2>/dev/null \
+        | awk 'NR==2{print $4, $5}'
+}
+
+# ---- commands ----
+cmd_status() {
+    echo "== gpu-lease status =="
+    if [ -f "$LOCK" ]; then
+        echo "lease:   HELD by '$(lock_field label)'  (holder $(lock_field holder), age $(lock_age))"
+        echo "         claimed $(lock_field claimed_at_h)  ttl $(lock_field ttl)  expires $(lock_field expires_at_h)"
+        echo "timer:   $(timer_left)"
+    else
+        echo "lease:   free"
+    fi
+    local rr; rr="$(requests_running)"
+    echo "voxtral: $(voxtral_active)   /health=$(health_code)   requests_running=$rr"
+    echo "ollama ps:"
+    ollama ps 2>&1 | sed 's/^/         /'
+    echo "gpu mem: $(gpu_mem_line)"
+    echo "gpu procs:"
+    gpu_apps | sed 's/^/         /'
+}
+
+cmd_claim() {
+    local wait=0 force=0 ttl="$DEFAULT_TTL" label=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --wait)   wait=1 ;;
+            --force)  force=1 ;;
+            --ttl)    ttl="$2"; shift ;;
+            --ttl=*)  ttl="${1#--ttl=}" ;;
+            -*)       die "unknown flag: $1" ;;
+            *)        label="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$label" ] || die "usage: gpu-lease claim [--wait] [--force] [--ttl DUR] LABEL"
+
+    # 1. existing lease
+    while [ -f "$LOCK" ]; do
+        if [ "$force" -eq 1 ]; then
+            warn "taking over lease held by '$(lock_field label)' (age $(lock_age)) — --force"
+            break
+        fi
+        if [ "$wait" -eq 1 ]; then
+            log "lease held by '$(lock_field label)' (age $(lock_age)); waiting for release..."
+            sleep 5; continue
+        fi
+        echo "[gpu-lease] ERROR: GPU lease already held:" >&2
+        cat "$LOCK" >&2
+        exit 1
+    done
+
+    # 2. idleness gate
+    while :; do
+        local r; r="$(requests_running)"
+        if [ "$r" = 0 ]; then break; fi
+        if [ "$force" -eq 1 ]; then warn "$r request(s) in flight; --force overriding"; break; fi
+        if [ "$wait" -eq 1 ]; then log "$r ASR request(s) in flight; waiting for idle..."; sleep 5; continue; fi
+        die "refusing to claim: $r ASR request(s) in flight (use --wait to queue, --force to override)"
+    done
+
+    log "claiming GPU for '$label' (ttl $ttl)"
+
+    # 3. stop voxtral, wait for VRAM to actually drop
+    if [ "$(voxtral_active)" = "active" ]; then
+        log "stopping voxtral.service..."
+        voxtral_stop || die "failed to stop voxtral.service"
+    fi
+    local waited=0
+    while vllm_on_gpu; do
+        [ "$waited" -ge "$VRAM_FREE_TIMEOUT" ] && die "voxtral VRAM still held after ${VRAM_FREE_TIMEOUT}s"
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    log "voxtral VRAM released (${waited}s); free: $(gpu_mem_line)"
+
+    # 4. write lock, 5. arm safety timer
+    write_lock "$label" "$ttl"
+    arm_timer "$ttl"
+
+    # 6. done — GPU is free for the new tenant
+    log "GPU leased to '$label'. Safety auto-release in $ttl (or run: gpu-lease release)."
+    echo "$LOCK"
+}
+
+cmd_release() {
+    local expired=0
+    [ "${1:-}" = "--expired" ] && expired=1
+
+    # serialize concurrent releases (manual EXIT trap vs safety timer)
+    exec 9>"$RELLOCK"
+    flock 9
+
+    if [ ! -f "$LOCK" ]; then
+        warn "no lease held (already released)"
+        # Defensive: if ASR is somehow down with no lease, restore it.
+        if [ "$(voxtral_active)" != "active" ]; then
+            warn "voxtral is not active though no lease is held — restarting it"
+        else
+            cancel_timer
+            exit 0
+        fi
+    else
+        local label; label="$(lock_field label)"
+        if [ "$expired" -eq 1 ]; then
+            log "SAFETY TIMER EXPIRED — releasing lease '$label'"
+        else
+            log "releasing lease '$label'"
+        fi
+        log "unloading $QWEN_MODEL..."
+        ollama stop "$QWEN_MODEL" 2>/dev/null || true
+    fi
+
+    # restart voxtral and confirm health
+    log "starting voxtral.service..."
+    voxtral_start || warn "voxtral start returned non-zero"
+    local waited=0 code
+    while :; do
+        code="$(health_code)"
+        [ "$code" = 200 ] && break
+        if [ "$waited" -ge "$HEALTH_TIMEOUT" ]; then
+            rm -f "$LOCK"; cancel_timer
+            die "voxtral did NOT come back healthy after ${HEALTH_TIMEOUT}s (last /health=$code) — ASR MAY BE DOWN, investigate now"
+        fi
+        sleep 3; waited=$(( waited + 3 ))
+    done
+
+    rm -f "$LOCK"
+    cancel_timer
+    log "ASR healthy again (/health=200 after ${waited}s); lease released"
+}
+
+usage() {
+    cat >&2 <<'EOF'
+gpu-lease — dynamic GPU model switching on pony
+
+  gpu-lease status
+      One-screen summary: lease state, voxtral health, vLLM requests,
+      ollama ps, nvidia-smi memory.
+
+  gpu-lease claim [--wait] [--force] [--ttl DUR] LABEL
+      Free the GPU for the big model. Refuses if a lease is held or ASR is
+      busy; --wait queues, --force overrides. Stops voxtral, waits for VRAM
+      to drop, writes the lock, arms a safety auto-release timer (default 2h).
+      DUR: systemd time span, e.g. 2h, 90min, 30s.
+
+  gpu-lease release [--expired]
+      Unload qwen, restart voxtral, confirm /health=200, drop the lock and
+      cancel the safety timer. Idempotent. --expired is used by the timer.
+EOF
+    exit 2
+}
+
+main() {
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        status)  cmd_status "$@" ;;
+        claim)   cmd_claim  "$@" ;;
+        release) cmd_release "$@" ;;
+        ""|-h|--help|help) usage ;;
+        *) die "unknown command: $cmd (try: status | claim | release)" ;;
+    esac
+}
+main "$@"

@@ -253,6 +253,10 @@ cmd_release() {
             rm -f "$LOCK"; cancel_timer
             die "voxtral did NOT come back healthy after ${HEALTH_TIMEOUT}s (last /health=$code) — ASR MAY BE DOWN, investigate now"
         fi
+        # heartbeat every ~15s so a long `ssh … release` keeps its stream
+        # alive (voxtral load-to-healthy is ~60-95s)
+        [ $(( waited % 15 )) -eq 0 ] && [ "$waited" -gt 0 ] && \
+            log "waiting for voxtral /health (=$code, ${waited}s elapsed)..."
         sleep 3; waited=$(( waited + 3 ))
     done
 

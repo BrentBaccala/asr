@@ -63,12 +63,22 @@ def probe_wh(src):
         return None, None
 
 
-def req(url, token, data=None, method=None, ctx=None):
+def req(url, token, data=None, method=None, ctx=None, length=None):
     r = urllib.request.Request(url, data=data, method=method)
     if token:
         r.add_header("Authorization", f"Bearer {token}")
     if data is not None:
         r.add_header("Content-Type", "application/octet-stream")
+        # Set Content-Length explicitly so a file-object body is sent with a
+        # fixed length, NOT chunked Transfer-Encoding (the stdlib server reads
+        # Content-Length only). This also streams large files without buffering.
+        if length is None and hasattr(data, "fileno"):
+            try:
+                length = os.fstat(data.fileno()).st_size
+            except OSError:
+                pass
+        if length is not None:
+            r.add_header("Content-Length", str(length))
     return urllib.request.urlopen(r, context=ctx)
 
 
@@ -132,7 +142,7 @@ def main():
     log(f"[2/4] uploading {size/1e6:.1f} MB -> {args.base}/caption/submit")
     try:
         with open(wav, "rb") as f, req(submit_url, token, data=f, method="POST",
-                                       ctx=ctx) as resp:
+                                       ctx=ctx, length=size) as resp:
             sub = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         log(f"ERROR submit: HTTP {e.code} {e.read()[:300]!r}")

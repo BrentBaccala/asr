@@ -266,11 +266,13 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in u.path.split("/") if p]
         if parts != ["caption", "submit"]:
             return self._json(404, {"error": "not found"})
+        chunked = "chunked" in self.headers.get("Transfer-Encoding", "").lower()
         length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
-            return self._json(400, {"error": "empty body (send audio bytes)"})
-        if length > MAX_UPLOAD:
-            return self._json(413, {"error": "upload too large"})
+        if not chunked:
+            if length <= 0:
+                return self._json(400, {"error": "empty body (send audio bytes)"})
+            if length > MAX_UPLOAD:
+                return self._json(413, {"error": "upload too large"})
 
         q = urllib.parse.parse_qs(u.query)
         opts = {}
@@ -294,19 +296,40 @@ class Handler(BaseHTTPRequestHandler):
         jd = _job_path(jid)
         os.makedirs(jd, exist_ok=True)
         inp = os.path.join(jd, "input")
-        # stream body to disk
-        remaining = length
-        with open(inp, "wb") as f:
-            while remaining > 0:
-                chunk = self.rfile.read(min(1 << 20, remaining))
-                if not chunk:
-                    break
-                f.write(chunk)
-                remaining -= len(chunk)
-        if remaining > 0:
-            job = {"id": jid, "status": "error", "detail": "truncated upload"}
+        # stream body to disk, honoring Content-Length OR chunked encoding
+        total = 0
+        try:
+            with open(inp, "wb") as f:
+                if chunked:
+                    while True:
+                        size_line = self.rfile.readline(64).strip()
+                        clen = int(size_line.split(b";")[0], 16)
+                        if clen == 0:
+                            self.rfile.readline()   # trailing CRLF
+                            break
+                        remaining = clen
+                        while remaining > 0:
+                            b = self.rfile.read(min(1 << 20, remaining))
+                            if not b:
+                                raise IOError("truncated chunk")
+                            f.write(b); remaining -= len(b); total += len(b)
+                            if total > MAX_UPLOAD:
+                                raise IOError("upload too large")
+                        self.rfile.readline()       # CRLF after chunk
+                else:
+                    remaining = length
+                    while remaining > 0:
+                        b = self.rfile.read(min(1 << 20, remaining))
+                        if not b:
+                            break
+                        f.write(b); remaining -= len(b); total += len(b)
+                    if remaining > 0:
+                        raise IOError("truncated upload")
+        except (IOError, ValueError) as e:
+            job = {"id": jid, "status": "error", "detail": f"upload: {e}"}
             _save(job)
-            return self._json(400, {"error": "truncated upload"})
+            return self._json(400, {"error": f"upload failed: {e}"})
+        length = total
 
         job = {"id": jid, "status": "queued", "filename": filename,
                "input": inp, "opts": opts, "submitted_at": time.time(),

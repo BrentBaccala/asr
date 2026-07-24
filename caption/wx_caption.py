@@ -237,13 +237,24 @@ def run(args):
             torch.cuda.empty_cache()
 
     # 1) transcribe (plain faster-whisper, no VAD batching)
+    #
+    # Vocabulary bias, two mutually exclusive mechanisms — faster-whisper
+    # ignores hotwords whenever initial_prompt is set, so --prompt wins:
+    #   --prompt   conditions only the first ~30 s window (bias then decays
+    #              through condition_on_previous_text chaining)
+    #   --hotwords injected into every window's prompt, so a glossary keeps
+    #              biasing minute 40 as hard as minute 1
+    # Both are capped by Whisper at ~224 tokens and truncated silently.
+    if args.prompt and args.hotwords:
+        log("WARNING: --prompt set, so --hotwords is ignored by faster-whisper")
     log("[1/3] transcribe (plain faster-whisper, vad_filter=False)")
     fw = WhisperModel(args.model, device=dev, compute_type=ctype,
                       download_root=HF_HUB)
     segs_it, info = fw.transcribe(
         wav, beam_size=5, language=args.language,
         word_timestamps=True, vad_filter=False,
-        initial_prompt=args.prompt or None)
+        initial_prompt=args.prompt or None,
+        hotwords=args.hotwords or None)
     lang = info.language
     fw_segs = [{"start": s.start, "end": s.end, "text": s.text.strip()}
                for s in segs_it if s.text.strip()]
@@ -325,7 +336,11 @@ def main():
     ap.add_argument("--language", default=None,
                     help="ISO code (default: auto-detect)")
     ap.add_argument("--prompt", default=None,
-                    help="initial_prompt vocabulary bias (names, jargon)")
+                    help="initial_prompt vocabulary bias (names, jargon); "
+                         "conditions the first window only")
+    ap.add_argument("--hotwords", default=None,
+                    help="glossary bias applied to every window (names, "
+                         "jargon); ignored if --prompt is also given")
     ap.add_argument("--model", default="large-v3", help="faster-whisper model")
     ap.add_argument("--min-speakers", type=int, default=None)
     ap.add_argument("--max-speakers", type=int, default=None)

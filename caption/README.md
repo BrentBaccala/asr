@@ -46,7 +46,22 @@ GET  /caption/health          → ok
 ```
 
 Submit opts (query string): `language`, `min_speakers`, `max_speakers`,
-`prompt`, `names`, `model`, `formats`, `width`, `height`, `filename`.
+`prompt`, `hotwords`, `names`, `model`, `formats`, `width`, `height`,
+`filename`.
+
+### Vocabulary bias (glossaries)
+
+Two knobs, both fed to faster-whisper, both truncated by Whisper at ~224
+tokens (≈150 words) without warning:
+
+| opt | scope | use for |
+|-----|-------|---------|
+| `prompt` | conditions the **first ~30 s window** only; bias then decays through `condition_on_previous_text` chaining | setting the scene — "a VMware class taught by Bruce Caslow" |
+| `hotwords` | injected into **every window's** prompt | a course glossary that must still bias minute 40 |
+
+faster-whisper ignores `hotwords` whenever `prompt` is set, so pick one;
+`wx_caption.py` logs a warning if both arrive. Neither affects alignment or
+diarization — they bias transcription only.
 
 ## Deploy on pony
 

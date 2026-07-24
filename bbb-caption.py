@@ -24,6 +24,10 @@ Examples:
   ./bbb-caption.py talk.mp4 --token-file /etc/bbb-transcribe.token \
       --min-speakers 2 --max-speakers 2 --names "Bruce,Brent" \
       --prompt "ITPIE demo by Bruce Caslow and Brent Baccala" --formats srt
+
+  # course glossary biasing the whole recording (not just the opening)
+  ./bbb-caption.py class.mp4 \
+      --hotwords "vSphere, vCenter, NSX-T, Tanzu, ESXi, vMotion, vSAN"
 """
 import argparse
 import json
@@ -92,7 +96,10 @@ def main():
     ap.add_argument("--formats", default="srt,ass,json,txt",
                     help="comma list: json,srt,ass,txt")
     ap.add_argument("--language", help="ISO code (default: auto-detect)")
-    ap.add_argument("--prompt", help="vocabulary bias (names, jargon)")
+    ap.add_argument("--prompt", help="vocabulary bias (names, jargon); "
+                                     "conditions the opening window only")
+    ap.add_argument("--hotwords", help="glossary applied to every window; "
+                                       "ignored if --prompt is also given")
     ap.add_argument("--names", help="comma list overriding Speaker N")
     ap.add_argument("--min-speakers", type=int)
     ap.add_argument("--max-speakers", type=int)
@@ -128,6 +135,7 @@ def main():
     # build submit query
     q = {"filename": os.path.basename(args.input), "formats": args.formats}
     for k, v in (("language", args.language), ("prompt", args.prompt),
+                 ("hotwords", args.hotwords),
                  ("names", args.names), ("model", args.model),
                  ("min_speakers", args.min_speakers),
                  ("max_speakers", args.max_speakers)):

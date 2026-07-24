@@ -28,7 +28,12 @@ Endpoints
   GET  /caption/health          -> "ok"
 
 Submit query options (all optional): language, min_speakers, max_speakers,
-prompt, names, formats, width, height, filename.
+prompt, hotwords, names, formats, width, height, filename.
+
+Vocabulary bias: `prompt` conditions the first window only; `hotwords` biases
+every window (the right knob for a glossary over a long recording). Setting
+both makes faster-whisper ignore `hotwords`. Either way Whisper truncates at
+~224 tokens, so keep a glossary to ~150 words.
 """
 import os, sys, json, uuid, time, queue, threading, subprocess, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,6 +127,7 @@ def _process(job):
            "--formats", job["opts"].get("formats", "json,srt,ass,txt")]
     o = job["opts"]
     for flag, key in (("--language", "language"), ("--prompt", "prompt"),
+                      ("--hotwords", "hotwords"),
                       ("--names", "names"), ("--model", "model"),
                       ("--min-speakers", "min_speakers"),
                       ("--max-speakers", "max_speakers"),
@@ -328,7 +334,7 @@ class Handler(BaseHTTPRequestHandler):
 
         q = urllib.parse.parse_qs(u.query)
         opts = {}
-        for k in ("language", "prompt", "names", "model", "formats"):
+        for k in ("language", "prompt", "hotwords", "names", "model", "formats"):
             if k in q:
                 opts[k] = q[k][0]
         for k in ("min_speakers", "max_speakers", "width", "height"):

@@ -1,0 +1,18 @@
+[Unit]
+Description=Diarized captioning job service (wx_caption + gpu-lease)
+Documentation=https://github.com/BrentBaccala/asr
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/claude/asr/caption/caption_service.py
+Restart=always
+RestartSec=5
+# Defaults come from caption_service.py; override here if needed:
+#   Environment=CAPTION_PORT=8001
+#   Environment=CAPTION_IDLE_LINGER=20
+#   Environment=CAPTION_JOBS_DIR=/mnt/models/caption-jobs
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

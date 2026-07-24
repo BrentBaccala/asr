@@ -45,7 +45,11 @@ LOCK="$XDG_RUNTIME_DIR/gpu-lease.json"
 RELLOCK="$XDG_RUNTIME_DIR/gpu-lease.rel.lock"
 TIMER_UNIT="gpu-lease-autorelease"
 DEFAULT_TTL="2h"
-HEALTH_TIMEOUT=120      # s to wait for voxtral /health=200 after release
+HEALTH_TIMEOUT=300      # s to wait for voxtral /health=200 after release.
+                        # Voxtral-Mini-4B (~9 GB) cold-loads from /mnt/models
+                        # (~160 MB/s) since the 2026-07-24 model migration, so a
+                        # cache-cold reload runs ~120-140 s (was ~60-95 s off the
+                        # root SSD). 300 s leaves generous margin.
 VRAM_FREE_TIMEOUT=60    # s to wait for EngineCore VRAM to actually drop
 SELF="$(readlink -f "$0")"
 
@@ -254,7 +258,7 @@ cmd_release() {
             die "voxtral did NOT come back healthy after ${HEALTH_TIMEOUT}s (last /health=$code) — ASR MAY BE DOWN, investigate now"
         fi
         # heartbeat every ~15s so a long `ssh … release` keeps its stream
-        # alive (voxtral load-to-healthy is ~60-95s)
+        # alive (voxtral load-to-healthy is ~120-140s cache-cold off /mnt/models)
         [ $(( waited % 15 )) -eq 0 ] && [ "$waited" -gt 0 ] && \
             log "waiting for voxtral /health (=$code, ${waited}s elapsed)..."
         sleep 3; waited=$(( waited + 3 ))

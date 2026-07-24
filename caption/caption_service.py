@@ -42,6 +42,7 @@ BIND = os.environ.get("CAPTION_BIND", "127.0.0.1")
 PORT = int(os.environ.get("CAPTION_PORT", "8001"))
 LEASE_LABEL = os.environ.get("CAPTION_LEASE_LABEL", "caption")
 IDLE_LINGER = float(os.environ.get("CAPTION_IDLE_LINGER", "20"))  # s to hold lease waiting for more work
+CLAIM_TIMEOUT = int(os.environ.get("CAPTION_CLAIM_TIMEOUT", "600"))  # s to wait for the GPU to free before failing the job
 MAX_UPLOAD = int(os.environ.get("CAPTION_MAX_UPLOAD", str(2 * 1024**3)))  # 2 GiB
 FORMATS_OK = {"json", "srt", "ass", "txt"}
 
@@ -111,6 +112,7 @@ def _process(job):
     jid = job["id"]
     jd = _job_path(jid)
     job["status"] = "running"
+    job["detail"] = "loading models and transcribing (Whisper -> align -> pyannote)"
     job["started_at"] = time.time()
     _save(job)
     log(f"job {jid}: running ({job.get('filename','audio')})")
@@ -165,28 +167,78 @@ def _process(job):
         f"({job.get('segments')} segs, speakers={job.get('speakers')})")
 
 
-def _lease(cmd_args):
+def _gpu_contention():
+    """Best-effort human-readable reason the GPU isn't free (for error text)."""
     try:
-        r = subprocess.run([GPU_LEASE] + cmd_args, capture_output=True,
-                           text=True, timeout=600)
-        if r.returncode != 0:
-            log(f"gpu-lease {' '.join(cmd_args)} rc={r.returncode}: "
-                f"{(r.stderr or '').strip()[-300:]}")
-        return r.returncode == 0
+        out = subprocess.run([GPU_LEASE, "status"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except Exception:
+        return "the GPU did not become free"
+    held, running = None, None
+    for line in out.splitlines():
+        ls = line.strip()
+        if ls.startswith("lease:") and "HELD by" in ls:
+            try:
+                held = ls.split("HELD by", 1)[1].split("'")[1]
+            except Exception:
+                held = "?"
+        if ls.startswith("voxtral:") and "requests_running=" in ls:
+            try:
+                running = int(ls.split("requests_running=", 1)[1].split()[0])
+            except Exception:
+                pass
+    if held and held != LEASE_LABEL:
+        return f"the GPU is held by another task ('{held}')"
+    if running and running > 0:
+        return f"live Voxtral (ASR) is busy ({running} request(s) in flight)"
+    return "the GPU did not become free"
+
+
+def _claim():
+    """Return (ok, reason). reason is a client-facing message on failure."""
+    try:
+        r = subprocess.run([GPU_LEASE, "claim", "--wait", LEASE_LABEL],
+                           capture_output=True, text=True, timeout=CLAIM_TIMEOUT)
+        if r.returncode == 0:
+            return True, None
+        last = ((r.stderr or "").strip().splitlines() or ["gpu-lease claim failed"])[-1]
+        return False, f"could not acquire the GPU: {last}"
+    except subprocess.TimeoutExpired:
+        reason = _gpu_contention()
+        return False, (f"could not acquire the GPU within {CLAIM_TIMEOUT}s "
+                       f"because {reason}. Captioning yields to live "
+                       "transcription — please retry once the live session "
+                       "(or other GPU task) has finished.")
     except Exception as e:
-        log(f"gpu-lease {' '.join(cmd_args)} raised: {e}")
-        return False
+        return False, f"gpu-lease claim error: {e}"
+
+
+def _release():
+    try:
+        r = subprocess.run([GPU_LEASE, "release"], capture_output=True,
+                           text=True, timeout=CLAIM_TIMEOUT)
+        if r.returncode != 0:
+            log(f"gpu-lease release rc={r.returncode}: "
+                f"{(r.stderr or '').strip()[-300:]}")
+    except Exception as e:
+        log(f"gpu-lease release raised: {e}")
 
 
 def _worker():
     log("worker started")
     while True:
         job = _q.get()                        # block for first job of a burst
-        log(f"claiming GPU for burst (job {job['id']})")
-        if not _lease(["claim", "--wait", LEASE_LABEL]):
+        job["status"] = "waiting_gpu"
+        job["detail"] = ("waiting for the GPU to free — captioning yields to "
+                         "live Voxtral ASR and any other GPU task")
+        _save(job)
+        log(f"job {job['id']}: waiting for GPU claim")
+        ok, reason = _claim()
+        if not ok:
             job["status"] = "error"
-            job["detail"] = "could not claim GPU (gpu-lease claim failed)"
+            job["detail"] = reason
             _save(job)
+            log(f"job {job['id']}: claim failed: {reason}")
             continue
         try:
             _process(job)
@@ -199,7 +251,7 @@ def _worker():
                 _process(job)
         finally:
             log("releasing GPU (restarting voxtral)")
-            _lease(["release"])               # best-effort; jobs already 'done'
+            _release()                        # best-effort; jobs already 'done'
 
 
 # ------------------------------------------------------------------ HTTP

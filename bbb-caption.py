@@ -171,7 +171,8 @@ def main():
             log(f"      status HTTP {e.code}; retrying"); continue
         s = st.get("status")
         if s != last:
-            log(f"      status: {s}")
+            d = st.get("detail")
+            log(f"      status: {s}" + (f" — {d}" if d else ""))
             last = s
         if s == "done":
             log(f"      done: {st.get('segments')} segments, "
@@ -179,7 +180,7 @@ def main():
                 f"lang={st.get('language')}, {st.get('duration_s')}s")
             break
         if s == "error":
-            log(f"ERROR: pipeline failed: {st.get('detail')}")
+            log(f"ERROR: {st.get('detail') or 'job failed'}")
             sys.exit(1)
 
     # 4) download artifacts

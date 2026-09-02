@@ -55,7 +55,11 @@ IDLE_LINGER = float(os.environ.get("CAPTION_IDLE_LINGER", "20"))  # s to hold le
 # Declared VRAM for the shared lease. Measured peak of the whisperx pipeline
 # (Whisper large-v3 -> wav2vec2 align -> pyannote diarize) is 5394 MiB; 6144
 # leaves a little headroom without eating the budget.
-LEASE_VRAM_MB = int(os.environ.get("CAPTION_LEASE_VRAM_MB", "6144"))
+# Measured (2026-09-02): the pipeline completes a 708 s recording with a peak
+# of 6240 MiB when that is all it can have. Uncapped it will reserve up to
+# 16392 MiB, so wx_caption.py is handed CAPTION_VRAM_MB below and enforces this
+# number -- the declaration has to bind, or the lease's accounting is fiction.
+LEASE_VRAM_MB = int(os.environ.get("CAPTION_LEASE_VRAM_MB", "7168"))
 LEASE_TTL = os.environ.get("CAPTION_LEASE_TTL", "3h")  # safety auto-unsuppress
 # s to wait for GPU budget before failing the job. With shared mode a wait only
 # happens against an exclusive qwen lease or a genuinely full card, both short
@@ -150,9 +154,10 @@ def _process(job):
         if v not in (None, ""):
             cmd += [flag, str(v)]
 
+    env = dict(os.environ, CAPTION_VRAM_MB=str(LEASE_VRAM_MB))
     t0 = time.time()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env,
                            timeout=int(os.environ.get("CAPTION_JOB_TIMEOUT", "7200")))
     except subprocess.TimeoutExpired:
         job["status"] = "error"; job["detail"] = "pipeline timed out"

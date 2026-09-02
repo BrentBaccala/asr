@@ -226,6 +226,24 @@ def run(args):
     ctype = "float16" if dev == "cuda" else "int8"
     log(f"device={dev} compute_type={ctype} model={args.model}")
 
+    # Hold this process to the VRAM its gpu-lease suppressor declared.
+    #
+    # Without a cap, PyTorch's caching allocator expands into whatever is free
+    # and never gives it back, so the pipeline's footprint is a function of who
+    # else happens to be on the card rather than of the work. Measured on pony
+    # 2026-09-02 with the same 708 s recording: pyannote diarization reserved
+    # 16392 MiB with the card idle, 14534 MiB beside a tracking pass, and
+    # 6240 MiB when only 6.4 GB was free -- identical output and no slowdown in
+    # every case. An uncapped elastic tenant makes the lease's VRAM accounting
+    # fiction and can starve a neighbour that declared honestly, so the
+    # declaration is enforced here rather than merely recorded.
+    cap_mb = int(os.environ.get("CAPTION_VRAM_MB", "0"))
+    if dev == "cuda" and cap_mb > 0:
+        total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        frac = min(1.0, cap_mb / total_mb)
+        torch.cuda.set_per_process_memory_fraction(frac)
+        log(f"VRAM cap: {cap_mb} MiB ({frac:.3f} of {total_mb:.0f} MiB)")
+
     tmp = tempfile.mkdtemp(prefix="wxcap-")
     wav = os.path.join(tmp, "audio16k.wav")
     log("resampling input -> 16 kHz mono wav")

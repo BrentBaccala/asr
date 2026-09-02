@@ -15,11 +15,20 @@ RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 # Wait as long as the aikreview client is willing to poll.  The client's
 # config.json sets caption.timeout_seconds=7200; the service's built-in
-# CAPTION_CLAIM_TIMEOUT default is 600, so it abandoned a contended job 12x
+# CAPTION_CLAIM_TIMEOUT default was 600, so it abandoned a contended job 12x
 # sooner than the caller would have waited -- and the client's deferred
 # cleanup then deleted commentary.upload.wav, losing the work rather than
 # parking it.  Matching the two turns ordinary contention (a live Voxtral
 # session, a short GPU task) into a wait instead of a failure.
+#
+# Shared mode (2026-09-02) removed the *reason* most of those waits existed --
+# a caption job no longer queues behind an unrelated GPU tenant, it runs
+# beside it -- and the code default came down to 1800 s accordingly.  This
+# override deliberately stays at 7200 anyway: failing the acquisition is not
+# a free retry for the caller, because aikreview's deferred cleanup deletes
+# commentary.upload.wav on failure.  Until that client parks the upload
+# instead of deleting it, waiting is strictly cheaper than failing, so keep
+# the service's patience matched to the client's.
 Environment=CAPTION_CLAIM_TIMEOUT=7200
 
 [Install]

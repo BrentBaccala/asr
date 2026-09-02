@@ -233,10 +233,13 @@ def run(args):
     # else happens to be on the card rather than of the work. Measured on pony
     # 2026-09-02 with the same 708 s recording: pyannote diarization reserved
     # 16392 MiB with the card idle, 14534 MiB beside a tracking pass, and
-    # 6240 MiB when only 6.4 GB was free -- identical output and no slowdown in
-    # every case. An uncapped elastic tenant makes the lease's VRAM accounting
-    # fiction and can starve a neighbour that declared honestly, so the
-    # declaration is enforced here rather than merely recorded.
+    # 6240 MiB when only 6.4 GB was free -- every run completing, with no
+    # slowdown attributable to the cap. (Transcripts differ ~29 % word-for-word
+    # between runs, but a same-conditions control differs by the same amount:
+    # this pipeline is simply not run-to-run deterministic, and the cap does not
+    # make it worse.) An uncapped elastic tenant makes the lease's VRAM
+    # accounting fiction and can starve a neighbour that declared honestly, so
+    # the declaration is enforced here rather than merely recorded.
     cap_mb = int(os.environ.get("CAPTION_VRAM_MB", "0"))
     if dev == "cuda" and cap_mb > 0:
         total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)

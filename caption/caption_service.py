@@ -13,10 +13,15 @@ Design
   and downloads artifacts when done. Individual HTTP requests stay short, so no
   long-lived connections through haproxy.
 * A single worker thread serializes GPU use. It wraps a *burst* of jobs in one
-  `gpu-lease claim ... / release` cycle (draining the queue with a short idle
-  linger) so a batch of recordings costs only one voxtral bounce, not one per
-  job. Each job is marked `done` the instant its artifacts are written —
+  `gpu-lease suppress ... / unsuppress` cycle (draining the queue with a short
+  idle linger) so a batch of recordings costs only one voxtral bounce, not one
+  per job. Each job is marked `done` the instant its artifacts are written —
   BEFORE the (slow) voxtral restart — so clients never wait on the release.
+* It takes the SHARED lease (`suppress`), not the exclusive one (`claim`). The
+  pipeline needs ~5.4 GB of a 24 GB card, so it coexists with other small GPU
+  tenants (e.g. the aikedit SAM 2 tracking pass, ~9 GB) instead of queueing
+  behind them. Before this, six consecutive caption submits failed overnight on
+  2026-09-01/02 while 12-14 GB sat free and voxtral was not even running.
 * The GPU pipeline runs as a fresh subprocess in the whisperx venv, so all CUDA
   memory is released on exit before voxtral is restarted.
 
@@ -47,7 +52,16 @@ BIND = os.environ.get("CAPTION_BIND", "127.0.0.1")
 PORT = int(os.environ.get("CAPTION_PORT", "8001"))
 LEASE_LABEL = os.environ.get("CAPTION_LEASE_LABEL", "caption")
 IDLE_LINGER = float(os.environ.get("CAPTION_IDLE_LINGER", "20"))  # s to hold lease waiting for more work
-CLAIM_TIMEOUT = int(os.environ.get("CAPTION_CLAIM_TIMEOUT", "600"))  # s to wait for the GPU to free before failing the job
+# Declared VRAM for the shared lease. Measured peak of the whisperx pipeline
+# (Whisper large-v3 -> wav2vec2 align -> pyannote diarize) is 5394 MiB; 6144
+# leaves a little headroom without eating the budget.
+LEASE_VRAM_MB = int(os.environ.get("CAPTION_LEASE_VRAM_MB", "6144"))
+LEASE_TTL = os.environ.get("CAPTION_LEASE_TTL", "3h")  # safety auto-unsuppress
+# s to wait for GPU budget before failing the job. With shared mode a wait only
+# happens against an exclusive qwen lease or a genuinely full card, both short
+# and rare -- so this is back to a fail-fast value rather than the 7200 s that
+# 566292f needed when any unrelated tenant blocked captioning outright.
+CLAIM_TIMEOUT = int(os.environ.get("CAPTION_CLAIM_TIMEOUT", "1800"))
 MAX_UPLOAD = int(os.environ.get("CAPTION_MAX_UPLOAD", str(2 * 1024**3)))  # 2 GiB
 FORMATS_OK = {"json", "srt", "ass", "txt"}
 
@@ -180,7 +194,7 @@ def _gpu_contention():
                              text=True, timeout=20).stdout
     except Exception:
         return "the GPU did not become free"
-    held, running = None, None
+    held, running, budget = None, None, None
     for line in out.splitlines():
         ls = line.strip()
         if ls.startswith("lease:") and "HELD by" in ls:
@@ -193,41 +207,51 @@ def _gpu_contention():
                 running = int(ls.split("requests_running=", 1)[1].split()[0])
             except Exception:
                 pass
+        if ls.startswith("budget:"):
+            budget = ls[len("budget:"):].strip()
     if held and held != LEASE_LABEL:
-        return f"the GPU is held by another task ('{held}')"
+        return f"the GPU is held exclusively by another task ('{held}')"
     if running and running > 0:
         return f"live Voxtral (ASR) is busy ({running} request(s) in flight)"
+    if budget:
+        return f"there was not enough free VRAM ({budget})"
     return "the GPU did not become free"
 
 
 def _claim():
-    """Return (ok, reason). reason is a client-facing message on failure."""
+    """Take the SHARED lease. Return (ok, reason); reason faces the client."""
     try:
-        r = subprocess.run([GPU_LEASE, "claim", "--wait", LEASE_LABEL],
-                           capture_output=True, text=True, timeout=CLAIM_TIMEOUT)
+        r = subprocess.run([GPU_LEASE, "suppress", "--wait",
+                            "--timeout", str(CLAIM_TIMEOUT),
+                            "--vram", str(LEASE_VRAM_MB),
+                            "--ttl", LEASE_TTL, LEASE_LABEL],
+                           capture_output=True, text=True,
+                           timeout=CLAIM_TIMEOUT + 300)
         if r.returncode == 0:
             return True, None
-        last = ((r.stderr or "").strip().splitlines() or ["gpu-lease claim failed"])[-1]
-        return False, f"could not acquire the GPU: {last}"
+        last = ((r.stderr or "").strip().splitlines() or ["gpu-lease suppress failed"])[-1]
+        return False, f"could not acquire GPU memory: {last}"
     except subprocess.TimeoutExpired:
         reason = _gpu_contention()
-        return False, (f"could not acquire the GPU within {CLAIM_TIMEOUT}s "
-                       f"because {reason}. Captioning yields to live "
-                       "transcription — please retry once the live session "
-                       "(or other GPU task) has finished.")
+        return False, (f"could not acquire {LEASE_VRAM_MB} MiB of GPU memory "
+                       f"within {CLAIM_TIMEOUT}s because {reason}. Captioning "
+                       "yields to live transcription — please retry once the "
+                       "live session (or other GPU task) has finished.")
     except Exception as e:
-        return False, f"gpu-lease claim error: {e}"
+        return False, f"gpu-lease suppress error: {e}"
 
 
 def _release():
+    """Drop the shared lease. voxtral restarts only if no other tenant holds
+    GPU memory -- gpu-lease decides that, not us."""
     try:
-        r = subprocess.run([GPU_LEASE, "release"], capture_output=True,
-                           text=True, timeout=CLAIM_TIMEOUT)
+        r = subprocess.run([GPU_LEASE, "unsuppress", LEASE_LABEL],
+                           capture_output=True, text=True, timeout=CLAIM_TIMEOUT)
         if r.returncode != 0:
-            log(f"gpu-lease release rc={r.returncode}: "
+            log(f"gpu-lease unsuppress rc={r.returncode}: "
                 f"{(r.stderr or '').strip()[-300:]}")
     except Exception as e:
-        log(f"gpu-lease release raised: {e}")
+        log(f"gpu-lease unsuppress raised: {e}")
 
 
 def _worker():
@@ -402,7 +426,8 @@ def main():
     _load_existing()
     threading.Thread(target=_worker, daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    log(f"listening on {BIND}:{PORT}  jobs_dir={JOBS_DIR}  lease='{LEASE_LABEL}'")
+    log(f"listening on {BIND}:{PORT}  jobs_dir={JOBS_DIR}  "
+        f"lease='{LEASE_LABEL}' (shared, {LEASE_VRAM_MB} MiB, ttl {LEASE_TTL})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

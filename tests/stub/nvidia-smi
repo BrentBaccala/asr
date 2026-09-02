@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# stub nvidia-smi: card state comes from $STUB_STATE/{voxtral,extra_used}
+tot=${STUB_GPU_TOTAL:-24576}
+vox=0; [ "$(cat "$STUB_STATE/voxtral" 2>/dev/null)" = active ] && vox=15216
+extra=$(cat "$STUB_STATE/extra_used" 2>/dev/null || echo 0)
+used=$(( vox + extra )); free=$(( tot - used ))
+case "$*" in
+  *query-compute-apps*)
+      [ "$vox" -gt 0 ] && echo "1234, VLLM::EngineCore, $vox MiB"
+      [ "$extra" -gt 0 ] && echo "5678, /usr/bin/python3, $extra MiB"
+      ;;
+  *memory.total,memory.used,memory.free*) echo "$tot MiB, $used MiB, $free MiB" ;;
+  *memory.total*) echo "$tot" ;;
+  *memory.free*)  echo "$free" ;;
+esac
+exit 0

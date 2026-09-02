@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# health -> 200 iff voxtral active; metrics -> $STUB_STATE/requests
+url="${@: -1}"
+active=$(cat "$STUB_STATE/voxtral" 2>/dev/null || echo inactive)
+case "$url" in
+  *health*) [ "$active" = active ] && echo -n 200 || echo -n 000 ;;
+  *metrics*) [ "$active" = active ] && echo "vllm:num_requests_running $(cat "$STUB_STATE/requests" 2>/dev/null || echo 0)" ;;
+esac
+exit 0

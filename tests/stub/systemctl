@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# stub systemctl: only the calls gpu-lease makes
+args="$*"
+case "$args" in
+  *"is-active voxtral.service"*) cat "$STUB_STATE/voxtral" 2>/dev/null || echo inactive ;;
+  *"stop  voxtral.service"*|*"stop voxtral.service"*) echo inactive > "$STUB_STATE/voxtral"; echo "stop voxtral" >> "$STUB_STATE/actions" ;;
+  *"start voxtral.service"*) echo active > "$STUB_STATE/voxtral"; echo "start voxtral" >> "$STUB_STATE/actions" ;;
+  *list-timers*) echo "NEXT LEFT LAST PASSED UNIT"; echo "- - - - -" ;;
+esac
+exit 0

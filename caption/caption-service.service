@@ -13,6 +13,14 @@ RestartSec=5
 #   Environment=CAPTION_IDLE_LINGER=20
 #   Environment=CAPTION_JOBS_DIR=/mnt/models/caption-jobs
 Environment=PYTHONUNBUFFERED=1
+# Wait as long as the aikreview client is willing to poll.  The client's
+# config.json sets caption.timeout_seconds=7200; the service's built-in
+# CAPTION_CLAIM_TIMEOUT default is 600, so it abandoned a contended job 12x
+# sooner than the caller would have waited -- and the client's deferred
+# cleanup then deleted commentary.upload.wav, losing the work rather than
+# parking it.  Matching the two turns ordinary contention (a live Voxtral
+# session, a short GPU task) into a wait instead of a failure.
+Environment=CAPTION_CLAIM_TIMEOUT=7200
 
 [Install]
 WantedBy=default.target
